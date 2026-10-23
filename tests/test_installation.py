@@ -643,5 +643,144 @@ class SetupTests(unittest.TestCase):
         self.assertFalse(any(call[0] in ("systemctl", "launchctl") for call in self.calls))
 
 
+class OpenRigSetupTests(unittest.TestCase):
+    def install_home(self, manager):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name).resolve()
+        self.agents = self.home / "Library/LaunchAgents"
+        environment = patch.dict(os.environ, {"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / "config"),
+            "XDG_STATE_HOME": str(self.home / "state"), "CODR_SERVICE_MANAGER": manager,
+            "CODR_LAUNCH_AGENTS_DIR": str(self.agents)}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+        bridge = self.home / ".local/bin/herdr-white-noise-bridge"
+        bridge.parent.mkdir(parents=True)
+        bridge.write_text("fixture")
+        self.rig = self.home / "node/lib/node_modules/@openrig/cli/dist/bin-wrapper.js"
+        self.rig.parent.mkdir(parents=True)
+        self.rig.write_text("#!/usr/bin/env node\n")
+        (self.home / "seat-bin").mkdir()
+        (self.home / "seat-bin/rig").symlink_to(self.rig)
+        self.config = self.home / "config/codr-openrig/config.toml"
+        self.calls = []
+        self.bootstrap_count = 0
+        self.herdr = [self.home / "config/herdr-white-noise-bridge/config.toml",
+                      self.home / "state/herdr-white-noise-bridge/state.json",
+                      self.home / ".marmot-agents/herdr/codr-bootstrap.json",
+                      self.agents / "io.github.tidley.codr.wn-agent-herdr.plist",
+                      self.agents / "io.github.tidley.codr.herdr-white-noise-bridge.plist",
+                      self.home / "config/systemd/user/wn-agent-herdr.service",
+                      self.home / "config/systemd/user/herdr-white-noise-bridge.service"]
+        for path in self.herdr:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"herdr fixture {path.name}")
+            path.chmod(0)
+        self.locked = {path.parent for path in self.herdr[:3]}
+        for directory in self.locked:
+            directory.chmod(0)
+            self.addCleanup(directory.chmod, 0o700)
+
+    def runner(self, argv):
+        argv = [str(arg) for arg in argv]
+        self.calls.append(argv)
+        if "bootstrap" in argv:
+            self.bootstrap_count += 1
+            return json.dumps({"account_id_hex": "cd" * 32, "npub": "npub1openrig", "label": "openrig-bridge"})
+        if "--version" in argv:
+            return f"wn-agent {setup.MDK_VERSION}"
+        if "check-readers" in argv:
+            return json.dumps({"checked_sessions": 1})
+        if "process.execPath" in argv:
+            return "/opt/node/22/bin/node\n"
+        return ""
+
+    def mocks(self):
+        def find(name, candidates=()):
+            return str(self.home / "seat-bin/rig") if name == "rig" else "/usr/bin/" + name
+        return patch.multiple(setup, find_executable=find, ensure_mdk=lambda runner: Path("/usr/bin/wn-agent"),
+            local_accounts=lambda path: [])
+
+    def assert_herdr_untouched(self):
+        for directory in self.locked:
+            self.assertEqual(directory.stat().st_mode & 0o777, 0, directory)
+            directory.chmod(0o700)
+        for path in self.herdr:
+            self.assertEqual(path.stat().st_mode & 0o777, 0, path)
+            path.chmod(0o600)
+            self.assertEqual(path.read_text(), f"herdr fixture {path.name}")
+        for call in self.calls:
+            text = " ".join(call)
+            for name in ("wn-agent-herdr", "herdr-white-noise-bridge.service", "codr.herdr-white-noise-bridge", ".marmot-agents/herdr"):
+                self.assertNotIn(name, text)
+
+    def test_openrig_setup_installs_its_own_bridge_and_reruns_keep_its_identity(self):
+        for manager in (services.LAUNCHD, services.SYSTEMD):
+            with self.subTest(manager=manager):
+                self.install_home(manager)
+                with self.mocks(), patch.object(services, "_capture", return_value="state = running"):
+                    result = setup.configure("npub1fixture", runner=self.runner, seats=["operator-agent@kernel"])
+                    config = setup.tomllib.loads(self.config.read_text())
+                    self.assertEqual(config["backend"], "openrig")
+                    self.assertEqual(config["openrig_seats"], ["operator-agent@kernel"])
+                    self.assertIs(config["phone_replies_only"], True)
+                    self.assertEqual(config["rig_bin"], str(self.rig.resolve()))
+                    self.assertEqual(config["account_id_hex"], "cd" * 32)
+                    self.assertEqual(config["wn_agent_socket"], str(self.home / ".marmot-agents/openrig/dev/wn-agent.sock"))
+                    self.assertEqual(config["state_path"], str(self.home / "state/codr-openrig/state.json"))
+                    self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(result["bridge_npub"], "npub1openrig")
+                    if manager == services.LAUNCHD:
+                        plist = plistlib.loads((self.agents / "io.github.tidley.codr.openrig-bridge.plist").read_bytes())
+                        self.assertEqual(plist["ProgramArguments"][1:], ["--config", str(self.config), "run"])
+                        self.assertTrue(plist["EnvironmentVariables"]["PATH"].startswith("/opt/node/22/bin" + os.pathsep))
+                        self.assertEqual(plist["StandardErrorPath"], str(self.home / "Library/Logs/codr/openrig-bridge.err.log"))
+                        self.assertTrue((self.agents / "io.github.tidley.codr.wn-agent-openrig.plist").exists())
+                    else:
+                        unit = (self.home / "config/systemd/user/openrig-bridge.service").read_text()
+                        self.assertIn('Environment="PATH=/opt/node/22/bin' + os.pathsep, unit)
+                        self.assertIn("Requires=wn-agent-openrig.service", unit)
+                        self.assertIn(".marmot-agents/openrig", (self.home / "config/systemd/user/wn-agent-openrig.service").read_text())
+                    original = self.config.read_bytes()
+                    again = setup.configure(None, runner=self.runner, openrig=True)
+                    self.assertEqual(self.config.read_bytes(), original)
+                    self.assertEqual(again["bridge_npub"], "npub1openrig")
+                    self.assertNotIn("restart", " ".join(" ".join(call) for call in self.calls))
+                    self.assertNotIn("-k", [part for call in self.calls for part in call])
+                    moved = setup.configure("npub1fixture", runner=self.runner, seats=["operator-agent@kernel", "dev-build@rig"])
+                    self.assertEqual(setup.tomllib.loads(self.config.read_text())["openrig_seats"], ["operator-agent@kernel", "dev-build@rig"])
+                    self.assertEqual(moved["openrig_seats"], ["operator-agent@kernel", "dev-build@rig"])
+                    self.assertEqual(setup.tomllib.loads(self.config.read_text())["account_id_hex"], "cd" * 32)
+                    restart = (["systemctl", "--user", "restart", "openrig-bridge.service"] if manager == services.SYSTEMD
+                               else ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/io.github.tidley.codr.openrig-bridge"])
+                    self.assertIn(restart, self.calls)
+                    setup.configure(None, runner=self.runner, openrig=True, check=True)
+                self.assertEqual(self.bootstrap_count, 1)
+                self.assertNotIn("nsec", json.dumps([result, again, moved]))
+                self.assert_herdr_untouched()
+
+    def test_openrig_setup_requires_a_seat_and_keeps_the_herdr_options_out(self):
+        self.install_home(services.LAUNCHD)
+        with self.mocks():
+            with self.assertRaisesRegex(setup.SetupError, "--seat"):
+                setup.configure("npub1fixture", runner=self.runner, openrig=True)
+            with self.assertRaises(setup.SetupError):
+                setup.configure("npub1fixture", self.home / "herdr.sock", self.runner, seats=["a@b"])
+            with self.assertRaises(setup.SetupError):
+                setup.configure("npub1fixture", runner=self.runner, enable_audio=True, seats=["a@b"])
+        self.assertFalse(self.config.exists())
+        self.assertEqual(self.bootstrap_count, 0)
+        self.assert_herdr_untouched()
+
+    def test_systemd_units_keep_a_template_path_and_add_a_missing_one(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = services.SystemdServices(lambda argv: "", setup.private_write, Path(temporary))
+            herdr = manager.install(services.Service("herdr-white-noise-bridge", "fixture", ["/bin/bridge", "run"], environment={"PATH": "/custom"}))
+            self.assertNotIn("/custom", herdr.read_text())
+            self.assertIn("Environment=PATH=%h/.local/bin", herdr.read_text())
+            openrig = manager.install(services.Service("openrig-bridge", "fixture", ["/bin/bridge", "run"], environment={"PATH": "/node/bin:/usr/bin"}))
+            self.assertIn('ExecStart="/bin/bridge" "run"\nEnvironment="PATH=/node/bin:/usr/bin"\n', openrig.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

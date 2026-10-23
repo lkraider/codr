@@ -99,6 +99,62 @@ Re-run setup with the same owner and socket. Matching service files are reused. 
 
 Ambiguous accounts or service files that differ from the proposed fresh configuration require inspection. Setup reports the conflict instead of overwriting them. Do not remove persistent state to make installation pass.
 
+## Install the OpenRig bridge
+
+The OpenRig bridge connects [OpenRig seats](REFERENCE.md#openrig-seats) to the phone. It runs beside the **herdr** bridge, with its own identity, configuration, state and services. Setup for it never reads, writes, stops or restarts the **herdr** bridge files and services. Install the **codr** binary first. The bridge needs a running OpenRig daemon, `rig` and `node`.
+
+```bash
+python3 scripts/setup.py --npub "$OWNER_NPUB" --seat operator-agent@kernel
+```
+
+Repeat `--seat` for each seat that gets a phone group. Setup writes these:
+
+- Configuration `${XDG_CONFIG_HOME:-~/.config}/codr-openrig/config.toml`, with `backend = "openrig"` and `phone_replies_only = true`.
+- State `${XDG_STATE_HOME:-~/.local/state}/codr-openrig/state.json`.
+- MDK home `~/.marmot-agents/openrig`, with its own bridge identity and socket.
+- On macOS, the LaunchAgents `io.github.tidley.codr.wn-agent-openrig` and `io.github.tidley.codr.openrig-bridge`, with logs in `~/Library/Logs/codr/`. On Linux, the user units `wn-agent-openrig.service` and `openrig-bridge.service`.
+
+Setup prints the bridge `npub`. Accept its invitation on the phone, as in [Verify on the phone](#verify-on-the-phone).
+
+`rig` starts with `#!/usr/bin/env node`. Setup stores the resolved `rig` path as `rig_bin` and puts the directory of the `node` that runs it first in the bridge service PATH. After you move or upgrade `node`, update `rig_bin` in the configuration and the PATH in the bridge service, then restart the bridge.
+
+Run the same command again to repair the services. It keeps the identity, the configuration and the state. `python3 scripts/setup.py --openrig --check` validates the configuration and the seat readers without changing services.
+
+### Move a seat to the OpenRig bridge
+
+Run setup again with the complete seat list:
+
+```bash
+python3 scripts/setup.py --seat operator-agent@kernel --seat dev-build@my-rig
+```
+
+Setup replaces `openrig_seats` and restarts the OpenRig bridge. Each new seat gets a new phone group. The **herdr** bridge keeps its own group for an agent that runs in a **herdr** pane, so both groups can get its replies. To stop the **herdr** bridge when no other pane needs it:
+
+```bash
+# Linux
+systemctl --user stop herdr-white-noise-bridge.service wn-agent-herdr.service
+# macOS
+launchctl bootout "gui/$(id -u)/io.github.tidley.codr.herdr-white-noise-bridge"
+launchctl bootout "gui/$(id -u)/io.github.tidley.codr.wn-agent-herdr"
+```
+
+### Remove the OpenRig bridge
+
+```bash
+# Linux
+systemctl --user disable --now openrig-bridge.service wn-agent-openrig.service
+rm "${XDG_CONFIG_HOME:-$HOME/.config}"/systemd/user/{openrig-bridge,wn-agent-openrig}.service
+systemctl --user daemon-reload
+# macOS
+launchctl bootout "gui/$(id -u)/io.github.tidley.codr.openrig-bridge"
+launchctl bootout "gui/$(id -u)/io.github.tidley.codr.wn-agent-openrig"
+rm ~/Library/LaunchAgents/io.github.tidley.codr.{openrig-bridge,wn-agent-openrig}.plist
+# Both
+rm -r "${XDG_CONFIG_HOME:-$HOME/.config}/codr-openrig" "${XDG_STATE_HOME:-$HOME/.local/state}/codr-openrig"
+```
+
+Keep `~/.marmot-agents/openrig` to install again with the same bridge identity. Delete it to remove the identity. Its phone groups then stop getting messages.
+
 ## Verify on the phone
 
 1. Compare the full bridge `npub` printed by setup with the inviter in White Noise.

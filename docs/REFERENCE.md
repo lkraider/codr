@@ -112,7 +112,7 @@ The setting is independent of `auto_forwarding`. It works with OpenCode, Codex, 
 
 ### OpenRig seats
 
-Set `backend = "openrig"` to connect OpenRig seats. The default backend is `herdr`. `openrig_seats` lists the seat session names that get a phone group, for example `["dev-build@my-rig"]`. `rig_bin` names the `rig` executable and defaults to `rig`. This mode does not use `herdr_socket`.
+Set `backend = "openrig"` to connect OpenRig seats. The default backend is `herdr`. `python3 scripts/setup.py --seat <seat>` installs a separate OpenRig bridge with its own identity and services. [Install the OpenRig bridge](INSTALL.md#install-the-openrig-bridge) says how to install it, move a seat to it, and remove it. `openrig_seats` lists the seat session names that get a phone group, for example `["dev-build@my-rig"]`. `rig_bin` names the `rig` executable and defaults to `rig`. This mode does not use `herdr_socket`.
 
 **codr** reads seats from `rig ps --nodes -A --json --full`. Each listed seat that runs Claude Code gets one group named `[cd] <seat>`. The group stays with the seat when the seat starts a new Claude session. **codr** then reads the new transcript. Replies already in that transcript stay off the phone, except a reply to a phone prompt. Transcripts are read from `claude_home`.
 

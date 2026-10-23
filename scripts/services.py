@@ -161,9 +161,11 @@ class SystemdServices:
     def install(self, service):
         template = (ROOT / "systemd" / f"{service.name}.service").read_text()
         try:
-            # The unit templates already carry PATH; environment overrides are for launchd.
-            text = _replace_directive(template, "ExecStart=",
-                                      "ExecStart=" + " ".join(systemd_argument(arg) for arg in service.argv))
+            # A variable the template sets keeps the template value, so existing units stay byte-identical.
+            missing = [f"Environment={systemd_argument(f'{key}={value}')}" for key, value in service.environment.items()
+                       if not re.search(rf'(?m)^Environment="?{re.escape(key)}=', template)]
+            text = _replace_directive(template, "ExecStart=", "\n".join(
+                ["ExecStart=" + " ".join(systemd_argument(arg) for arg in service.argv), *missing]))
         except ServiceError as error:
             raise self.error(str(error)) from error
         target = self.path(service)
