@@ -240,7 +240,14 @@ const EXPORT_V2: u8 = 2;
 /// the v1 `--pure export` command, so one failed attempt is expected after an upgrade.
 static EXPORT_API: AtomicU8 = AtomicU8::new(EXPORT_UNKNOWN);
 
+#[derive(Debug, thiserror::Error)]
+#[error("Configured OpenCode executable is missing; rerun setup")]
+struct MissingExecutable;
+
 async fn export_data(bin: &Path, session: &str) -> Result<Export> {
+    if bin.is_absolute() && !bin.is_file() {
+        return Err(MissingExecutable.into());
+    }
     let attempts = if EXPORT_API.load(Ordering::Relaxed) == EXPORT_V2 {
         [EXPORT_V2, EXPORT_V1]
     } else {
@@ -425,6 +432,9 @@ pub struct SessionSnapshot {
 
 /// Fixed diagnostics never include transcript content, IDs, paths, or CLI stderr.
 pub fn read_error_message(error: &anyhow::Error) -> &'static str {
+    if error.downcast_ref::<MissingExecutable>().is_some() {
+        return "configured OpenCode executable is missing; rerun setup";
+    }
     if let Some(rusqlite::Error::SqliteFailure(code, _)) = error.downcast_ref::<rusqlite::Error>() {
         return match code.code {
             rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
@@ -505,5 +515,22 @@ pub async fn read_snapshot(
             .map_err(|_| anyhow::anyhow!("Native transcript reader failed"))?
         }
         _ => Ok(SessionSnapshot::default()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_missing_absolute_executable_is_reported_clearly() {
+        let error = match export_data(Path::new("/nonexistent/opencode"), "ses_test").await {
+            Ok(_) => panic!("missing executable must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            read_error_message(&error),
+            "configured OpenCode executable is missing; rerun setup"
+        );
     }
 }

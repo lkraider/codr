@@ -70,6 +70,10 @@ Version 0.6.0 enables automatic handoff by default: a new local native prompt mu
 
 For an existing installation, setup validates the configuration and selects the release-matched connector. A managed transport upgrade pauses the bridge and transport, replaces only the transport executable in its unit, then restarts both services. Configuration, identities, and mappings are preserved. Custom transport overrides require inspection before an upgrade. `--check` validates without changing services.
 
+Setup stores the OpenCode executable's PATH entry, such as `/opt/homebrew/bin/opencode`, instead of Homebrew's versioned Cellar path. If an upgrade removes an absolute configured path and a replacement is installed, rerun setup: it validates session readers with the replacement before saving it, then restarts the worker. A failed restart restores the original configuration so setup can retry. `--check` reports an available repair without writing or restarting.
+
+Bare command names such as `opencode` keep their normal PATH lookup. Claude-only and Codex-only installations do not require OpenCode, including on repeat setup and `--check`. If OpenCode is unavailable, validation still fails when a live session needs its reader; without such a session, validation can be deferred.
+
 The binary installer replaces **codr**'s executable atomically. A running worker continues with its previous executable until restarted. Run setup first to select the matching connector. After that, a separately replaced bridge executable can be applied by restarting only the **codr** worker when work and group creation have settled:
 
 ```bash

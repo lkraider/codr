@@ -361,11 +361,16 @@ class SetupTests(unittest.TestCase):
             upgrade.assert_not_called()
 
     def test_setup_check_reports_deferred_readers_without_changing_services_or_config(self):
-        with self.mocks():
+        opencode = self.home / ".local/bin/opencode"
+        opencode.write_text("fixture")
+        opencode.chmod(0o700)
+        def find(name, candidates=()):
+            return str(opencode) if name == "opencode" else "/usr/bin/" + name
+        with self.mocks(), patch.object(setup, "find_executable", side_effect=find):
             setup.configure("npub1fixture", self.socket, self.runner)
         before = self.config.read_bytes()
         self.calls.clear()
-        with self.mocks(), patch.object(setup, "upgrade_transport") as upgrade:
+        with self.mocks(), patch.object(setup, "find_executable", side_effect=find), patch.object(setup, "upgrade_transport") as upgrade:
             result = setup.configure("npub1fixture", self.socket, self.runner, check=True)
             upgrade.assert_not_called()
         self.assertEqual(result["checked_session_readers"], 0)
@@ -425,8 +430,13 @@ class SetupTests(unittest.TestCase):
             return "/usr/bin/" + name
         with self.mocks(), patch.object(setup, "find_executable", side_effect=find):
             setup.configure("npub1fixture", self.socket, self.runner)
+            setup.configure("npub1fixture", self.socket, self.runner)
+            setup.configure("npub1fixture", self.socket, self.runner, check=True)
+            self.config.write_text(self.config.read_text().replace('opencode_bin = "opencode"', 'opencode_bin = "/removed/opencode"'))
+            setup.configure("npub1fixture", self.socket, self.runner)
+            setup.configure("npub1fixture", self.socket, self.runner, check=True)
         config = setup.tomllib.loads(self.config.read_text())
-        self.assertEqual(config["opencode_bin"], "opencode")
+        self.assertEqual(config["opencode_bin"], "/removed/opencode")
         self.assertEqual(config["codex_home"], str((self.home / ".codex").resolve()))
 
     def test_claude_only_install_does_not_require_opencode_or_codex(self):
@@ -436,6 +446,8 @@ class SetupTests(unittest.TestCase):
             return "/usr/bin/" + name
         with self.mocks(), patch.object(setup, "find_executable", side_effect=find):
             result = setup.configure("npub1fixture", self.socket, self.runner)
+            setup.configure("npub1fixture", self.socket, self.runner)
+            setup.configure("npub1fixture", self.socket, self.runner, check=True)
         config = setup.tomllib.loads(self.config.read_text())
         self.assertEqual(config["claude_home"], str((self.home / ".claude").resolve()))
         self.assertEqual(result["supported_agents"], ["claude"])
@@ -513,6 +525,122 @@ class SetupTests(unittest.TestCase):
                         self.assertEqual(payload["EnvironmentVariables"]["KEEP_ME"], "yes")
                         self.assertEqual(running["transport"], unit.read_text())
                     self.assertTrue(all(loaded.values()))
+
+    def test_find_executable_keeps_the_path_entry_instead_of_the_symlink_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real = root / "real-opencode"
+            real.write_text("fixture")
+            real.chmod(0o700)
+            link = root / "opencode"
+            link.symlink_to(real)
+            with patch.dict(os.environ, {"PATH": str(root)}):
+                self.assertEqual(setup.find_executable("opencode"), str(link))
+
+    def test_existing_install_repairs_a_moved_opencode_executable(self):
+        opencode = self.home / ".local/bin/opencode"
+        opencode.write_text("fixture")
+        opencode.chmod(0o700)
+        def find(name, candidates=()):
+            return str(opencode) if name == "opencode" else "/usr/bin/" + name
+        with self.mocks(), patch.object(setup, "find_executable", side_effect=find):
+            setup.configure("npub1fixture", self.socket, self.runner)
+            self.assertEqual(setup.tomllib.loads(self.config.read_text())["opencode_bin"], str(opencode))
+            text = self.config.read_text().replace(f'opencode_bin = "{opencode}"', 'opencode_bin = "/missing/opencode"')
+            self.config.write_text(text)
+            self.calls.clear()
+            setup.configure("npub1fixture", self.socket, self.runner)
+        self.assertEqual(setup.tomllib.loads(self.config.read_text())["opencode_bin"], str(opencode))
+        self.assertIn(["systemctl", "--user", "restart", "herdr-white-noise-bridge.service"], self.calls)
+
+    def test_check_reports_a_missing_opencode_executable_without_writing(self):
+        with self.mocks():
+            setup.configure("npub1fixture", self.socket, self.runner)
+        text = self.config.read_text().replace('opencode_bin = "/usr/bin/opencode"', 'opencode_bin = "/missing/opencode"')
+        self.config.write_text(text)
+        with self.mocks(), self.assertRaises(setup.SetupError):
+            setup.configure("npub1fixture", self.socket, self.runner, check=True)
+        self.assertIn('"/missing/opencode"', self.config.read_text())
+
+    def test_check_keeps_a_valid_opencode_path_command_without_repair(self):
+        with self.mocks():
+            setup.configure("npub1fixture", self.socket, self.runner)
+        executable = self.home / ".local/bin/opencode"
+        executable.write_text("fixture")
+        executable.chmod(0o700)
+        self.config.write_text(self.config.read_text().replace('opencode_bin = "/usr/bin/opencode"', 'opencode_bin = "opencode"'))
+        before = self.config.read_bytes()
+        self.calls.clear()
+        with self.mocks(), patch.dict(os.environ, {"PATH": str(executable.parent)}), patch.object(setup, "find_executable") as find:
+            setup.configure("npub1fixture", self.socket, self.runner, check=True)
+            find.assert_not_called()
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertFalse(any(call[0] in ("systemctl", "launchctl") for call in self.calls))
+
+    def test_failed_repair_reader_validation_preserves_config_and_retries_restart(self):
+        executable = self.home / ".local/bin/opencode"
+        executable.write_text("fixture")
+        executable.chmod(0o700)
+        with self.mocks():
+            setup.configure("npub1fixture", self.socket, self.runner)
+        self.config.write_text(self.config.read_text().replace('opencode_bin = "/usr/bin/opencode"', 'opencode_bin = "/missing/opencode"'))
+        before = self.config.read_bytes()
+        self.calls.clear()
+        def find(name, candidates=()):
+            return str(executable) if name == "opencode" else "/usr/bin/" + name
+        def fail_reader(argv):
+            if "check-readers" in argv:
+                candidate = Path(argv[argv.index("--config") + 1])
+                self.assertEqual(setup.tomllib.loads(candidate.read_text())["opencode_bin"], str(executable))
+                raise setup.SetupError("Reader unavailable")
+            return self.runner(argv)
+        with self.mocks(), patch.object(setup, "find_executable", side_effect=find), patch.object(setup, "upgrade_transport") as upgrade:
+            with self.assertRaisesRegex(setup.SetupError, "history check"):
+                setup.configure("npub1fixture", self.socket, fail_reader)
+            self.assertEqual(self.config.read_bytes(), before)
+            self.assertFalse(any(call[0] in ("systemctl", "launchctl") for call in self.calls))
+            upgrade.assert_not_called()
+            setup.configure("npub1fixture", self.socket, self.runner)
+        self.assertEqual(setup.tomllib.loads(self.config.read_text())["opencode_bin"], str(executable))
+        self.assertIn(["systemctl", "--user", "restart", "herdr-white-noise-bridge.service"], self.calls)
+
+    def test_failed_repair_restart_restores_config_so_retry_restarts_again(self):
+        executable = self.home / ".local/bin/opencode"
+        executable.write_text("fixture")
+        executable.chmod(0o700)
+        with self.mocks():
+            setup.configure("npub1fixture", self.socket, self.runner)
+        self.config.write_text(self.config.read_text().replace('opencode_bin = "/usr/bin/opencode"', 'opencode_bin = "/missing/opencode"'))
+        before = self.config.read_bytes()
+        restart = ["systemctl", "--user", "restart", "herdr-white-noise-bridge.service"]
+        def runner(argv):
+            if argv == restart:
+                raise setup.SetupError("Restart failed")
+            return self.runner(argv)
+        with self.mocks(), patch.object(setup, "find_executable", return_value=str(executable)), patch.object(setup, "upgrade_transport"):
+            with self.assertRaisesRegex(setup.SetupError, "Restart failed"):
+                setup.configure("npub1fixture", self.socket, runner)
+            self.assertEqual(self.config.read_bytes(), before)
+            self.calls.clear()
+            setup.configure("npub1fixture", self.socket, self.runner)
+        self.assertIn(restart, self.calls)
+
+    def test_unavailable_opencode_still_fails_a_required_live_reader(self):
+        with self.mocks():
+            setup.configure("npub1fixture", self.socket, self.runner)
+        self.config.write_text(self.config.read_text().replace('opencode_bin = "/usr/bin/opencode"', 'opencode_bin = "/missing/opencode"'))
+        before = self.config.read_bytes()
+        self.calls.clear()
+        def runner(argv):
+            if "check-readers" in argv:
+                raise setup.SetupError("OpenCode reader unavailable")
+            return self.runner(argv)
+        with self.mocks(), patch.object(setup, "find_executable", side_effect=setup.SetupError("Not installed")), patch.object(setup, "upgrade_transport") as upgrade:
+            with self.assertRaisesRegex(setup.SetupError, "history check"):
+                setup.configure("npub1fixture", self.socket, runner)
+            upgrade.assert_not_called()
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertFalse(any(call[0] in ("systemctl", "launchctl") for call in self.calls))
 
 
 if __name__ == "__main__":
