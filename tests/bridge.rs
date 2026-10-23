@@ -4411,7 +4411,7 @@ async fn phone_replies_only_stops_waiting_for_a_held_prompt_after_30_minutes_and
         assert_eq!(
             sent(
                 &calls,
-                "Stopped waiting for a phone prompt sent 30 minutes ago. Its reply will not be forwarded."
+                "Stopped waiting for a phone prompt sent more than 30 minutes ago. Its reply will not be forwarded."
             ),
             1 - expected,
             "age={age}"
