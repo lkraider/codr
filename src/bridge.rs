@@ -1214,7 +1214,9 @@ impl Bridge {
             }
         } else if previous.last_agent_status != agent.agent_status
             && agent.agent_status != "done"
-            && (!quiet || agent.agent_status == "blocked")
+            && (!self.config.phone_replies_only
+                || agent.agent_status == "blocked"
+                || resumed && !quiet)
         {
             let status = herdr::status_label(&agent.agent_status);
             self.state.enqueue(&group, &format!("> {status}"));

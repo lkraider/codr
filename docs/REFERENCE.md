@@ -334,7 +334,7 @@ Set `phone_replies_only = true` to send a final reply only when it answers a pro
 
 Claude Code holds a prompt typed while it works. It either adds that prompt to the running turn or starts a new turn with it when the running turn ends. In the first case, the final reply of the running turn answers both prompts and goes to the phone.
 
-Working and idle notices and editable progress follow the same rule. They go to the phone from a phone submission until the final reply of its turn. Blocked notices always go to the phone.
+Blocked notices always go to the phone. Working and idle notices stay off the phone, with one exception. A `> Working` notice right after `> Blocked` goes to the phone from a phone submission until the final reply of its turn. It tells you that the agent continued after the blocker. With `edit_responses = true`, editable progress goes to the phone from a phone submission until the final reply of its turn.
 
 The setting is independent of `auto_forwarding`. It works with OpenCode, Codex, and Claude Code transcripts.
 
