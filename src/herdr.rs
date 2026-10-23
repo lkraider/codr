@@ -35,10 +35,16 @@ pub struct Agent {
     #[serde(default)]
     pub foreground_cwd: Option<String>,
     pub terminal_title_stripped: Option<String>,
+    /// OpenRig session name. The seat keeps its group across Claude session changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
 }
 
 impl Agent {
     pub fn key(&self) -> String {
+        if let Some(seat) = &self.seat {
+            return serde_json::to_string(&("openrig", seat)).expect("strings serialize");
+        }
         match &self.agent_session {
             Some(s) => serde_json::to_string(&(&s.source, &s.agent, &s.kind, &s.value))
                 .expect("strings serialize"),
@@ -94,9 +100,14 @@ impl Agent {
                 .collect::<String>()
         };
         format!(
-            "Workspace: {}\nAgent: {}\nManaged by codr via HERDR.",
+            "Workspace: {}\nAgent: {}\nManaged by codr via {}.",
             clean(workspace),
-            clean(agent)
+            clean(agent),
+            if self.seat.is_some() {
+                "OpenRig"
+            } else {
+                "HERDR"
+            }
         )
     }
 }

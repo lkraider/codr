@@ -3,6 +3,7 @@ pub mod bridge;
 pub mod config;
 pub mod herdr;
 pub mod media;
+pub mod openrig;
 pub mod output;
 mod reads;
 pub mod state;

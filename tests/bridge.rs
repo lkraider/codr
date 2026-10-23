@@ -23,7 +23,10 @@ fn phone_npub() -> String {
 fn config(dir: &std::path::Path) -> BridgeConfig {
     BridgeConfig {
         phone_npub: phone_npub(),
+        backend: Default::default(),
         herdr_socket: dir.join("herdr.sock"),
+        openrig_seats: vec![],
+        rig_bin: "rig".into(),
         wn_agent_socket: dir.join("wn.sock"),
         account_id_hex: "aa".repeat(32),
         state_path: dir.join("state.json"),

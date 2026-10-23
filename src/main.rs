@@ -190,13 +190,21 @@ async fn main() -> Result<()> {
 }
 
 async fn check_readers(config: BridgeConfig) -> Result<usize> {
-    use herdr_white_noise_bridge::{herdr, output, wire::Socket};
-    let agents = herdr::snapshot(&Socket {
-        path: config.herdr_socket.clone(),
-    })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!("Session history check failed: HERDR snapshot is unavailable or invalid")
+    use herdr_white_noise_bridge::{config::Backend, herdr, openrig, output, wire::Socket};
+    let (agents, backend) = match config.backend {
+        Backend::Herdr => (
+            herdr::snapshot(&Socket {
+                path: config.herdr_socket.clone(),
+            })
+            .await,
+            "HERDR",
+        ),
+        Backend::OpenRig => (openrig::snapshot(&config).await, "OpenRig"),
+    };
+    let agents = agents.map_err(|_| {
+        anyhow::anyhow!(
+            "Session history check failed: {backend} snapshot is unavailable or invalid"
+        )
     })?;
     let sessions: std::collections::BTreeMap<_, _> = agents
         .into_iter()

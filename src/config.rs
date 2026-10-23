@@ -3,11 +3,28 @@ use bech32::FromBase32;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    #[default]
+    Herdr,
+    OpenRig,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeConfig {
     pub phone_npub: String,
+    #[serde(default)]
+    pub backend: Backend,
+    /// Required for the herdr backend.
+    #[serde(default)]
     pub herdr_socket: PathBuf,
+    /// OpenRig session names, such as `dev-build@my-rig`, that get a phone group.
+    #[serde(default)]
+    pub openrig_seats: Vec<String>,
+    #[serde(default = "default_rig")]
+    pub rig_bin: PathBuf,
     pub wn_agent_socket: PathBuf,
     pub account_id_hex: String,
     pub state_path: PathBuf,
@@ -43,6 +60,10 @@ fn automatic_default() -> bool {
 
 fn settled_reread_default() -> u64 {
     30
+}
+
+fn default_rig() -> PathBuf {
+    "rig".into()
 }
 
 fn default_opencode() -> PathBuf {
@@ -89,8 +110,21 @@ impl BridgeConfig {
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
             "Invalid bridge account ID"
         );
+        match config.backend {
+            Backend::Herdr => ensure!(
+                config.herdr_socket.is_absolute(),
+                "Configuration paths must be absolute"
+            ),
+            Backend::OpenRig => ensure!(
+                !config.openrig_seats.is_empty()
+                    && config
+                        .openrig_seats
+                        .iter()
+                        .all(|seat| !seat.trim().is_empty()),
+                "The openrig backend requires at least one seat in openrig_seats"
+            ),
+        }
         for path in [
-            &config.herdr_socket,
             &config.wn_agent_socket,
             &config.state_path,
             &config.codex_home,

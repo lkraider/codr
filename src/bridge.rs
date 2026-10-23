@@ -1,9 +1,9 @@
 use crate::{
     BridgeConfig, BridgeState,
-    config::phone_hex,
+    config::{Backend, phone_hex},
     forwarding,
     herdr::{self, Agent},
-    output,
+    openrig, output,
     state::Mapping,
     wire::{PROTOCOL, Socket, read_line},
 };
@@ -72,6 +72,34 @@ impl Bridge {
 
     pub fn save(&self) -> Result<()> {
         self.state.save(&self.config.state_path)
+    }
+
+    fn backend_name(&self) -> &'static str {
+        match self.config.backend {
+            Backend::Herdr => "HERDR",
+            Backend::OpenRig => "OpenRig",
+        }
+    }
+
+    pub async fn snapshot(&self) -> Result<Vec<Agent>> {
+        match self.config.backend {
+            Backend::Herdr => herdr::snapshot(&self.herdr).await,
+            Backend::OpenRig => openrig::snapshot(&self.config).await,
+        }
+    }
+
+    async fn current_agent(&self, agent: &Agent) -> Result<Agent> {
+        match self.config.backend {
+            Backend::Herdr => herdr::get(&self.herdr, agent).await,
+            Backend::OpenRig => openrig::get(&self.config, agent).await,
+        }
+    }
+
+    async fn prompt_agent(&self, agent: &Agent, text: &str) -> Result<()> {
+        match self.config.backend {
+            Backend::Herdr => herdr::prompt(&self.herdr, agent, text).await.map(drop),
+            Backend::OpenRig => openrig::prompt(&self.config, agent, text).await,
+        }
     }
 
     fn refresh_forwarding(&mut self) -> Result<()> {
@@ -689,6 +717,14 @@ impl Bridge {
             self.state.mappings.insert(key.to_owned(), m);
             self.save()?;
         }
+        if self.state.mappings[key]
+            .agent_record
+            .as_ref()
+            .is_some_and(|record| record.agent_session != agent.agent_session)
+        {
+            // A new session on the same seat brings a transcript with its own history.
+            self.state.mappings.get_mut(key).unwrap().output_initialised = false;
+        }
         self.baseline_forwarding(key, agent).await?;
         // Older bridge versions created these groups without a transcript watermark.
         // Seed their existing history once when enabling native reply support.
@@ -733,7 +769,7 @@ impl Bridge {
                         let group = response["group_id_hex"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| anyhow::anyhow!("Missing group ID"))?.to_owned();
                         let m = self.state.mappings.get_mut(key).unwrap(); m.group_id_hex = Some(group.clone()); m.creating = false;
                         m.group_name = Some(name.clone()); m.group_description = Some(description.clone());
-                        self.state.enqueue(&group, &format!("Connected to HERDR: {}. Send a message here to prompt this session. Use /status for its state.", agent.title()));
+                        self.state.enqueue(&group, &format!("Connected to {}: {}. Send a message here to prompt this session. Use /status for its state.", self.backend_name(), agent.title()));
                         self.save()?;
                     }
                     Err(error) => {
@@ -869,7 +905,8 @@ impl Bridge {
                     .unwrap()
                     .blocked_context_seq = Some(agent.state_change_seq);
             }
-        } else if agent.agent_status == "blocked"
+        } else if self.config.backend == Backend::Herdr
+            && agent.agent_status == "blocked"
             && self.state.mappings[key].blocked_context_seq != Some(agent.state_change_seq)
         {
             let response = self
@@ -1113,7 +1150,7 @@ impl Bridge {
             && !self.state.mappings[&key].pending_prompt
         {
             let agent = self.agents[&key].clone();
-            match herdr::get(&self.herdr, &agent).await {
+            match self.current_agent(&agent).await {
                 Ok(current) if current.settled() => {}
                 Err(error) if error.downcast_ref::<crate::wire::NotSubmitted>().is_some() => {
                     self.herdr_available = false;
@@ -1196,8 +1233,9 @@ impl Bridge {
         self.save()?;
         let response = if text == "/status" {
             Some(format!(
-                "> {} HERDR session: {}.",
+                "> {} {} session: {}.",
                 self.state.mappings[&key].last_agent_status,
+                self.backend_name(),
                 if self.agents.contains_key(&key) {
                     "connected"
                 } else {
@@ -1223,7 +1261,7 @@ impl Bridge {
                     }
                 }
                 self.save()?;
-                match herdr::prompt(&self.herdr, &agent, text).await {
+                match self.prompt_agent(&agent, text).await {
                     Ok(_) => {
                         self.state
                             .mappings
@@ -1244,6 +1282,12 @@ impl Bridge {
                             self.state.begin_response(&key, group);
                         }
                         None
+                    }
+                    Err(error) if error.downcast_ref::<openrig::NeedsInput>().is_some() => {
+                        let m = self.state.mappings.get_mut(&key).unwrap();
+                        m.pending_prompt = false;
+                        m.activity.cancel_phone(id);
+                        Some("The agent is waiting on a terminal prompt. Answer it at the desk, then resend.".into())
                     }
                     Err(error) => {
                         if error.downcast_ref::<crate::wire::NotSubmitted>().is_some() {
@@ -1581,7 +1625,8 @@ impl Bridge {
     }
 
     pub async fn rename_groups(&mut self) -> Result<()> {
-        let live: BTreeMap<_, _> = herdr::snapshot(&self.herdr)
+        let live: BTreeMap<_, _> = self
+            .snapshot()
             .await?
             .into_iter()
             .map(|a| (a.key(), a))
@@ -1616,7 +1661,10 @@ impl Bridge {
                 .as_ref()
                 .map(Agent::group_description)
                 .unwrap_or_else(|| {
-                    "Workspace: unknown\nAgent: unknown\nManaged by codr via HERDR.".into()
+                    format!(
+                        "Workspace: unknown\nAgent: unknown\nManaged by codr via {}.",
+                        self.backend_name()
+                    )
                 });
             // MDK 0.13 exposes the subject but not the description. Remember only
             // confirmed metadata writes, so matching titles can still gain details.
@@ -1820,9 +1868,9 @@ impl Bridge {
                     return Ok(());
                 },
                 _ = tick.tick() => {
-                    match herdr::snapshot(&self.herdr).await {
+                    match self.snapshot().await {
                         Ok(agents) => if self.reconcile(agents).await.is_err() { eprintln!("Session reconciliation failed; will retry."); },
-                        Err(_) => { self.herdr_available = false; recovery_due = true; eprintln!("HERDR is unavailable; waiting for reconnection."); }
+                        Err(_) => { self.herdr_available = false; recovery_due = true; eprintln!("{} is unavailable; waiting for reconnection.", self.backend_name()); }
                     }
                 },
                 _ = reads_ready.notified() => {

@@ -110,6 +110,14 @@ Working and idle notices and editable progress follow the same rule. They go to 
 
 The setting is independent of `auto_forwarding`. It works with OpenCode, Codex, and Claude Code transcripts.
 
+### OpenRig seats
+
+Set `backend = "openrig"` to connect OpenRig seats. The default backend is `herdr`. `openrig_seats` lists the seat session names that get a phone group, for example `["dev-build@my-rig"]`. `rig_bin` names the `rig` executable and defaults to `rig`. This mode does not use `herdr_socket`.
+
+**codr** runs `rig ps --nodes -A --json --full` every 3 seconds. Each listed seat that runs Claude Code gets one group named `[cd] <seat>`. The group stays with the seat when the seat starts a new Claude session. **codr** then reads the new transcript. Replies already in that transcript stay off the phone. Transcripts are read from `claude_home`.
+
+A phone prompt goes to the seat with `rig send <seat> --raw`. OpenRig refuses input while the agent waits on an interactive prompt. The phone then gets a notice to answer the prompt at the desk and resend. Decision cards and terminal context for a blocked agent need **herdr**.
+
 ### Editable progress and separate final replies
 
 Set `edit_responses = true` in the bridge configuration to enable editable progress. The release-matched connector includes the required `edit_message` API.

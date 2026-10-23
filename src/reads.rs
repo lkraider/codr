@@ -15,6 +15,7 @@ pub(crate) struct Pending;
 
 #[derive(Clone, PartialEq)]
 struct Context {
+    session: Option<String>,
     sequence: u64,
     status: String,
     revision: Option<String>,
@@ -107,6 +108,10 @@ impl Reads {
     ) -> Result<Arc<output::SessionSnapshot>> {
         let key = agent.key();
         let context = Context {
+            session: agent
+                .agent_session
+                .as_ref()
+                .map(|session| session.value.clone()),
             sequence: agent.state_change_seq,
             status: agent.agent_status.clone(),
             revision,
