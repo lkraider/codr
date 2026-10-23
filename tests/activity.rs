@@ -110,3 +110,34 @@ fn queued_input_never_mutes_and_a_queued_phone_echo_marks_the_running_turn() {
     assert!(!state.observe(&[peer, other, phone]));
     assert!(state.phone_turn("turn-1"));
 }
+
+#[test]
+fn a_held_phone_echo_waits_behind_local_input_and_a_later_match_drops_older_ones() {
+    let mut state = Activity::default();
+    state.baseline(&[]);
+    for (receipt, text) in [("lost", "first"), ("receipt", "hello")] {
+        state.start_phone(receipt, text, &[]);
+        state.confirm_phone(receipt);
+        state.hold_phone(receipt);
+    }
+    let local = input("local", "work").in_turn(Some("turn-1".into()));
+    assert!(state.observe(std::slice::from_ref(&local)));
+    assert!(state.awaiting_phone());
+    let phone = input("phone", "hello").in_turn(Some("turn-2".into()));
+    assert!(!state.observe(&[local.clone(), phone.clone()]));
+    assert!(state.phone_turn("turn-2"));
+    assert!(!state.awaiting_phone());
+    let late = input("late", "first").in_turn(Some("turn-3".into()));
+    assert!(state.observe(&[local, phone, late]));
+    assert!(!state.phone_turn("turn-3"));
+}
+
+#[test]
+fn an_unconfirmed_phone_submission_does_not_await_a_reply() {
+    let mut state = Activity::default();
+    state.baseline(&[]);
+    state.start_phone("receipt", "hello", &[]);
+    assert!(!state.awaiting_phone());
+    state.confirm_phone("receipt");
+    assert!(state.awaiting_phone());
+}

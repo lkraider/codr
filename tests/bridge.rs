@@ -4258,3 +4258,55 @@ async fn phone_replies_only_sends_status_notices_only_for_phone_prompts() {
         handle.abort();
     }
 }
+
+#[tokio::test]
+async fn phone_replies_only_answers_a_phone_prompt_queued_behind_a_peer_prompt() {
+    let (_dir, config, mut observed, calls, mut bridge, peers) = phone_only_bridge("working").await;
+    claude_transcript(
+        &config,
+        &[
+            ("u0", "user", "Old prompt"),
+            ("a0", "final", "Old final"),
+            ("u1", "user", "First peer message"),
+        ],
+    );
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.inbound(&inbound(HEX, "phone-busy")).await.unwrap();
+    claude_transcript(
+        &config,
+        &[
+            ("u0", "user", "Old prompt"),
+            ("a0", "final", "Old final"),
+            ("u1", "user", "First peer message"),
+            ("a1", "final", "Reply to the first peer"),
+            ("u2", "user", "Second peer message"),
+        ],
+    );
+    observed.agent_status = "idle".into();
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.flush().await.unwrap();
+    claude_transcript(
+        &config,
+        &[
+            ("u0", "user", "Old prompt"),
+            ("a0", "final", "Old final"),
+            ("u1", "user", "First peer message"),
+            ("a1", "final", "Reply to the first peer"),
+            ("u2", "user", "Second peer message"),
+            ("a2", "final", "Reply to the second peer"),
+            ("u3", "user", "test prompt"),
+            ("a3", "final", "Reply to the phone"),
+        ],
+    );
+    observed.agent_status = "idle".into();
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.flush().await.unwrap();
+    assert_eq!(sent(&calls, "Reply to the first peer"), 0);
+    assert_eq!(sent(&calls, "Reply to the second peer"), 0);
+    assert_eq!(sent(&calls, "Reply to the phone"), 1);
+    for handle in peers {
+        handle.abort();
+    }
+}
