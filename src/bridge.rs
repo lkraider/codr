@@ -941,12 +941,15 @@ impl Bridge {
             self.finish_queued_prompt(key, &history);
             self.observe_activity(key, &history)?;
             if self.config.phone_replies_only {
-                self.state
-                    .mappings
-                    .get_mut(key)
-                    .unwrap()
-                    .activity
-                    .retain_turns(&history.turns);
+                let answered = history.latest_turn.as_ref().is_some_and(|latest| {
+                    history
+                        .finals
+                        .iter()
+                        .any(|reply| reply.turn.as_ref() == Some(latest))
+                });
+                let activity = &mut self.state.mappings.get_mut(key).unwrap().activity;
+                activity.retain_turns(&history.turns);
+                activity.track_latest(history.latest_turn.as_deref(), answered);
             }
             if !self.state.forwarding_enabled {
                 let mapping = self.state.mappings.get_mut(key).unwrap();
@@ -1176,8 +1179,9 @@ impl Bridge {
         let status_changed = previous.last_agent_status != agent.agent_status;
         let resumed = previous.last_agent_status == "blocked";
         let previous_settled = matches!(previous.last_agent_status.as_str(), "idle" | "done");
+        let quiet = self.config.phone_replies_only && !previous.activity.awaiting_phone();
         if self.config.edit_responses {
-            if agent.agent_status == "working" {
+            if agent.agent_status == "working" && !quiet {
                 if resumed {
                     self.state.resume_response(key, &group);
                 }
@@ -1208,7 +1212,10 @@ impl Bridge {
                     false,
                 );
             }
-        } else if previous.last_agent_status != agent.agent_status && agent.agent_status != "done" {
+        } else if previous.last_agent_status != agent.agent_status
+            && agent.agent_status != "done"
+            && (!quiet || agent.agent_status == "blocked")
+        {
             let status = herdr::status_label(&agent.agent_status);
             self.state.enqueue(&group, &format!("> {status}"));
         }
@@ -1222,6 +1229,7 @@ impl Bridge {
         }
         self.save()?;
         if self.config.edit_responses
+            && !quiet
             && self.state.forwarding_enabled
             && (agent.agent_status == "working"
                 || (agent.settled() && self.state.mappings[key].response_id.is_some()))
