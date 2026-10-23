@@ -759,6 +759,25 @@ class OpenRigSetupTests(unittest.TestCase):
                 self.assertNotIn("nsec", json.dumps([result, again, moved]))
                 self.assert_herdr_untouched()
 
+    def test_failed_seat_change_restart_restores_config_so_retry_restarts_again(self):
+        self.install_home(services.SYSTEMD)
+        restart = ["systemctl", "--user", "restart", "openrig-bridge.service"]
+        def runner(argv):
+            if [str(arg) for arg in argv] == restart:
+                raise setup.SetupError("Restart failed")
+            return self.runner(argv)
+        with self.mocks(), patch.object(services, "_capture", return_value="state = running"):
+            setup.configure("npub1fixture", runner=self.runner, seats=["a@kernel"])
+            before = self.config.read_bytes()
+            with self.assertRaisesRegex(setup.SetupError, "Restart failed"):
+                setup.configure(None, runner=runner, seats=["a@kernel", "b@rig"])
+            self.assertEqual(self.config.read_bytes(), before)
+            self.calls.clear()
+            setup.configure(None, runner=self.runner, seats=["a@kernel", "b@rig"])
+        self.assertIn(restart, self.calls)
+        self.assertEqual(setup.tomllib.loads(self.config.read_text())["openrig_seats"], ["a@kernel", "b@rig"])
+        self.assert_herdr_untouched()
+
     def test_openrig_setup_requires_a_seat_and_keeps_the_herdr_options_out(self):
         self.install_home(services.LAUNCHD)
         with self.mocks():

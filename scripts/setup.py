@@ -432,8 +432,14 @@ def configure_openrig(owner, seats, runner, check):
             runner([str(bridge), "--config", str(candidate), "status"])
             checked = check_readers(bridge, candidate, runner)
         if moved:
+            original = config.read_text()
             private_write(config, text)
-            manager.restart(OPENRIG.bridge)
+            try:
+                manager.restart(OPENRIG.bridge)
+            except BaseException:
+                # Keep the seat change detectable on the next setup attempt.
+                private_write(config, original)
+                raise
         if not check:
             upgrade_transport(existing, config_root, runner, OPENRIG)
             manager.start(OPENRIG.bridge)
