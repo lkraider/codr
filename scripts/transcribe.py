@@ -25,17 +25,22 @@ class UnixHTTPConnection(http.client.HTTPConnection):
         self.sock.connect(self.path)
 
 
+def normalise(audio, ffmpeg, directory):
+    wav = Path(directory) / "audio.wav"
+    subprocess.run([ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(audio),
+                    "-t", "301", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav)],
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   check=True, timeout=45)
+    with wave.open(str(wav), "rb") as recording:
+        duration = recording.getnframes() / recording.getframerate()
+        if duration <= 0 or duration > 300:
+            raise ValueError("Audio must contain at most five minutes of speech")
+    return wav
+
+
 def transcribe(audio, socket_path, ffmpeg):
     with tempfile.TemporaryDirectory(prefix="codr-audio-") as temporary:
-        wav = Path(temporary) / "audio.wav"
-        subprocess.run([ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(audio),
-                        "-t", "301", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav)],
-                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       check=True, timeout=45)
-        with wave.open(str(wav), "rb") as recording:
-            duration = recording.getnframes() / recording.getframerate()
-            if duration <= 0 or duration > 300:
-                raise ValueError("Audio must contain at most five minutes of speech")
+        wav = normalise(audio, ffmpeg, temporary)
         boundary = "codr-" + uuid.uuid4().hex
         body = (f'--{boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nphonon-2\r\n'
                 f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\n'

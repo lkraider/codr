@@ -162,7 +162,7 @@ The gallery uses an owner-created group, bound to an isolated demo session. Alex
 
 ## Images and voice messages
 
-Images and audio are available in **codr** 0.5.0. Voice prompts require the local transcription worker described below.
+Images and audio are available in **codr** 0.5.0. Voice prompts require a transcription command. Setup installs the local worker described below. The [Gemini script](#gemini-transcription) sends audio to Google instead.
 
 **codr** asks MDK's `download_media` API to fetch and decrypt each attachment. Keys stay in MDK. PNG, JPEG, WebP, and GIF images are copied into a private `media` directory beside bridge state. The prompt includes the local file paths and the original caption. The agent needs its normal local-file access to inspect them. Files remain there for later conversation access until you remove them.
 
@@ -198,6 +198,24 @@ journalctl --user -u codr-phonon.service
 launchctl print "gui/$(id -u)/io.github.tidley.codr.codr-phonon"
 tail -n 50 ~/Library/Logs/codr/codr-phonon.err.log
 ```
+
+### Gemini transcription
+
+`scripts/transcribe_gemini.py` sends each recording to the Gemini API model `gemini-3.5-transcribe`. Use it on a host where the local worker is too slow or too large. **The audio leaves the machine and goes to Google.** Google's API terms apply to it.
+
+The script uses the same FFmpeg conversion and five-minute limit as the local worker. The model detects the spoken language and returns a verbatim transcript in that language. It needs Python 3 and FFmpeg, with no extra packages.
+
+1. Create an API key in Google AI Studio.
+2. Put the key in `~/.config/codr/gemini-api-key`, then run `chmod 600 ~/.config/codr/gemini-api-key`. The script refuses a key file with group or other access.
+3. Set the command in the bridge configuration:
+
+   ```toml
+   transcribe_command = ["/usr/bin/python3", "/absolute/path/to/codr/scripts/transcribe_gemini.py", "--ffmpeg", "/opt/homebrew/bin/ffmpeg"]
+   ```
+
+4. Restart the bridge.
+
+The key goes in the `x-goog-api-key` request header. On failure, the script exits non-zero with a one-line reason on stderr. The reason never contains the key or the response body. **codr** discards stderr, so run the script by hand with an audio file to see the reason.
 
 Normalised audio files are temporary and removed after each attempt. MDK manages its downloaded temporary files. Image copies stay in **codr**'s private media directory. Do not commit media, transcripts, or model files to Git.
 

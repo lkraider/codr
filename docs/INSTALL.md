@@ -250,4 +250,4 @@ python3 scripts/setup.py --npub "$OWNER_NPUB"
 
 `plugin link` does not run the download hook. Keep the linked checkout at its permanent location. The startup hook starts the configured worker after **herdr** restores its session; a client disconnect does not stop it.
 
-Use `python3 scripts/setup.py --npub "$OWNER_NPUB" --no-audio` to skip speech setup. Existing installations can add it with `python3 scripts/setup.py --phonon`. See [media and speech details](REFERENCE.md#images-and-voice-messages).
+Use `python3 scripts/setup.py --npub "$OWNER_NPUB" --no-audio` to skip speech setup. Existing installations can add it with `python3 scripts/setup.py --phonon`. To transcribe with the Gemini API instead, see [Gemini transcription](REFERENCE.md#gemini-transcription). That option sends audio to Google. See [media and speech details](REFERENCE.md#images-and-voice-messages).
