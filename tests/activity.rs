@@ -141,3 +141,33 @@ fn an_unconfirmed_phone_submission_does_not_await_a_reply() {
     state.confirm_phone("receipt");
     assert!(state.awaiting_phone());
 }
+
+#[test]
+fn identical_held_phone_echoes_match_the_oldest_submission_first() {
+    let mut state = Activity::default();
+    state.baseline(&[]);
+    for receipt in ["first", "second"] {
+        state.start_phone(receipt, "yes", &[]);
+        state.confirm_phone(receipt);
+        state.hold_phone(receipt);
+    }
+    let one = input("one", "yes").in_turn(Some("turn-1".into()));
+    assert!(!state.observe(std::slice::from_ref(&one)));
+    assert!(state.phone_turn("turn-1"));
+    assert!(state.awaiting_phone());
+    let two = input("two", "yes").in_turn(Some("turn-2".into()));
+    assert!(!state.observe(&[one, two]));
+    assert!(state.phone_turn("turn-2"));
+    assert!(!state.awaiting_phone());
+}
+
+#[test]
+fn identical_unheld_phone_echoes_stay_ambiguous() {
+    let mut state = Activity::default();
+    state.baseline(&[]);
+    for receipt in ["first", "second"] {
+        state.start_phone(receipt, "yes", &[]);
+        state.confirm_phone(receipt);
+    }
+    assert!(state.observe(&[input("one", "yes")]));
+}
