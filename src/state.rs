@@ -96,6 +96,9 @@ pub struct BridgeState {
     /// Authorised inbound media awaiting download/transcription. No terminal input yet.
     #[serde(default)]
     pub media_pending: Vec<serde_json::Value>,
+    /// Sequence number of the last OpenRig event read, sent back as `Last-Event-ID`.
+    #[serde(default)]
+    pub openrig_event_seq: Option<u64>,
 }
 
 fn forwarding_default() -> bool {
@@ -113,6 +116,7 @@ impl Default for BridgeState {
             forwarding_enabled: true,
             forwarding_revision: None,
             forwarding_resume_pending: false,
+            openrig_event_seq: None,
             media_pending: vec![],
         }
     }

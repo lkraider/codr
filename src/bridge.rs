@@ -559,9 +559,18 @@ impl Bridge {
             let history = self.read_history(agent).await?;
             let mapping = self.state.mappings.get_mut(key).unwrap();
             mapping.activity.baseline(&history.user_inputs);
-            mapping
-                .final_ids
-                .extend(history.finals.into_iter().map(|reply| reply.id));
+            // A new session's transcript can already hold the reply to a phone prompt sent before the change.
+            let phone_turn = |turn: &Option<String>| {
+                turn.as_ref()
+                    .is_some_and(|turn| mapping.activity.phone_turn(turn))
+            };
+            let seen: Vec<_> = history
+                .finals
+                .into_iter()
+                .filter(|reply| !phone_turn(&reply.turn))
+                .map(|reply| reply.id)
+                .collect();
+            mapping.final_ids.extend(seen);
             mapping.output_initialised = true;
             mapping.last_export_at = now();
             self.save()?;
@@ -1033,6 +1042,42 @@ impl Bridge {
         self.reconcile(agents).await
     }
 
+    /// Applies a batch of OpenRig events. Hook states patch the last snapshot, and anything else reads `rig ps` again.
+    pub async fn apply_events(&mut self, events: Vec<openrig::Event>) -> Result<()> {
+        let mut resync = false;
+        let mut statuses = BTreeMap::new();
+        for event in events {
+            if event.seq.is_some() {
+                self.state.openrig_event_seq = event.seq;
+            }
+            match event.action {
+                openrig::Action::Ignore => {}
+                openrig::Action::Resync => resync = true,
+                openrig::Action::Status { seat, status } => {
+                    statuses.insert(seat, (status, event.seq.unwrap_or_default()));
+                }
+            }
+        }
+        let mut agents = self.last_snapshot.clone();
+        resync |= statuses
+            .keys()
+            .any(|seat| !agents.iter().any(|agent| agent.seat.as_ref() == Some(seat)));
+        if resync {
+            agents = self.snapshot().await?;
+        } else if statuses.is_empty() {
+            return Ok(());
+        } else {
+            for agent in &mut agents {
+                if let Some((status, seq)) = agent.seat.as_ref().and_then(|seat| statuses.get(seat))
+                {
+                    agent.agent_status.clone_from(status);
+                    agent.state_change_seq = *seq;
+                }
+            }
+        }
+        self.reconcile(agents).await
+    }
+
     pub async fn poll_ready_sessions(&mut self) -> Result<()> {
         // Completion wakes apply existing reads without starting another polling round.
         // Preserve unknown-session terminals from the authoritative HERDR snapshot.
@@ -1283,11 +1328,19 @@ impl Bridge {
                         }
                         None
                     }
-                    Err(error) if error.downcast_ref::<openrig::NeedsInput>().is_some() => {
+                    Err(error) if error.downcast_ref::<openrig::Refused>().is_some() => {
+                        let reason = &error.downcast_ref::<openrig::Refused>().unwrap().0;
+                        let notice = if reason == "target_needs_input" {
+                            "The agent is waiting on a terminal prompt. Answer it at the desk, then resend.".into()
+                        } else {
+                            format!(
+                                "OpenRig did not type the prompt ({reason}). Resend it when the seat accepts input."
+                            )
+                        };
                         let m = self.state.mappings.get_mut(&key).unwrap();
                         m.pending_prompt = false;
                         m.activity.cancel_phone(id);
-                        Some("The agent is waiting on a terminal prompt. Answer it at the desk, then resend.".into())
+                        Some(notice)
                     }
                     Err(error) => {
                         if error.downcast_ref::<crate::wire::NotSubmitted>().is_some() {
@@ -1853,9 +1906,19 @@ impl Bridge {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
+        let (event_tx, mut events) = tokio::sync::mpsc::channel::<openrig::Event>(256);
+        let follower = (self.config.backend == Backend::OpenRig).then(|| {
+            let config = self.config.clone();
+            let since = self.state.openrig_event_seq;
+            tokio::spawn(async move { openrig::follow(&config, since, event_tx).await })
+        });
         // Authoritative snapshots avoid relying on HERDR's non-durable, differently shaped event payloads.
         // State-change sequence and stored assistant message IDs also catch work completed between snapshots.
-        let mut tick = tokio::time::interval(Duration::from_secs(3));
+        // OpenRig events drive its seats, so its snapshot only resyncs.
+        let mut tick = tokio::time::interval(Duration::from_secs(match self.config.backend {
+            Backend::Herdr => 3,
+            Backend::OpenRig => 60,
+        }));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut recovery_due = true;
         let mut recovery_tick = tokio::time::interval(Duration::from_secs(60));
@@ -1864,6 +1927,7 @@ impl Bridge {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     subscriber.abort();
+                    if let Some(follower) = &follower { follower.abort(); }
                     if let Some(job) = self.media_job.take() { job.abort(); }
                     return Ok(());
                 },
@@ -1871,6 +1935,14 @@ impl Bridge {
                     match self.snapshot().await {
                         Ok(agents) => if self.reconcile(agents).await.is_err() { eprintln!("Session reconciliation failed; will retry."); },
                         Err(_) => { self.herdr_available = false; recovery_due = true; eprintln!("{} is unavailable; waiting for reconnection.", self.backend_name()); }
+                    }
+                },
+                Some(event) = events.recv() => {
+                    let mut batch = vec![event];
+                    while let Ok(event) = events.try_recv() { batch.push(event); }
+                    if self.apply_events(batch).await.is_err() {
+                        recovery_due = true;
+                        eprintln!("OpenRig event handling failed; the next resync retries it.");
                     }
                 },
                 _ = reads_ready.notified() => {

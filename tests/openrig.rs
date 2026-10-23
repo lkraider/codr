@@ -1,12 +1,22 @@
 use bech32::ToBase32;
-use herdr_white_noise_bridge::{BridgeConfig, bridge::Bridge, config::Backend, wire::read_line};
+use herdr_white_noise_bridge::{
+    BridgeConfig,
+    bridge::Bridge,
+    config::Backend,
+    openrig::{self, Action, Event},
+    wire::read_line,
+};
 use serde_json::{Value, json};
 use std::{
     os::unix::fs::PermissionsExt,
     path::Path,
     sync::{Arc, Mutex},
 };
-use tokio::{io::AsyncWriteExt, net::UnixListener};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, UnixListener},
+    sync::mpsc,
+};
 
 // Synthetic test identity. Never use it as an installation owner.
 const HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -335,7 +345,25 @@ async fn a_rig_send_refusal_at_an_interactive_prompt_tells_the_phone_and_is_not_
 
     send_reply(
         dir.path(),
-        json!({"ok":false,"sessionName":SEAT,"sent":false,"reason":"guard_unavailable"}),
+        json!({"ok":false,"sessionName":SEAT,"sent":false,"reason":"typing_guard_enabled",
+            "error":"Typing guard prevents submit-only; no Enter was sent."}),
+        1,
+    );
+    bridge.inbound(&inbound("phone-3", "go on")).await.unwrap();
+    bridge.flush().await.unwrap();
+    assert_eq!(
+        sent(
+            &calls,
+            "OpenRig did not type the prompt (typing_guard_enabled). Resend it when the seat accepts input."
+        ),
+        1
+    );
+    bridge.inbound(&inbound("phone-3", "go on")).await.unwrap();
+    assert_eq!(rig_calls(dir.path(), "send").len(), 2);
+
+    send_reply(
+        dir.path(),
+        json!({"ok":false,"sessionName":SEAT,"sent":false}),
         1,
     );
     assert!(bridge.inbound(&inbound("phone-2", "go on")).await.is_err());
@@ -347,8 +375,214 @@ async fn a_rig_send_refusal_at_an_interactive_prompt_tells_the_phone_and_is_not_
     );
     tick(&mut bridge).await;
     bridge.inbound(&inbound("phone-2", "go on")).await.unwrap();
-    assert_eq!(rig_calls(dir.path(), "send").len(), 3);
+    assert_eq!(rig_calls(dir.path(), "send").len(), 4);
     assert!(bridge.state.mappings[&key].pending_prompt);
+    peer.abort();
+}
+
+/// Events recorded from a live `/api/events` stream, renamed to the test seat and renumbered from 101.
+fn recorded() -> Vec<String> {
+    include_str!("fixtures/openrig-events.jsonl")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn frame(events: &[String]) -> String {
+    let mut body = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n".to_owned();
+    for event in events {
+        match serde_json::from_str::<Value>(event) {
+            Ok(value) => body.push_str(&format!("data: {event}\nid: {}\n\n", value["seq"])),
+            Err(_) => body.push_str(&format!("data: {event}\n\n")),
+        }
+    }
+    body
+}
+
+/// Serves one reply per connection and keeps the last connection open.
+async fn event_server(replies: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(vec![]));
+    let seen = requests.clone();
+    tokio::spawn(async move {
+        for (index, reply) in replies.iter().enumerate() {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![];
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).await.unwrap() == 1 {
+                request.push(byte[0]);
+            }
+            seen.lock()
+                .unwrap()
+                .push(String::from_utf8(request).unwrap());
+            stream.write_all(reply.as_bytes()).await.unwrap();
+            if index + 1 == replies.len() {
+                std::future::pending::<()>().await;
+            }
+        }
+    });
+    (url, requests)
+}
+
+async fn follow(config: &BridgeConfig, since: Option<u64>, count: usize) -> Vec<Event> {
+    let (tx, mut rx) = mpsc::channel(16);
+    let config = config.clone();
+    let follower = tokio::spawn(async move { openrig::follow(&config, since, tx).await });
+    let mut events = vec![];
+    while events.len() < count {
+        let next = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv());
+        events.push(next.await.unwrap().unwrap());
+    }
+    follower.abort();
+    events
+}
+
+fn status(seq: u64, status: &str) -> Event {
+    Event {
+        seq: Some(seq),
+        action: Action::Status {
+            seat: SEAT.into(),
+            status: status.into(),
+        },
+    }
+}
+
+fn ignored(seq: Option<u64>) -> Event {
+    Event {
+        seq,
+        action: Action::Ignore,
+    }
+}
+
+const RESYNC: Event = Event {
+    seq: None,
+    action: Action::Resync,
+};
+
+#[tokio::test]
+async fn a_stop_hook_on_the_event_stream_forwards_the_reply_without_waiting_for_rig_ps() {
+    let (dir, mut config, calls, mut bridge, peer) = connected_seat().await;
+    bridge.inbound(&inbound("phone-1", "Fix it")).await.unwrap();
+    transcript(
+        &config,
+        FIRST,
+        &[
+            ("u0", "user", "Old prompt"),
+            ("a0", "final", "Old final"),
+            ("u1", "user", "Fix it"),
+            ("a1", "final", "Fixed"),
+        ],
+    );
+    let lines = recorded();
+    let replay = [
+        lines[0].clone(),
+        lines[1].clone(),
+        "{\"type\":\"agent.activity\",".to_owned(),
+        lines[2].clone(),
+        lines[3].clone(),
+    ];
+    let (url, _) = event_server(vec![frame(&replay)]).await;
+    config.openrig_url = url;
+    let events = follow(&config, Some(100), 6).await;
+    assert_eq!(
+        events,
+        [
+            RESYNC,
+            ignored(Some(101)),
+            ignored(Some(102)),
+            ignored(None),
+            status(103, "working"),
+            status(104, "idle"),
+        ]
+    );
+    let listed = rig_calls(dir.path(), "ps").len();
+    for event in events {
+        bridge.apply_events(vec![event]).await.unwrap();
+    }
+    bridge.flush().await.unwrap();
+    assert_eq!(sent(&calls, "Fixed"), 1);
+    assert_eq!(rig_calls(dir.path(), "ps").len(), listed + 1);
+    assert_eq!(bridge.state.openrig_event_seq, Some(104));
+    peer.abort();
+}
+
+#[tokio::test]
+async fn a_dropped_stream_resumes_from_the_last_event_id_across_a_restart() {
+    let (dir, mut config, _calls, mut bridge, peer) = connected_seat().await;
+    let lines = recorded();
+    let (url, requests) = event_server(vec![
+        frame(&lines[..1]),
+        "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n".into(),
+        frame(&lines[3..4]),
+    ])
+    .await;
+    config.openrig_url = url;
+    let events = follow(&config, Some(100), 4).await;
+    assert_eq!(
+        events,
+        [RESYNC, ignored(Some(101)), RESYNC, status(104, "idle")]
+    );
+    let requests = requests.lock().unwrap().clone();
+    assert!(requests[0].contains("Last-Event-ID: 100\r\n"));
+    assert!(requests[1].contains("Last-Event-ID: 101\r\n"));
+    assert!(requests[2].contains("Last-Event-ID: 101\r\n"));
+    bridge.apply_events(events).await.unwrap();
+    drop(bridge);
+    let reopened = Bridge::open(config).unwrap();
+    assert_eq!(reopened.state.openrig_event_seq, Some(104));
+    drop(dir);
+    peer.abort();
+}
+
+#[tokio::test]
+async fn a_first_start_acts_only_on_events_created_after_it_connects() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    let lines = recorded();
+    let mut fresh: Value = serde_json::from_str(&lines[3]).unwrap();
+    fresh["seq"] = json!(200);
+    fresh["createdAt"] = json!("9999-12-31 23:59:59");
+    let (url, requests) = event_server(vec![frame(&[lines[3].clone(), fresh.to_string()])]).await;
+    config.openrig_url = url;
+    let events = follow(&config, None, 3).await;
+    assert_eq!(events, [RESYNC, ignored(Some(104)), status(200, "idle")]);
+    assert!(!requests.lock().unwrap()[0].contains("Last-Event-ID"));
+}
+
+#[tokio::test]
+async fn a_session_change_event_follows_the_new_session_and_keeps_the_phone_reply() {
+    let (dir, mut config, calls, mut bridge, peer) = connected_seat().await;
+    bridge
+        .inbound(&inbound("phone-1", "Next step"))
+        .await
+        .unwrap();
+    // The seat restarts into a new session before codr reads the prompt in the old one.
+    transcript(
+        &config,
+        SECOND,
+        &[("n0", "user", "Next step"), ("n1", "final", "Next final")],
+    );
+    seats(dir.path(), &[node(SEAT, SECOND, "idle", 2)]);
+    let (url, _) = event_server(vec![frame(&recorded()[4..])]).await;
+    config.openrig_url = url;
+    let events = follow(&config, Some(104), 2).await;
+    assert_eq!(
+        events,
+        [
+            RESYNC,
+            Event {
+                seq: Some(105),
+                action: Action::Resync
+            }
+        ]
+    );
+    bridge.apply_events(events).await.unwrap();
+    bridge.flush().await.unwrap();
+    let key = json!(["openrig", SEAT]).to_string();
+    let record = bridge.state.mappings[&key].agent_record.as_ref().unwrap();
+    assert_eq!(record.agent_session.as_ref().unwrap().value, SECOND);
+    assert_eq!(sent(&calls, "Next final"), 1);
     peer.abort();
 }
 

@@ -25,6 +25,9 @@ pub struct BridgeConfig {
     pub openrig_seats: Vec<String>,
     #[serde(default = "default_rig")]
     pub rig_bin: PathBuf,
+    /// Base URL of the OpenRig daemon, which serves the event stream at `/api/events`.
+    #[serde(default = "default_openrig_url")]
+    pub openrig_url: String,
     pub wn_agent_socket: PathBuf,
     pub account_id_hex: String,
     pub state_path: PathBuf,
@@ -64,6 +67,10 @@ fn settled_reread_default() -> u64 {
 
 fn default_rig() -> PathBuf {
     "rig".into()
+}
+
+fn default_openrig_url() -> String {
+    "http://127.0.0.1:7433".into()
 }
 
 fn default_opencode() -> PathBuf {

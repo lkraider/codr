@@ -5,12 +5,37 @@ use crate::{
 };
 use anyhow::{Result, bail, ensure};
 use serde_json::Value;
-use std::time::Duration;
-use tokio::{process::Command, time::timeout};
+use std::{process::Stdio, time::Duration};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::Command,
+    sync::mpsc::Sender,
+    time::timeout,
+};
 
+/// OpenRig typed nothing and gave this reason, such as `target_needs_input` or `typing_guard_enabled`.
 #[derive(Debug, thiserror::Error)]
-#[error("OpenRig refused input while the agent waits on an interactive prompt")]
-pub struct NeedsInput;
+#[error("OpenRig refused the prompt: {0}")]
+pub struct Refused(pub String);
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Event {
+    /// The SSE id, which OpenRig sets to the event's `seq`.
+    pub seq: Option<u64>,
+    pub action: Action,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Action {
+    Ignore,
+    /// A Claude Code hook moved a listed seat to this `rig ps` agent status.
+    Status {
+        seat: String,
+        status: String,
+    },
+    /// Seats or sessions changed, or events were missed. Read `rig ps` again.
+    Resync,
+}
 
 pub async fn snapshot(config: &BridgeConfig) -> Result<Vec<Agent>> {
     let output = timeout(
@@ -50,22 +75,20 @@ fn agent(node: &Value) -> Agent {
             kind: "id".into(),
             value: token.into(),
         });
-    let reported = &node["agentActivity"]["state"];
     let decided = &node["activityState"];
-    let status =
-        if reported == "needs_input" || decided["needsInput"]["count"].as_u64().unwrap_or(0) > 0 {
-            "blocked"
-        } else {
-            match reported.as_str() {
-                Some("running") => "working",
-                Some("idle") => "idle",
-                _ => match decided["display"].as_str() {
-                    Some("working") => "working",
-                    Some("idle") => "idle",
-                    _ => "unknown",
-                },
-            }
-        };
+    let status = if decided["needsInput"]["count"].as_u64().unwrap_or(0) > 0 {
+        "blocked"
+    } else {
+        node["agentActivity"]["state"]
+            .as_str()
+            .and_then(status)
+            .or(match decided["display"].as_str() {
+                Some("working") => Some("working"),
+                Some("idle") => Some("idle"),
+                _ => None,
+            })
+            .unwrap_or("unknown")
+    };
     Agent {
         pane_id: seat.clone(),
         terminal_id: seat.clone(),
@@ -85,6 +108,15 @@ fn agent(node: &Value) -> Agent {
         foreground_cwd: None,
         terminal_title_stripped: Some(seat.clone()),
         seat: Some(seat),
+    }
+}
+
+fn status(state: &str) -> Option<&'static str> {
+    match state {
+        "needs_input" => Some("blocked"),
+        "running" => Some("working"),
+        "idle" => Some("idle"),
+        _ => None,
     }
 }
 
@@ -121,11 +153,144 @@ pub async fn prompt(config: &BridgeConfig, agent: &Agent, text: &str) -> Result<
     if output.status.success() && reply["ok"] == true && reply["sent"] != false && !retained {
         return Ok(());
     }
-    if reply["reason"] == "target_needs_input" {
-        return Err(NeedsInput.into());
+    let reason = reply["reason"].as_str().filter(|reason| !reason.is_empty());
+    if let Some(reason) = reason
+        .filter(|reason| *reason == "target_needs_input" || (reply["sent"] == false && !retained))
+    {
+        return Err(Refused(reason.into()).into());
     }
     if reply["sent"] == false && !retained {
         return Err(NotSubmitted.into());
     }
     bail!("OpenRig did not confirm the prompt")
+}
+
+pub fn classify(event: &Value, seats: &[String]) -> Action {
+    let kind = event["type"].as_str().unwrap_or_default();
+    let topology = ["session.", "node.", "rig."]
+        .iter()
+        .any(|prefix| kind.starts_with(prefix));
+    let Some(seat) = event["sessionName"].as_str() else {
+        return if topology {
+            Action::Resync
+        } else {
+            Action::Ignore
+        };
+    };
+    if !seats.iter().any(|listed| listed == seat) {
+        return Action::Ignore;
+    }
+    if kind == "agent.activity" {
+        return match event["activity"]["state"].as_str().and_then(status) {
+            Some(status) => Action::Status {
+                seat: seat.into(),
+                status: status.into(),
+            },
+            None => Action::Resync,
+        };
+    }
+    if topology || kind == "agent.session_identity" {
+        Action::Resync
+    } else {
+        Action::Ignore
+    }
+}
+
+/// Follows `GET <openrig_url>/api/events` until the receiver closes.
+/// Without a stored sequence, OpenRig replays its whole history, so events created before the connection are ignored.
+pub async fn follow(config: &BridgeConfig, mut since: Option<u64>, tx: Sender<Event>) {
+    let url = format!("{}/api/events", config.openrig_url.trim_end_matches('/'));
+    let mut down = false;
+    let mut wait = 1;
+    loop {
+        let skip_before = since.is_none().then(daemon_now).flatten();
+        let mut curl = Command::new("curl");
+        curl.args(["-sN", "--fail", "-H", "Accept: text/event-stream"]);
+        if let Some(seq) = since {
+            curl.arg("-H").arg(format!("Last-Event-ID: {seq}"));
+        }
+        let child = curl
+            .arg(&url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn();
+        if let Ok(mut child) = child
+            && let Some(stdout) = child.stdout.take()
+        {
+            let mut lines = BufReader::new(stdout).lines();
+            let mut connected = false;
+            let mut data = String::new();
+            let mut id = None;
+            while let Ok(Some(line)) = lines.next_line().await {
+                if !connected {
+                    connected = true;
+                    wait = 1;
+                    if down {
+                        eprintln!("OpenRig event stream reconnected.");
+                        down = false;
+                    }
+                    if tx
+                        .send(Event {
+                            seq: None,
+                            action: Action::Resync,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                if let Some(value) = line.strip_prefix("data:") {
+                    data.push_str(value.strip_prefix(' ').unwrap_or(value));
+                    continue;
+                }
+                if let Some(value) = line.strip_prefix("id:") {
+                    id = value.trim().parse().ok();
+                    continue;
+                }
+                if !line.is_empty() || data.is_empty() {
+                    continue;
+                }
+                let action = match serde_json::from_str::<Value>(&data) {
+                    Ok(event) => {
+                        id = id.or(event["seq"].as_u64());
+                        let old = skip_before.as_deref().is_some_and(|start| {
+                            event["createdAt"].as_str().is_some_and(|at| at < start)
+                        });
+                        if old {
+                            Action::Ignore
+                        } else {
+                            classify(&event, &config.openrig_seats)
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!("Skipped an OpenRig event that is not JSON.");
+                        Action::Ignore
+                    }
+                };
+                data.clear();
+                let seq = id.take();
+                since = seq.or(since);
+                if tx.send(Event { seq, action }).await.is_err() {
+                    return;
+                }
+            }
+            let _ = child.wait().await;
+        }
+        if !down {
+            eprintln!("OpenRig event stream is unavailable; codr resyncs with rig ps every 60 s.");
+            down = true;
+        }
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+        wait = (wait * 2).min(30);
+    }
+}
+
+/// The daemon stamps `createdAt` with SQLite's `datetime('now')`, so SQLite gives the same format.
+fn daemon_now() -> Option<String> {
+    rusqlite::Connection::open_in_memory()
+        .and_then(|db| db.query_row("SELECT datetime('now')", [], |row| row.get(0)))
+        .ok()
 }

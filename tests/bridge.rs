@@ -27,6 +27,7 @@ fn config(dir: &std::path::Path) -> BridgeConfig {
         herdr_socket: dir.join("herdr.sock"),
         openrig_seats: vec![],
         rig_bin: "rig".into(),
+        openrig_url: "http://127.0.0.1:7433".into(),
         wn_agent_socket: dir.join("wn.sock"),
         account_id_hex: "aa".repeat(32),
         state_path: dir.join("state.json"),

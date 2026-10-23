@@ -114,9 +114,11 @@ The setting is independent of `auto_forwarding`. It works with OpenCode, Codex, 
 
 Set `backend = "openrig"` to connect OpenRig seats. The default backend is `herdr`. `openrig_seats` lists the seat session names that get a phone group, for example `["dev-build@my-rig"]`. `rig_bin` names the `rig` executable and defaults to `rig`. This mode does not use `herdr_socket`.
 
-**codr** runs `rig ps --nodes -A --json --full` every 3 seconds. Each listed seat that runs Claude Code gets one group named `[cd] <seat>`. The group stays with the seat when the seat starts a new Claude session. **codr** then reads the new transcript. Replies already in that transcript stay off the phone. Transcripts are read from `claude_home`.
+**codr** reads seats from `rig ps --nodes -A --json --full`. Each listed seat that runs Claude Code gets one group named `[cd] <seat>`. The group stays with the seat when the seat starts a new Claude session. **codr** then reads the new transcript. Replies already in that transcript stay off the phone, except a reply to a phone prompt. Transcripts are read from `claude_home`.
 
-A phone prompt goes to the seat with `rig send <seat> --raw`. OpenRig refuses input while the agent waits on an interactive prompt. The phone then gets a notice to answer the prompt at the desk and resend. Decision cards and terminal context for a blocked agent need **herdr**.
+**codr** follows the OpenRig event stream at `<openrig_url>/api/events` with `curl`. `openrig_url` defaults to `http://127.0.0.1:7433`. A Claude Code hook on a listed seat updates its state at once, and the `Stop` hook sends the reply to the phone. A session or seat change runs `rig ps` again. `rig ps` also runs every 60 seconds. **codr** stores the last event number in its state and resumes from it after a restart or a dropped stream. On the first start, it acts only on events created after it connects. When the stream fails, **codr** logs one line, retries with a growing delay up to 30 seconds, and keeps the 60-second `rig ps` reads.
+
+A phone prompt goes to the seat with `rig send <seat> --raw`. OpenRig refuses input while the agent waits on an interactive prompt. The phone then gets a notice to answer the prompt at the desk and resend. When OpenRig refuses a prompt for another reason, such as `typing_guard_enabled`, the phone gets that reason. **codr** does not retry a refused prompt. Decision cards and terminal context for a blocked agent need **herdr**.
 
 ### Editable progress and separate final replies
 
