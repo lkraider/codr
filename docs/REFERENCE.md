@@ -326,6 +326,16 @@ Previously accepted legacy text and desktop deliveries run independently per cha
 
 The bridge saves consumption and submission intent before native input. A proven pre-submission socket failure retains the message for retry without clearing a running task. A lost acknowledgement, uncertain result, or restart during submission is never automatically repeated. Inspect the terminal, then use local `clear-prompt` to release a retained-delivery hold; it does not resubmit the uncertain task. `/queue` inspects pending state while muted or disconnected. `/cancel` interrupts only a freshly verified active task, persists its receipt before submission, and never repeats an uncertain interrupt automatically.
 
+### Phone replies only
+
+Set `phone_replies_only = true` to send a final reply only when it answers a prompt from your phone. Replies to prompts typed at the desk or sent by other agents, for example with `rig send`, stay off the phone. They are not queued for later.
+
+**codr** attributes a prompt to the phone when its transcript text matches the confirmed phone submission. A reply is sent when the turn it completes contains such a prompt. Ambiguous input, such as identical text typed at the desk at the same time, counts as local, so its reply stays off the phone.
+
+Claude Code holds a prompt typed while it works. It either adds that prompt to the running turn or starts a new turn with it when the running turn ends. In the first case, the final reply of the running turn answers both prompts and goes to the phone. Status notices and editable progress are not filtered by this setting.
+
+The setting is independent of `auto_forwarding`. It works with OpenCode, Codex, and Claude Code transcripts.
+
 ### Editable progress and separate final replies
 
 Set `edit_responses = true` in the bridge configuration to enable editable progress. The release-matched connector includes the required `edit_message` API.

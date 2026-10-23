@@ -7,6 +7,10 @@ use std::collections::HashSet;
 pub struct UserInput {
     pub id: String,
     pub fingerprint: Option<String>,
+    /// The turn whose final reply answers this input.
+    pub turn: Option<String>,
+    /// Delivered into a running turn. It never opens a turn and never mutes forwarding.
+    pub queued: bool,
     complete: bool,
 }
 
@@ -18,6 +22,8 @@ impl UserInput {
             complete: true,
             fingerprint: (!text.trim().is_empty())
                 .then(|| hex::encode(Sha256::digest(text.trim().as_bytes()))),
+            turn: None,
+            queued: false,
         }
     }
 
@@ -25,8 +31,20 @@ impl UserInput {
         Self {
             id,
             fingerprint: None,
+            turn: None,
+            queued: false,
             complete: false,
         }
+    }
+
+    pub fn in_turn(mut self, turn: Option<String>) -> Self {
+        self.turn = turn;
+        self
+    }
+
+    pub fn queued(mut self) -> Self {
+        self.queued = true;
+        self
     }
 }
 
@@ -159,6 +177,8 @@ pub struct Activity {
     phone: Vec<PhoneInput>,
     #[serde(default)]
     unresolved: bool,
+    #[serde(default)]
+    phone_turns: Vec<String>,
 }
 
 impl Activity {
@@ -179,9 +199,12 @@ impl Activity {
         // Group fresh text by fingerprint. A resend produces two phone receipts
         // with the same text and two echoes; matching counts keeps that
         // attributable instead of treating the whole batch as local input.
+        // A queued input rides inside a running turn: it never counts as local input.
         let mut by_text: std::collections::BTreeMap<String, Vec<&UserInput>> =
             std::collections::BTreeMap::new();
-        let mut local = fresh.iter().any(|input| input.fingerprint.is_none());
+        let mut local = fresh
+            .iter()
+            .any(|input| input.fingerprint.is_none() && !input.queued);
         for input in &fresh {
             if let Some(fingerprint) = &input.fingerprint {
                 by_text.entry(fingerprint.clone()).or_default().push(input);
@@ -200,7 +223,15 @@ impl Activity {
                 .collect();
             if candidates.len() == group.len() {
                 consumed.insert(fingerprint.clone());
-            } else {
+                // The turn each matched input opens or joins holds the phone's prompt.
+                for input in group {
+                    if let Some(turn) = &input.turn
+                        && !self.phone_turns.contains(turn)
+                    {
+                        self.phone_turns.push(turn.clone());
+                    }
+                }
+            } else if group.iter().any(|input| !input.queued) {
                 local = true;
             }
         }
@@ -222,6 +253,14 @@ impl Activity {
 
     pub fn baseline(&mut self, inputs: &[UserInput]) {
         let _ = self.observe(inputs);
+    }
+
+    pub fn phone_turn(&self, turn: &str) -> bool {
+        self.phone_turns.iter().any(|known| known == turn)
+    }
+
+    pub fn retain_turns(&mut self, live: &[String]) {
+        self.phone_turns.retain(|turn| live.contains(turn));
     }
 
     pub fn unresolved(&self) -> bool {

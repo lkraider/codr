@@ -20,3 +20,5 @@ claude_home = "/home/YOUR_USER/.claude"
 # Standalone owner-only control chat for /new and general commands.
 # control_chat = true
 # edit_responses = true
+# Optional. Send a final reply only when the turn it answers holds a phone prompt.
+# phone_replies_only = true

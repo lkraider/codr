@@ -940,6 +940,14 @@ impl Bridge {
             let history = self.read_history(agent).await?;
             self.finish_queued_prompt(key, &history);
             self.observe_activity(key, &history)?;
+            if self.config.phone_replies_only {
+                self.state
+                    .mappings
+                    .get_mut(key)
+                    .unwrap()
+                    .activity
+                    .retain_turns(&history.turns);
+            }
             if !self.state.forwarding_enabled {
                 let mapping = self.state.mappings.get_mut(key).unwrap();
                 let muted: HashSet<_> = mapping.muted_turns.iter().cloned().collect();
@@ -977,10 +985,16 @@ impl Bridge {
                     {
                         self.state.mappings.get_mut(key).unwrap().pending_prompt = false;
                     }
+                    let mapping = &self.state.mappings[key];
                     if reply
                         .turn
                         .as_ref()
-                        .is_none_or(|turn| !self.state.mappings[key].muted_turns.contains(turn))
+                        .is_none_or(|turn| !mapping.muted_turns.contains(turn))
+                        && (!self.config.phone_replies_only
+                            || reply
+                                .turn
+                                .as_ref()
+                                .is_some_and(|turn| mapping.activity.phone_turn(turn)))
                     {
                         let source = output::message_key("Agent", &reply.id, &reply.text);
                         if self.state.forwarding_enabled && !self.state.source_known(group, &source)
@@ -1422,7 +1436,7 @@ impl Bridge {
             &mut self.state.mappings.get_mut(key).unwrap().submissions,
             &history.user_inputs,
         );
-        if !self.config.auto_forwarding {
+        if !self.config.auto_forwarding && !self.config.phone_replies_only {
             return Ok(());
         }
         let previous = self.state.mappings[key].activity.clone();
@@ -1433,6 +1447,7 @@ impl Bridge {
             .unwrap()
             .activity
             .observe(&history.user_inputs)
+            && self.config.auto_forwarding
         {
             if let Err(error) = forwarding::set(&self.config.state_path, false) {
                 self.state.mappings.get_mut(key).unwrap().activity = previous;
@@ -2506,7 +2521,11 @@ impl Bridge {
             self.state.media_pending.push(pending);
             return self.save();
         }
-        let phone_history = if (self.config.auto_forwarding || queued)
+        // Phone-only replies need the checkpoint while the agent works, because the
+        // agent holds the typed prompt and answers it in a later or the running turn.
+        let phone_history = if (self.config.phone_replies_only
+            || self.config.auto_forwarding
+            || queued)
             && (!immediate_prompt || self.state.forwarding_enabled)
             && !status_command
             && !text.trim().is_empty()
@@ -2514,9 +2533,9 @@ impl Bridge {
             && msg["attachments_truncated"] != true
             && msg["media"].as_array().is_none_or(|media| media.is_empty())
             && !media_busy
-            && !self.state.mappings[&key].pending_prompt
+            && (self.config.phone_replies_only || !self.state.mappings[&key].pending_prompt)
             && self.agents.get(&key).is_some_and(|agent| {
-                agent.settled()
+                (self.config.phone_replies_only || agent.settled())
                     && agent
                         .agent_session
                         .as_ref()
