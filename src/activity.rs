@@ -54,6 +54,8 @@ struct PhoneInput {
     before: Vec<String>,
     fingerprint: Option<String>,
     confirmed: bool,
+    #[serde(default)]
+    held: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -120,11 +122,20 @@ impl Activity {
             }
         }
         // A submission can explain only the first new input batch after its checkpoint.
+        // A held submission waits behind earlier queued prompts. A later match proves it was dropped.
+        let last = self
+            .phone
+            .iter()
+            .rposition(|phone| consumed.contains(&phone.receipt));
+        let mut index = 0;
         self.phone.retain(|phone| {
+            index += 1;
             !consumed.contains(&phone.receipt)
-                && !fresh
-                    .iter()
-                    .any(|input| !input.queued && !phone.before.contains(&input.id))
+                && last.is_none_or(|last| index > last + 1)
+                && (phone.held
+                    || !fresh
+                        .iter()
+                        .any(|input| !input.queued && !phone.before.contains(&input.id)))
         });
         observed.extend(fresh.into_iter().map(|input| input.id.clone()));
         local
@@ -140,7 +151,7 @@ impl Activity {
 
     /// True from a phone submission until the final reply of its turn.
     pub fn awaiting_phone(&self) -> bool {
-        !self.phone.is_empty() || self.phone_open
+        self.phone.iter().any(|phone| phone.confirmed) || self.phone_open
     }
 
     pub fn track_latest(&mut self, latest: Option<&str>, answered: bool) {
@@ -168,6 +179,7 @@ impl Activity {
             before: inputs.iter().map(|input| input.id.clone()).collect(),
             fingerprint: UserInput::new(String::new(), text).fingerprint,
             confirmed: false,
+            held: false,
         });
     }
 
@@ -175,6 +187,15 @@ impl Activity {
         for phone in &mut self.phone {
             if phone.receipt == receipt {
                 phone.confirmed = true;
+            }
+        }
+    }
+
+    /// Keeps the submission across unrelated input until its own prompt appears.
+    pub fn hold_phone(&mut self, receipt: &str) {
+        for phone in &mut self.phone {
+            if phone.receipt == receipt {
+                phone.held = true;
             }
         }
     }

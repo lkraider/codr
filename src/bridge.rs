@@ -1214,6 +1214,9 @@ impl Bridge {
                 mapping.pending_prompt = true;
                 if let Some(history) = phone_history {
                     mapping.activity.start_phone(id, text, &history.user_inputs);
+                    if self.config.phone_replies_only {
+                        mapping.activity.hold_phone(id);
+                    }
                 }
                 self.save()?;
                 match herdr::prompt(&self.herdr, &agent, text).await {
