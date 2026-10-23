@@ -85,40 +85,48 @@ impl Activity {
             .iter()
             .filter(|input| input.complete && !known.contains(&input.id))
             .collect();
-        let phone = &self.phone;
-        let matched = |input: &UserInput| {
-            let candidates: Vec<_> = phone
+        let mut consumed: Vec<String> = Vec::new();
+        let mut local = false;
+        for input in &fresh {
+            let candidates: Vec<_> = self
+                .phone
                 .iter()
                 .filter(|phone| {
                     phone.confirmed
                         && input.fingerprint.is_some()
                         && input.fingerprint == phone.fingerprint
                         && !phone.before.contains(&input.id)
+                        && !consumed.contains(&phone.receipt)
                 })
                 .collect();
-            (candidates.len() == 1
-                && fresh
-                    .iter()
-                    .filter(|other| {
-                        other.fingerprint == candidates[0].fingerprint
-                            && !candidates[0].before.contains(&other.id)
-                    })
-                    .count()
-                    == 1)
-                .then(|| candidates[0].receipt.clone())
-        };
-        let local = fresh
-            .iter()
-            .any(|input| !input.queued && matched(input).is_none());
-        let mut consumed = Vec::new();
-        for input in &fresh {
-            if let Some(receipt) = matched(input) {
-                consumed.push(receipt);
-                if let Some(turn) = &input.turn
-                    && !self.phone_turns.contains(turn)
+            // Held prompts run in send order, so identical held text matches the oldest submission.
+            let receipt = match candidates.first() {
+                Some(first) if candidates.iter().all(|phone| phone.held) => Some(first),
+                Some(only)
+                    if candidates.len() == 1
+                        && fresh
+                            .iter()
+                            .filter(|other| {
+                                other.fingerprint == only.fingerprint
+                                    && !only.before.contains(&other.id)
+                            })
+                            .count()
+                            == 1 =>
                 {
-                    self.phone_turns.push(turn.clone());
+                    Some(only)
                 }
+                _ => None,
+            }
+            .map(|phone| phone.receipt.clone());
+            let Some(receipt) = receipt else {
+                local |= !input.queued;
+                continue;
+            };
+            consumed.push(receipt);
+            if let Some(turn) = &input.turn
+                && !self.phone_turns.contains(turn)
+            {
+                self.phone_turns.push(turn.clone());
             }
         }
         // A submission can explain only the first new input batch after its checkpoint.

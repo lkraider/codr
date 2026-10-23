@@ -4310,3 +4310,50 @@ async fn phone_replies_only_answers_a_phone_prompt_queued_behind_a_peer_prompt()
         handle.abort();
     }
 }
+
+#[tokio::test]
+async fn phone_replies_only_answers_identical_phone_prompts_in_send_order() {
+    let (_dir, config, mut observed, calls, mut bridge, peers) = phone_only_bridge("working").await;
+    let mut rows = vec![
+        ("u0", "user", "Old prompt"),
+        ("a0", "final", "Old final"),
+        ("u1", "user", "From: a peer agent"),
+    ];
+    claude_transcript(&config, &rows);
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.inbound(&inbound(HEX, "phone-a")).await.unwrap();
+    bridge.inbound(&inbound(HEX, "phone-b")).await.unwrap();
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["method"] == "agent.prompt")
+            .count(),
+        2
+    );
+    rows.extend([
+        ("a1", "final", "Reply to the peer"),
+        ("u2", "user", "test prompt"),
+        ("a2", "final", "First phone reply"),
+    ]);
+    claude_transcript(&config, &rows);
+    observed.agent_status = "idle".into();
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.flush().await.unwrap();
+    rows.extend([
+        ("u3", "user", "test prompt"),
+        ("a3", "final", "Second phone reply"),
+    ]);
+    claude_transcript(&config, &rows);
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.flush().await.unwrap();
+    assert_eq!(sent(&calls, "Reply to the peer"), 0);
+    assert_eq!(sent(&calls, "First phone reply"), 1);
+    assert_eq!(sent(&calls, "Second phone reply"), 1);
+    for handle in peers {
+        handle.abort();
+    }
+}
