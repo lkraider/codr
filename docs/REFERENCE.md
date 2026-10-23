@@ -293,7 +293,7 @@ For a non-interactive installation by a coding agent, see the [agent instruction
 
 **herdr** starts the plugin worker through its startup hook after restore. The worker's user service keeps it alive across client disconnects. On Linux, use `systemctl --user enable herdr-white-noise-bridge.service` if it must start independently at login. On macOS the LaunchAgents in `~/Library/LaunchAgents` run at login by default.
 
-macOS treats each new ad-hoc signed bridge build as a new app for privacy access. If agent transcripts are on an external drive, approve the removable-volume prompt for each new build. Until it is approved, transcript reads fail with "transcript read failed".
+macOS treats each new ad-hoc signed bridge build as a new app for privacy access. If agent transcripts are on an external drive, approve the removable-volume prompt for each new build. Until it is approved, transcript reads fail with "transcript read failed". If the prompt was missed or denied, enable Removable Volumes for the bridge in System Settings > Privacy & Security > Files & Folders. `check-readers` run from a terminal uses the terminal's access, so it can pass while the LaunchAgent bridge fails.
 
 Do not share the existing `wn-opencode` connector home. That adapter can also answer messages sent to its identity.
 
