@@ -179,9 +179,9 @@ fn a_held_phone_submission_expires_and_later_identical_text_is_local() {
     state.start_phone("receipt", "yes", &[]);
     state.confirm_phone("receipt");
     state.hold_phone("receipt", 100);
-    state.expire_held(100 + HELD_PHONE_SECS - 1);
+    assert_eq!(state.expire_held(100 + HELD_PHONE_SECS - 1), 0);
     assert!(state.awaiting_phone());
-    state.expire_held(100 + HELD_PHONE_SECS);
+    assert_eq!(state.expire_held(100 + HELD_PHONE_SECS), 1);
     assert!(!state.awaiting_phone());
     let desk = input("desk", "yes").in_turn(Some("turn-1".into()));
     assert!(state.observe(&[desk]));

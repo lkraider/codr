@@ -612,7 +612,13 @@ impl Bridge {
 
     async fn reconcile_agent(&mut self, key: &str, agent: &Agent) -> Result<()> {
         if let Some(mapping) = self.state.mappings.get_mut(key) {
-            mapping.activity.expire_held(now());
+            let expired = mapping.activity.expire_held(now());
+            if let Some(group) = mapping.group_id_hex.clone().filter(|_| expired > 0) {
+                for _ in 0..expired {
+                    self.state.enqueue(&group, "Stopped waiting for a phone prompt sent 30 minutes ago. Its reply will not be forwarded.");
+                }
+                self.save()?;
+            }
         }
         if self.reads.background
             && agent
