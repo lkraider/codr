@@ -98,7 +98,7 @@ Forwarding defaults to Away on an existing installation. The control file is pri
 
 ### Phone replies only
 
-Set `phone_replies_only = true` to send a final reply only when it answers a prompt from your phone. Replies to prompts typed at the desk or sent by other agents, for example with `rig send`, stay off the phone. They are not queued for later.
+Set `phone_replies_only = true` to send a final reply only when it answers a prompt from your phone. Replies to prompts typed at the desk or sent by other agents stay off the phone. They are not queued for later.
 
 **codr** attributes a prompt to the phone when its transcript text matches the confirmed phone submission. A reply is sent when the turn it completes contains such a prompt. The transcript holds no source for a prompt. While a phone prompt is held, the first transcript row with the same text counts as the phone prompt, even when it came from the desk or another agent.
 
