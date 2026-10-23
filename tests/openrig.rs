@@ -422,6 +422,29 @@ async fn an_image_is_queued_while_the_stored_status_is_blocked() {
     peer.abort();
 }
 
+#[tokio::test]
+async fn a_second_image_while_the_stored_status_is_blocked_is_refused_as_busy() {
+    let (dir, _config, calls, mut bridge, peer) = connected_seat().await;
+    seats(dir.path(), &[node(SEAT, FIRST, "needs_input", 2)]);
+    tick(&mut bridge).await;
+    for id in ["photo-1", "photo-2"] {
+        let mut event = inbound(id, "");
+        event["message"]["media"] = json!([{"media_type":"image/jpeg","file_name":"photo.jpg"}]);
+        bridge.inbound(&event).await.unwrap();
+    }
+    bridge.flush().await.unwrap();
+    assert_eq!(bridge.state.media_pending.len(), 1);
+    assert_eq!(sent(&calls, BLOCKED), 0);
+    assert_eq!(
+        sent(
+            &calls,
+            "Media could not be queued. Another media message may still be in preparation, or the session has ended. Resend it later."
+        ),
+        1
+    );
+    peer.abort();
+}
+
 /// Events recorded from a live `/api/events` stream, renamed to the test seat and renumbered from 101.
 fn recorded() -> Vec<String> {
     include_str!("fixtures/openrig-events.jsonl")
