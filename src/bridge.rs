@@ -25,6 +25,15 @@ pub struct Bridge {
     media_job: Option<tokio::task::JoinHandle<Result<crate::media::Prepared>>>,
     reads: crate::reads::Reads,
     last_snapshot: Vec<Agent>,
+    stop_rereads: BTreeMap<String, StopReread>,
+}
+
+/// A `Stop` hook can arrive before the transcript holds the final reply.
+struct StopReread {
+    finals: usize,
+    started: tokio::time::Instant,
+    next: tokio::time::Instant,
+    wait: Duration,
 }
 
 impl Drop for Bridge {
@@ -65,6 +74,7 @@ impl Bridge {
             media_job: None,
             reads: crate::reads::Reads::default(),
             last_snapshot: vec![],
+            stop_rereads: BTreeMap::new(),
         };
         bridge.refresh_forwarding()?;
         Ok(bridge)
@@ -1046,6 +1056,7 @@ impl Bridge {
     pub async fn apply_events(&mut self, events: Vec<openrig::Event>) -> Result<()> {
         let mut resync = false;
         let mut statuses = BTreeMap::new();
+        let mut stopped = HashSet::new();
         for event in events {
             if event.seq.is_some() {
                 self.state.openrig_event_seq = event.seq;
@@ -1053,7 +1064,10 @@ impl Bridge {
             match event.action {
                 openrig::Action::Ignore => {}
                 openrig::Action::Resync => resync = true,
-                openrig::Action::Status { seat, status } => {
+                openrig::Action::Status { seat, status, stop } => {
+                    if stop {
+                        stopped.insert(seat.clone());
+                    }
                     statuses.insert(seat, (status, event.seq.unwrap_or_default()));
                 }
             }
@@ -1075,7 +1089,79 @@ impl Bridge {
                 }
             }
         }
-        self.reconcile(agents).await
+        let keys: Vec<_> = agents
+            .iter()
+            .filter(|agent| {
+                agent
+                    .seat
+                    .as_ref()
+                    .is_some_and(|seat| stopped.contains(seat))
+            })
+            .map(Agent::key)
+            .collect();
+        let finals = |bridge: &Self, key: &String| {
+            bridge
+                .state
+                .mappings
+                .get(key)
+                .map_or(0, |mapping| mapping.final_ids.len())
+        };
+        let before: Vec<_> = keys.iter().map(|key| finals(self, key)).collect();
+        let result = self.reconcile(agents).await;
+        let start = tokio::time::Instant::now();
+        for (key, before) in keys.into_iter().zip(before) {
+            if finals(self, &key) == before {
+                self.stop_rereads.insert(
+                    key,
+                    StopReread {
+                        finals: before,
+                        started: start,
+                        next: start + Duration::from_secs(1),
+                        wait: Duration::from_secs(1),
+                    },
+                );
+            }
+        }
+        result
+    }
+
+    pub fn stop_rereads_pending(&self) -> bool {
+        !self.stop_rereads.is_empty()
+    }
+
+    /// Rereads a stopped seat's transcript after 1, 2, 4… seconds until a final appears or `settled_reread_secs` pass.
+    pub async fn reread_stopped(&mut self) -> Result<()> {
+        let now = tokio::time::Instant::now();
+        let limit = Duration::from_secs(self.config.settled_reread_secs);
+        let state = &self.state;
+        self.stop_rereads.retain(|key, reread| {
+            state
+                .mappings
+                .get(key)
+                .is_some_and(|mapping| mapping.final_ids.len() == reread.finals)
+                && now.duration_since(reread.started) < limit
+        });
+        let mut due = false;
+        for (key, reread) in &mut self.stop_rereads {
+            if reread.next <= now {
+                due = true;
+                reread.wait *= 2;
+                reread.next = now + reread.wait;
+                self.state.mappings.get_mut(key).unwrap().completion_pending = true;
+            }
+        }
+        if !due {
+            return Ok(());
+        }
+        let result = self.reconcile(self.last_snapshot.clone()).await;
+        let state = &self.state;
+        self.stop_rereads.retain(|key, reread| {
+            state
+                .mappings
+                .get(key)
+                .is_some_and(|mapping| mapping.final_ids.len() == reread.finals)
+        });
+        result
     }
 
     pub async fn poll_ready_sessions(&mut self) -> Result<()> {
@@ -1922,6 +2008,7 @@ impl Bridge {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut recovery_due = true;
         let mut recovery_tick = tokio::time::interval(Duration::from_secs(60));
+        let mut reread_tick = tokio::time::interval(Duration::from_secs(1));
         recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -1943,6 +2030,11 @@ impl Bridge {
                     if self.apply_events(batch).await.is_err() {
                         recovery_due = true;
                         eprintln!("OpenRig event handling failed; the next resync retries it.");
+                    }
+                },
+                _ = reread_tick.tick(), if self.stop_rereads_pending() => {
+                    if self.reread_stopped().await.is_err() {
+                        eprintln!("A stopped seat's transcript reread failed; it retries.");
                     }
                 },
                 _ = reads_ready.notified() => {

@@ -32,6 +32,8 @@ pub enum Action {
     Status {
         seat: String,
         status: String,
+        /// The hook was `Stop`, so the turn's final reply is due.
+        stop: bool,
     },
     /// Seats or sessions changed, or events were missed. Read `rig ps` again.
     Resync,
@@ -185,6 +187,7 @@ pub fn classify(event: &Value, seats: &[String]) -> Action {
             Some(status) => Action::Status {
                 seat: seat.into(),
                 status: status.into(),
+                stop: event["activity"]["rawEvent"] == "Stop",
             },
             None => Action::Resync,
         };
@@ -197,13 +200,14 @@ pub fn classify(event: &Value, seats: &[String]) -> Action {
 }
 
 /// Follows `GET <openrig_url>/api/events` until the receiver closes.
-/// Without a stored sequence, OpenRig replays its whole history, so events created before the connection are ignored.
+/// Each connection starts with a resync and ignores events created before it connected.
+/// Without a stored sequence, OpenRig replays its whole history.
 pub async fn follow(config: &BridgeConfig, mut since: Option<u64>, tx: Sender<Event>) {
     let url = format!("{}/api/events", config.openrig_url.trim_end_matches('/'));
     let mut down = false;
     let mut wait = 1;
     loop {
-        let skip_before = since.is_none().then(daemon_now).flatten();
+        let skip_before = daemon_now();
         let mut curl = Command::new("curl");
         curl.args(["-sN", "--fail", "-H", "Accept: text/event-stream"]);
         if let Some(seq) = since {

@@ -388,6 +388,13 @@ fn recorded() -> Vec<String> {
         .collect()
 }
 
+fn fresh(line: &str, seq: u64) -> String {
+    let mut event: Value = serde_json::from_str(line).unwrap();
+    event["seq"] = json!(seq);
+    event["createdAt"] = json!("9999-12-31 23:59:59");
+    event.to_string()
+}
+
 fn frame(events: &[String]) -> String {
     let mut body = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n".to_owned();
     for event in events {
@@ -438,12 +445,13 @@ async fn follow(config: &BridgeConfig, since: Option<u64>, count: usize) -> Vec<
     events
 }
 
-fn status(seq: u64, status: &str) -> Event {
+fn status(seq: u64, status: &str, stop: bool) -> Event {
     Event {
         seq: Some(seq),
         action: Action::Status {
             seat: SEAT.into(),
             status: status.into(),
+            stop,
         },
     }
 }
@@ -479,8 +487,8 @@ async fn a_stop_hook_on_the_event_stream_forwards_the_reply_without_waiting_for_
         lines[0].clone(),
         lines[1].clone(),
         "{\"type\":\"agent.activity\",".to_owned(),
-        lines[2].clone(),
-        lines[3].clone(),
+        fresh(&lines[2], 103),
+        fresh(&lines[3], 104),
     ];
     let (url, _) = event_server(vec![frame(&replay)]).await;
     config.openrig_url = url;
@@ -492,8 +500,8 @@ async fn a_stop_hook_on_the_event_stream_forwards_the_reply_without_waiting_for_
             ignored(Some(101)),
             ignored(Some(102)),
             ignored(None),
-            status(103, "working"),
-            status(104, "idle"),
+            status(103, "working", false),
+            status(104, "idle", true),
         ]
     );
     let listed = rig_calls(dir.path(), "ps").len();
@@ -503,7 +511,43 @@ async fn a_stop_hook_on_the_event_stream_forwards_the_reply_without_waiting_for_
     bridge.flush().await.unwrap();
     assert_eq!(sent(&calls, "Fixed"), 1);
     assert_eq!(rig_calls(dir.path(), "ps").len(), listed + 1);
+    assert!(!bridge.stop_rereads_pending());
     assert_eq!(bridge.state.openrig_event_seq, Some(104));
+    peer.abort();
+}
+
+#[tokio::test]
+async fn a_stop_before_the_final_is_written_rereads_the_transcript_within_seconds() {
+    let (dir, config, calls, mut bridge, peer) = connected_seat().await;
+    bridge.inbound(&inbound("phone-1", "Fix it")).await.unwrap();
+    let prompt = [
+        ("u0", "user", "Old prompt"),
+        ("a0", "final", "Old final"),
+        ("u1", "user", "Fix it"),
+    ];
+    transcript(&config, FIRST, &prompt);
+    let listed = rig_calls(dir.path(), "ps").len();
+    bridge
+        .apply_events(vec![
+            status(103, "working", false),
+            status(104, "idle", true),
+        ])
+        .await
+        .unwrap();
+    bridge.flush().await.unwrap();
+    assert_eq!(sent(&calls, "Fixed"), 0);
+    assert!(bridge.stop_rereads_pending());
+    transcript(
+        &config,
+        FIRST,
+        &[prompt[0], prompt[1], prompt[2], ("a1", "final", "Fixed")],
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    bridge.reread_stopped().await.unwrap();
+    bridge.flush().await.unwrap();
+    assert_eq!(sent(&calls, "Fixed"), 1);
+    assert!(!bridge.stop_rereads_pending());
+    assert_eq!(rig_calls(dir.path(), "ps").len(), listed);
     peer.abort();
 }
 
@@ -514,14 +558,19 @@ async fn a_dropped_stream_resumes_from_the_last_event_id_across_a_restart() {
     let (url, requests) = event_server(vec![
         frame(&lines[..1]),
         "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n".into(),
-        frame(&lines[3..4]),
+        frame(&[fresh(&lines[3], 104)]),
     ])
     .await;
     config.openrig_url = url;
     let events = follow(&config, Some(100), 4).await;
     assert_eq!(
         events,
-        [RESYNC, ignored(Some(101)), RESYNC, status(104, "idle")]
+        [
+            RESYNC,
+            ignored(Some(101)),
+            RESYNC,
+            status(104, "idle", true)
+        ]
     );
     let requests = requests.lock().unwrap().clone();
     assert!(requests[0].contains("Last-Event-ID: 100\r\n"));
@@ -536,17 +585,96 @@ async fn a_dropped_stream_resumes_from_the_last_event_id_across_a_restart() {
 }
 
 #[tokio::test]
+async fn a_hook_from_a_seat_missing_from_the_last_rig_ps_reads_rig_ps_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    transcript(
+        &config,
+        FIRST,
+        &[("u0", "user", "Old prompt"), ("a0", "final", "Old final")],
+    );
+    seats(dir.path(), &[]);
+    let calls = Arc::new(Mutex::new(vec![]));
+    let peer = mdk(&config.wn_agent_socket, calls.clone()).await;
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    tick(&mut bridge).await;
+    seats(dir.path(), &[node(SEAT, FIRST, "running", 1)]);
+    let listed = rig_calls(dir.path(), "ps").len();
+    bridge
+        .apply_events(vec![status(5, "working", false)])
+        .await
+        .unwrap();
+    bridge.flush().await.unwrap();
+    assert_eq!(rig_calls(dir.path(), "ps").len(), listed + 1);
+    assert_eq!(
+        sent(
+            &calls,
+            &format!(
+                "Connected to OpenRig: {SEAT}. Send a message here to prompt this session. Use /status for its state."
+            )
+        ),
+        1
+    );
+    peer.abort();
+}
+
+#[tokio::test]
+async fn a_reconnect_ignores_replayed_hooks_from_before_it_connected() {
+    let (dir, mut config, calls, mut bridge, peer) = connected_seat().await;
+    let lines = recorded();
+    let (url, _) = event_server(vec![frame(&lines[2..4])]).await;
+    config.openrig_url = url;
+    let events = follow(&config, Some(102), 3).await;
+    assert_eq!(events, [RESYNC, ignored(Some(103)), ignored(Some(104))]);
+    let before = calls.lock().unwrap().len();
+    bridge.apply_events(events).await.unwrap();
+    bridge.flush().await.unwrap();
+    assert_eq!(calls.lock().unwrap().len(), before);
+    assert_eq!(bridge.state.openrig_event_seq, Some(104));
+    drop(dir);
+    peer.abort();
+}
+
+#[tokio::test]
+async fn a_reply_finished_during_an_outage_reaches_the_phone_on_reconnect() {
+    let (dir, mut config, calls, mut bridge, peer) = connected_seat().await;
+    bridge.inbound(&inbound("phone-1", "Fix it")).await.unwrap();
+    seats(dir.path(), &[node(SEAT, FIRST, "running", 2)]);
+    tick(&mut bridge).await;
+    transcript(
+        &config,
+        FIRST,
+        &[
+            ("u0", "user", "Old prompt"),
+            ("a0", "final", "Old final"),
+            ("u1", "user", "Fix it"),
+            ("a1", "final", "Fixed"),
+        ],
+    );
+    seats(dir.path(), &[node(SEAT, FIRST, "idle", 3)]);
+    let lines = recorded();
+    let (url, _) = event_server(vec![frame(&lines[2..4])]).await;
+    config.openrig_url = url;
+    let events = follow(&config, Some(102), 3).await;
+    bridge.apply_events(events).await.unwrap();
+    bridge.flush().await.unwrap();
+    assert_eq!(sent(&calls, "Fixed"), 1);
+    peer.abort();
+}
+
+#[tokio::test]
 async fn a_first_start_acts_only_on_events_created_after_it_connects() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = config(dir.path());
     let lines = recorded();
-    let mut fresh: Value = serde_json::from_str(&lines[3]).unwrap();
-    fresh["seq"] = json!(200);
-    fresh["createdAt"] = json!("9999-12-31 23:59:59");
-    let (url, requests) = event_server(vec![frame(&[lines[3].clone(), fresh.to_string()])]).await;
+    let (url, requests) =
+        event_server(vec![frame(&[lines[3].clone(), fresh(&lines[3], 200)])]).await;
     config.openrig_url = url;
     let events = follow(&config, None, 3).await;
-    assert_eq!(events, [RESYNC, ignored(Some(104)), status(200, "idle")]);
+    assert_eq!(
+        events,
+        [RESYNC, ignored(Some(104)), status(200, "idle", true)]
+    );
     assert!(!requests.lock().unwrap()[0].contains("Last-Event-ID"));
 }
 
@@ -564,7 +692,7 @@ async fn a_session_change_event_follows_the_new_session_and_keeps_the_phone_repl
         &[("n0", "user", "Next step"), ("n1", "final", "Next final")],
     );
     seats(dir.path(), &[node(SEAT, SECOND, "idle", 2)]);
-    let (url, _) = event_server(vec![frame(&recorded()[4..])]).await;
+    let (url, _) = event_server(vec![frame(&[fresh(&recorded()[4], 105)])]).await;
     config.openrig_url = url;
     let events = follow(&config, Some(104), 2).await;
     assert_eq!(
