@@ -409,6 +409,19 @@ async fn a_stored_blocked_state_still_tries_rig_send_and_refuses_only_when_rig_s
     peer.abort();
 }
 
+#[tokio::test]
+async fn an_image_is_queued_while_the_stored_status_is_blocked() {
+    let (dir, _config, _calls, mut bridge, peer) = connected_seat().await;
+    seats(dir.path(), &[node(SEAT, FIRST, "needs_input", 2)]);
+    tick(&mut bridge).await;
+    let mut event = inbound("photo", "");
+    event["message"]["media"] = json!([{"media_type":"image/jpeg","file_name":"photo.jpg"}]);
+    bridge.inbound(&event).await.unwrap();
+    assert_eq!(bridge.state.media_pending.len(), 1);
+    assert!(rig_calls(dir.path(), "send").is_empty());
+    peer.abort();
+}
+
 /// Events recorded from a live `/api/events` stream, renamed to the test seat and renumbered from 101.
 fn recorded() -> Vec<String> {
     include_str!("fixtures/openrig-events.jsonl")

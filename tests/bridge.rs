@@ -3422,6 +3422,72 @@ async fn renaming_uses_the_existing_title_when_an_ended_group_has_no_stored_tab_
 }
 
 #[tokio::test]
+async fn an_image_is_queued_while_a_prompt_is_pending_or_the_agent_works() {
+    for status in ["idle", "working", "blocked"] {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        export_script(&config.opencode_bin, "Historical answer", "old");
+        let calls = Arc::new(Mutex::new(vec![]));
+        let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+        let herdr = peer(&config.herdr_socket, false, calls.clone()).await;
+        let mut bridge = Bridge::open(config).unwrap();
+        let mut observed = agent();
+        observed.agent_status = status.into();
+        bridge.reconcile(vec![observed]).await.unwrap();
+        bridge.state.outbox.clear();
+        bridge
+            .state
+            .mappings
+            .get_mut(&agent().key())
+            .unwrap()
+            .pending_prompt = true;
+        let image = root.path().join("photo.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\nexample").unwrap();
+        let mut event = inbound(HEX, "photo");
+        event["message"]["text"] = json!("");
+        event["message"]["media"] = json!([{"media_type":"image/png","test_path":image,"file_name":"photo.png",
+            "ciphertext_sha256":"aa".repeat(32),"plaintext_sha256":"bb".repeat(32),"nonce_hex":"00".repeat(12),
+            "version":"encrypted-media-v1","source_epoch":1,"locators":[{"kind":"blossom-v1","value":"https://example.com/fixture"}]}]);
+        bridge.inbound(&event).await.unwrap();
+        let notices: Vec<_> = bridge
+            .state
+            .outbox
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect();
+        if status == "blocked" {
+            assert!(bridge.state.media_pending.is_empty(), "{status}");
+            assert_eq!(
+                notices,
+                [
+                    "Media could not be queued. The session may be busy or ended. Wait for it to become idle and try again."
+                ]
+            );
+        } else {
+            assert_eq!(bridge.state.media_pending.len(), 1, "{status}");
+            assert_eq!(notices, ["> downloading"], "{status}");
+            for _ in 0..100 {
+                bridge.process_media().await.unwrap();
+                if bridge.state.media_pending.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(bridge.state.media_pending.is_empty(), "{status}");
+            let prompts = calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call["method"] == "agent.prompt")
+                .count();
+            assert_eq!(prompts, 1, "{status}");
+        }
+        mdk.abort();
+        herdr.abort();
+    }
+}
+
+#[tokio::test]
 async fn deferred_prepared_media_does_not_block_another_session() {
     let root = tempfile::tempdir().unwrap();
     let config = config(root.path());

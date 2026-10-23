@@ -1309,8 +1309,9 @@ impl Bridge {
             && !media_busy
             && self.state.media_pending.len() < 16
             && self.agents.get(&key).is_some_and(|agent| {
-                (agent.settled() && !self.state.mappings[&key].pending_prompt)
-                    || (agent.agent_status == "blocked" && crate::media::audio(msg))
+                agent.agent_status != "blocked"
+                    || crate::media::audio(msg)
+                    || self.config.backend == Backend::OpenRig
             })
         {
             let mut pending = event.clone();

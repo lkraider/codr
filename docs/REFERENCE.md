@@ -170,7 +170,7 @@ Audio goes through FFmpeg to 16 kHz mono WAV, then to a local Phonon-2 worker. I
 
 The phone sees `> transcribing` while audio processing runs. With `edit_responses = true` and an edit-capable MDK build, **codr** edits that bubble to `> transcribed` with the transcript quoted underneath. The edit survives restarts and retries independently of agent submission. Without edit support, the transcript arrives as a separate message. Images use `> downloading`. Long transcript displays are shortened with a notice; the agent receives the full prepared prompt.
 
-Downloads and transcription run separately from session updates, one media message at a time. Pending messages survive bridge restarts. Sender checks and session checks still apply. A preparation failure sends no agent prompt. An uncertain terminal submission is not repeated automatically.
+Media is accepted while the agent works or a phone prompt is pending. With **herdr**, an image sent while the agent is blocked gets a notice to resend it later. Downloads and transcription run separately from session updates, one media message at a time. Pending messages survive bridge restarts. Sender checks and session checks still apply. A preparation failure sends no agent prompt. An uncertain terminal submission is not repeated automatically.
 
 Offline media recovery uses `timeline_message_get` with opt-in `include_media` download references. The release-matched connector includes this extension. Older connectors return only attachment summaries. **codr** defers those without consuming the message and can accept a complete live event later.
 
