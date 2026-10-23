@@ -4543,3 +4543,37 @@ async fn phone_replies_only_stops_waiting_for_a_held_prompt_after_30_minutes_and
         }
     }
 }
+
+#[tokio::test]
+async fn a_phone_prompt_behind_media_from_the_same_group_gets_the_media_notice() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    export_script(&config.opencode_bin, "Historical answer", "old");
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+    let herdr = peer(&config.herdr_socket, false, calls.clone()).await;
+    let mut bridge = Bridge::open(config).unwrap();
+    bridge.reconcile(vec![agent()]).await.unwrap();
+    bridge.state.outbox.clear();
+    bridge.state.media_pending = vec![inbound(HEX, "media")];
+    bridge.inbound(&inbound(HEX, "prompt")).await.unwrap();
+    let notices: Vec<_> = bridge
+        .state
+        .outbox
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect();
+    assert_eq!(
+        notices,
+        ["Media from this group is still being prepared. Wait for it, then resend."]
+    );
+    assert!(
+        !calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call["method"] == "agent.prompt")
+    );
+    mdk.abort();
+    herdr.abort();
+}

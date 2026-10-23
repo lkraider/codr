@@ -1393,11 +1393,15 @@ impl Bridge {
                 .into(),
             )
         } else if let Some(agent) = self.agents.get(&key).cloned() {
+            if media_busy {
+                Some(
+                    "Media from this group is still being prepared. Wait for it, then resend."
+                        .into(),
+                )
+            }
             // OpenRig can keep needs_input after a prompt is answered at the desk.
             // rig send refuses with target_needs_input while a prompt is open.
-            if media_busy
-                || agent.agent_status == "blocked" && self.config.backend == Backend::Herdr
-            {
+            else if agent.agent_status == "blocked" && self.config.backend == Backend::Herdr {
                 Some("The agent is waiting on a terminal prompt. Answer it at the desk, then resend.".into())
             } else if text.trim().is_empty() {
                 Some("Send a non-empty text message.".into())
