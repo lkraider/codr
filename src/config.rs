@@ -26,6 +26,9 @@ pub struct BridgeConfig {
     /// Local native user input mutes all groups; authorized phone input wakes them.
     #[serde(default = "automatic_default")]
     pub auto_forwarding: bool,
+    /// Seconds between transcript rereads for a settled agent whose herdr state never changes.
+    #[serde(default = "settled_reread_default")]
+    pub settled_reread_secs: u64,
     /// Executable and fixed arguments. The downloaded audio path is appended.
     #[serde(default)]
     pub transcribe_command: Vec<String>,
@@ -33,6 +36,10 @@ pub struct BridgeConfig {
 
 fn automatic_default() -> bool {
     true
+}
+
+fn settled_reread_default() -> u64 {
+    30
 }
 
 fn default_opencode() -> PathBuf {

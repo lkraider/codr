@@ -33,6 +33,7 @@ fn config(dir: &std::path::Path) -> BridgeConfig {
         claude_home: dir.join("claude"),
         edit_responses: false,
         auto_forwarding: false,
+        settled_reread_secs: 30,
         transcribe_command: vec![],
     }
 }
