@@ -1174,7 +1174,12 @@ impl Bridge {
         } else if !msg["media"].as_array().is_none_or(|a| a.is_empty()) {
             Some("Media could not be queued. The session may be busy or ended. Wait for it to become idle and try again.".into())
         } else if let Some(agent) = self.agents.get(&key).cloned() {
-            if media_busy || agent.agent_status == "blocked" {
+            if media_busy {
+                Some(
+                    "Media from this group is still being prepared. Wait for it, then resend."
+                        .into(),
+                )
+            } else if agent.agent_status == "blocked" {
                 Some("The agent is waiting on a terminal prompt. Answer it at the desk, then resend.".into())
             } else if text.trim().is_empty() {
                 Some("Send a non-empty text message.".into())

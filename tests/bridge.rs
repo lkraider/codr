@@ -966,7 +966,7 @@ async fn a_phone_choice_answers_the_blocked_question_instead_of_becoming_a_promp
             .as_str()
             .is_some_and(|text| text.contains("PRIVATE TOOL OUTPUT")
                 || text.contains("PRIVATE REASONING")
-                || text.contains("busy or blocked")))
+                || text.contains("terminal prompt")))
     );
     let mut restarted = Bridge::open(config).unwrap();
     let current = observed.lock().unwrap().clone();
@@ -3978,4 +3978,80 @@ async fn an_unconfirmed_profile_update_is_not_retried() {
     );
     assert!(bridge.state.mappings[&observed.key()].rename_uncertain);
     mdk.abort();
+}
+
+#[tokio::test]
+async fn a_phone_prompt_reaches_a_working_agent_and_a_blocked_agent_refuses_it() {
+    for status in ["working", "blocked"] {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        export_script(&config.opencode_bin, "Historical answer", "old");
+        let calls = Arc::new(Mutex::new(vec![]));
+        let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+        let herdr = peer(&config.herdr_socket, false, calls.clone()).await;
+        let mut bridge = Bridge::open(config).unwrap();
+        let mut observed = agent();
+        observed.agent_status = status.into();
+        bridge.reconcile(vec![observed]).await.unwrap();
+        bridge.state.outbox.clear();
+        bridge.inbound(&inbound(HEX, "prompt")).await.unwrap();
+        let notices: Vec<_> = bridge
+            .state
+            .outbox
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect();
+        let prompts = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["method"] == "agent.prompt")
+            .count();
+        if status == "blocked" {
+            assert_eq!(prompts, 0);
+            assert_eq!(
+                notices,
+                ["The agent is waiting on a terminal prompt. Answer it at the desk, then resend."]
+            );
+        } else {
+            assert_eq!(prompts, 1);
+            assert!(notices.is_empty(), "{notices:?}");
+        }
+        mdk.abort();
+        herdr.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_phone_prompt_behind_media_from_the_same_group_gets_the_media_notice() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    export_script(&config.opencode_bin, "Historical answer", "old");
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+    let herdr = peer(&config.herdr_socket, false, calls.clone()).await;
+    let mut bridge = Bridge::open(config).unwrap();
+    bridge.reconcile(vec![agent()]).await.unwrap();
+    bridge.state.outbox.clear();
+    bridge.state.media_pending = vec![inbound(HEX, "media")];
+    bridge.inbound(&inbound(HEX, "prompt")).await.unwrap();
+    let notices: Vec<_> = bridge
+        .state
+        .outbox
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect();
+    assert_eq!(
+        notices,
+        ["Media from this group is still being prepared. Wait for it, then resend."]
+    );
+    assert!(
+        !calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call["method"] == "agent.prompt")
+    );
+    mdk.abort();
+    herdr.abort();
 }
