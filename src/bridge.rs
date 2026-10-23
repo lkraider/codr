@@ -787,7 +787,7 @@ impl Bridge {
             && agent.agent_status != "done"
             && (!self.config.phone_replies_only
                 || agent.agent_status == "blocked"
-                || resumed && !quiet)
+                || resumed && !quiet && agent.agent_status == "working")
         {
             self.state
                 .enqueue(&group, &format!("> {}", agent.agent_status));

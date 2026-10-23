@@ -4201,20 +4201,21 @@ async fn step(bridge: &mut Bridge, observed: &mut Agent, status: &str) {
     bridge.flush().await.unwrap();
 }
 
+fn notices(calls: &Arc<Mutex<Vec<Value>>>) -> Vec<String> {
+    calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| call["type"] == "send_final")
+        .filter_map(|call| call["text"].as_str())
+        .filter(|text| text.starts_with("> "))
+        .map(str::to_owned)
+        .collect()
+}
+
 #[tokio::test]
 async fn phone_replies_only_sends_blocked_and_the_resume_after_it_only_for_phone_prompts() {
     let (_dir, config, mut observed, calls, mut bridge, peers) = phone_only_bridge("idle").await;
-    let notices = |calls: &Arc<Mutex<Vec<Value>>>| -> Vec<String> {
-        calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|call| call["type"] == "send_final")
-            .filter_map(|call| call["text"].as_str())
-            .filter(|text| text.starts_with("> "))
-            .map(str::to_owned)
-            .collect()
-    };
     let peer_turn = [
         ("u0", "user", "Old prompt"),
         ("a0", "final", "Old final"),
@@ -4264,6 +4265,36 @@ async fn phone_replies_only_sends_blocked_and_the_resume_after_it_only_for_phone
     claude_transcript(&config, &next);
     step(&mut bridge, &mut observed, "working").await;
     assert_eq!(notices(&calls).len(), peer_notices.len() + blocked + 1);
+    for handle in peers {
+        handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn phone_replies_only_sends_no_idle_when_a_phone_turn_ends_from_blocked() {
+    let (_dir, config, mut observed, calls, mut bridge, peers) = phone_only_bridge("idle").await;
+    bridge.inbound(&inbound(HEX, "phone-denied")).await.unwrap();
+    step(&mut bridge, &mut observed, "working").await;
+    step(&mut bridge, &mut observed, "blocked").await;
+    claude_transcript(
+        &config,
+        &[
+            ("u0", "user", "Old prompt"),
+            ("a0", "final", "Old final"),
+            ("u1", "user", "test prompt"),
+            ("a1", "final", "Reply to the phone"),
+        ],
+    );
+    step(&mut bridge, &mut observed, "idle").await;
+    let phone_notices = notices(&calls);
+    assert!(!phone_notices.is_empty());
+    assert!(
+        phone_notices
+            .iter()
+            .all(|text| text.starts_with("> blocked")),
+        "{phone_notices:?}"
+    );
+    assert_eq!(sent(&calls, "Reply to the phone"), 1);
     for handle in peers {
         handle.abort();
     }
