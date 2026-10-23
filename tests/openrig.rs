@@ -552,6 +552,38 @@ async fn a_stop_before_the_final_is_written_rereads_the_transcript_within_second
 }
 
 #[tokio::test]
+async fn stop_rereads_end_after_settled_reread_secs() {
+    let (_dir, config, calls, mut bridge, peer) = connected_seat().await;
+    bridge.config.settled_reread_secs = 1;
+    bridge.inbound(&inbound("phone-1", "Fix it")).await.unwrap();
+    let prompt = [
+        ("u0", "user", "Old prompt"),
+        ("a0", "final", "Old final"),
+        ("u1", "user", "Fix it"),
+    ];
+    transcript(&config, FIRST, &prompt);
+    bridge
+        .apply_events(vec![
+            status(103, "working", false),
+            status(104, "idle", true),
+        ])
+        .await
+        .unwrap();
+    assert!(bridge.stop_rereads_pending());
+    transcript(
+        &config,
+        FIRST,
+        &[prompt[0], prompt[1], prompt[2], ("a1", "final", "Fixed")],
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    bridge.reread_stopped().await.unwrap();
+    bridge.flush().await.unwrap();
+    assert!(!bridge.stop_rereads_pending());
+    assert_eq!(sent(&calls, "Fixed"), 0);
+    peer.abort();
+}
+
+#[tokio::test]
 async fn a_dropped_stream_resumes_from_the_last_event_id_across_a_restart() {
     let (dir, mut config, _calls, mut bridge, peer) = connected_seat().await;
     let lines = recorded();
