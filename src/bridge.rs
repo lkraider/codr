@@ -616,7 +616,7 @@ impl Bridge {
                         && (mapping.last_state_change_seq != agent.state_change_seq
                             || mapping.last_agent_status != agent.agent_status
                             || mapping.completion_pending
-                            || now().saturating_sub(mapping.last_export_at) >= 30))
+                            || now().saturating_sub(mapping.last_export_at) >= self.config.settled_reread_secs))
             });
             if needs_read {
                 let result = self
@@ -865,7 +865,7 @@ impl Bridge {
         }
         if agent.settled()
             && (self.state.mappings[key].completion_pending
-                || now().saturating_sub(self.state.mappings[key].last_export_at) >= 30)
+                || now().saturating_sub(self.state.mappings[key].last_export_at) >= self.config.settled_reread_secs)
         {
             self.collect_finals(key, agent, &group).await?;
             if self.config.edit_responses {
