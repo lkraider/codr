@@ -187,3 +187,19 @@ fn a_held_phone_submission_expires_and_later_identical_text_is_local() {
     assert!(state.observe(&[desk]));
     assert!(!state.phone_turn("turn-1"));
 }
+
+#[test]
+fn a_held_phone_submission_saved_without_its_hold_time_expires_after_a_full_limit() {
+    let mut state = Activity::default();
+    state.baseline(&[]);
+    state.start_phone("receipt", "yes", &[]);
+    state.confirm_phone("receipt");
+    state.hold_phone("receipt", 100);
+    let mut saved = serde_json::to_value(&state).unwrap();
+    saved["phone"][0].as_object_mut().unwrap().remove("held_at");
+    let mut state: Activity = serde_json::from_value(saved).unwrap();
+    assert_eq!(state.expire_held(5000), 0);
+    assert_eq!(state.expire_held(5000 + HELD_PHONE_SECS - 1), 0);
+    assert!(state.awaiting_phone());
+    assert_eq!(state.expire_held(5000 + HELD_PHONE_SECS), 1);
+}

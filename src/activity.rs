@@ -215,7 +215,15 @@ impl Activity {
     }
 
     /// Returns how many confirmed submissions expired.
+    /// A held entry saved without `held_at` starts its limit at the first check.
     pub fn expire_held(&mut self, now: u64) -> usize {
+        for phone in self
+            .phone
+            .iter_mut()
+            .filter(|phone| phone.held && phone.held_at == 0)
+        {
+            phone.held_at = now;
+        }
         let before = self.phone.iter().filter(|phone| phone.confirmed).count();
         self.phone
             .retain(|phone| !phone.held || now.saturating_sub(phone.held_at) < HELD_PHONE_SECS);

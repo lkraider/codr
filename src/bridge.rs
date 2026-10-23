@@ -615,7 +615,7 @@ impl Bridge {
             let expired = mapping.activity.expire_held(now());
             if let Some(group) = mapping.group_id_hex.clone().filter(|_| expired > 0) {
                 for _ in 0..expired {
-                    self.state.enqueue(&group, "Stopped waiting for a phone prompt sent 30 minutes ago. Its reply will not be forwarded.");
+                    self.state.enqueue(&group, "Stopped waiting for a phone prompt sent more than 30 minutes ago. Its reply will not be forwarded.");
                 }
                 self.save()?;
             }
