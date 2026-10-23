@@ -4207,7 +4207,7 @@ async fn step(bridge: &mut Bridge, observed: &mut Agent, status: &str) {
 }
 
 #[tokio::test]
-async fn phone_replies_only_sends_status_notices_only_for_phone_prompts() {
+async fn phone_replies_only_sends_blocked_and_the_resume_after_it_only_for_phone_prompts() {
     let (_dir, config, mut observed, calls, mut bridge, peers) = phone_only_bridge("idle").await;
     let notices = |calls: &Arc<Mutex<Vec<Value>>>| -> Vec<String> {
         calls
@@ -4243,6 +4243,11 @@ async fn phone_replies_only_sends_status_notices_only_for_phone_prompts() {
     assert!(!peer_notices.is_empty());
     bridge.inbound(&inbound(HEX, "phone-status")).await.unwrap();
     step(&mut bridge, &mut observed, "working").await;
+    assert_eq!(notices(&calls).len(), peer_notices.len());
+    step(&mut bridge, &mut observed, "blocked").await;
+    let blocked = notices(&calls).len() - peer_notices.len();
+    assert!(blocked > 0);
+    step(&mut bridge, &mut observed, "working").await;
     answered.extend([
         ("u2", "user", "test prompt"),
         ("a2", "final", "Reply to the phone"),
@@ -4250,14 +4255,20 @@ async fn phone_replies_only_sends_status_notices_only_for_phone_prompts() {
     claude_transcript(&config, &answered);
     step(&mut bridge, &mut observed, "idle").await;
     let phone_notices: Vec<_> = notices(&calls).split_off(peer_notices.len());
-    assert_eq!(phone_notices, ["> working", "> idle"]);
+    assert!(
+        phone_notices[..blocked]
+            .iter()
+            .all(|text| text.starts_with("> blocked")),
+        "{phone_notices:?}"
+    );
+    assert_eq!(phone_notices[blocked..], ["> working"]);
     assert_eq!(sent(&calls, "Reply to the phone"), 1);
     assert_eq!(sent(&calls, "Reply to the peer"), 0);
     let mut next = answered.clone();
     next.push(("u3", "user", "From: another peer"));
     claude_transcript(&config, &next);
     step(&mut bridge, &mut observed, "working").await;
-    assert_eq!(notices(&calls).len(), peer_notices.len() + 2);
+    assert_eq!(notices(&calls).len(), peer_notices.len() + blocked + 1);
     for handle in peers {
         handle.abort();
     }

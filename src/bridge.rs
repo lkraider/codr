@@ -840,7 +840,9 @@ impl Bridge {
             }
         } else if previous.last_agent_status != agent.agent_status
             && agent.agent_status != "done"
-            && (!quiet || agent.agent_status == "blocked")
+            && (!self.config.phone_replies_only
+                || agent.agent_status == "blocked"
+                || resumed && !quiet)
         {
             self.state
                 .enqueue(&group, &format!("> {}", agent.agent_status));
