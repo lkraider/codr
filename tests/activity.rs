@@ -1,4 +1,4 @@
-use herdr_white_noise_bridge::activity::{Activity, UserInput};
+use herdr_white_noise_bridge::activity::{Activity, HELD_PHONE_SECS, UserInput};
 
 fn input(id: &str, text: &str) -> UserInput {
     UserInput::new(id.into(), text)
@@ -118,7 +118,7 @@ fn a_held_phone_echo_waits_behind_local_input_and_a_later_match_drops_older_ones
     for (receipt, text) in [("lost", "first"), ("receipt", "hello")] {
         state.start_phone(receipt, text, &[]);
         state.confirm_phone(receipt);
-        state.hold_phone(receipt);
+        state.hold_phone(receipt, 0);
     }
     let local = input("local", "work").in_turn(Some("turn-1".into()));
     assert!(state.observe(std::slice::from_ref(&local)));
@@ -149,7 +149,7 @@ fn identical_held_phone_echoes_match_the_oldest_submission_first() {
     for receipt in ["first", "second"] {
         state.start_phone(receipt, "yes", &[]);
         state.confirm_phone(receipt);
-        state.hold_phone(receipt);
+        state.hold_phone(receipt, 0);
     }
     let one = input("one", "yes").in_turn(Some("turn-1".into()));
     assert!(!state.observe(std::slice::from_ref(&one)));
@@ -170,4 +170,20 @@ fn identical_unheld_phone_echoes_stay_ambiguous() {
         state.confirm_phone(receipt);
     }
     assert!(state.observe(&[input("one", "yes")]));
+}
+
+#[test]
+fn a_held_phone_submission_expires_and_later_identical_text_is_local() {
+    let mut state = Activity::default();
+    state.baseline(&[]);
+    state.start_phone("receipt", "yes", &[]);
+    state.confirm_phone("receipt");
+    state.hold_phone("receipt", 100);
+    state.expire_held(100 + HELD_PHONE_SECS - 1);
+    assert!(state.awaiting_phone());
+    state.expire_held(100 + HELD_PHONE_SECS);
+    assert!(!state.awaiting_phone());
+    let desk = input("desk", "yes").in_turn(Some("turn-1".into()));
+    assert!(state.observe(&[desk]));
+    assert!(!state.phone_turn("turn-1"));
 }

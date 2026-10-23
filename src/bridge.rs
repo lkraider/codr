@@ -611,6 +611,9 @@ impl Bridge {
     }
 
     async fn reconcile_agent(&mut self, key: &str, agent: &Agent) -> Result<()> {
+        if let Some(mapping) = self.state.mappings.get_mut(key) {
+            mapping.activity.expire_held(now());
+        }
         if self.reads.background
             && agent
                 .agent_session
@@ -1215,7 +1218,7 @@ impl Bridge {
                 if let Some(history) = phone_history {
                     mapping.activity.start_phone(id, text, &history.user_inputs);
                     if self.config.phone_replies_only {
-                        mapping.activity.hold_phone(id);
+                        mapping.activity.hold_phone(id, now());
                     }
                 }
                 self.save()?;

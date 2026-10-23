@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
+pub const HELD_PHONE_SECS: u64 = 30 * 60;
+
 #[derive(Clone, Debug)]
 pub struct UserInput {
     pub id: String,
@@ -56,6 +58,8 @@ struct PhoneInput {
     confirmed: bool,
     #[serde(default)]
     held: bool,
+    #[serde(default)]
+    held_at: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -188,6 +192,7 @@ impl Activity {
             fingerprint: UserInput::new(String::new(), text).fingerprint,
             confirmed: false,
             held: false,
+            held_at: 0,
         });
     }
 
@@ -200,12 +205,18 @@ impl Activity {
     }
 
     /// Keeps the submission across unrelated input until its own prompt appears.
-    pub fn hold_phone(&mut self, receipt: &str) {
+    pub fn hold_phone(&mut self, receipt: &str, now: u64) {
         for phone in &mut self.phone {
             if phone.receipt == receipt {
                 phone.held = true;
+                phone.held_at = now;
             }
         }
+    }
+
+    pub fn expire_held(&mut self, now: u64) {
+        self.phone
+            .retain(|phone| !phone.held || now.saturating_sub(phone.held_at) < HELD_PHONE_SECS);
     }
 
     pub fn cancel_phone(&mut self, receipt: &str) {
