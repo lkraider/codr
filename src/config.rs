@@ -26,6 +26,9 @@ pub struct BridgeConfig {
     /// Local native user input mutes all groups; authorized phone input wakes them.
     #[serde(default = "automatic_default")]
     pub auto_forwarding: bool,
+    /// Send a final reply only when the turn it answers holds a confirmed phone prompt.
+    #[serde(default)]
+    pub phone_replies_only: bool,
     /// Seconds between transcript rereads for a settled agent whose herdr state never changes.
     #[serde(default = "settled_reread_default")]
     pub settled_reread_secs: u64,

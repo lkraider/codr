@@ -37,7 +37,8 @@ pub(super) fn snapshot(
                 user_inputs.len(),
                 row["timestamp"].as_str().unwrap_or("")
             );
-            user_inputs.push(crate::activity::UserInput::new(id, text));
+            user_inputs
+                .push(crate::activity::UserInput::new(id, text).in_turn(latest_turn.clone()));
         }
         if ((row["type"] == "event_msg"
             && matches!(

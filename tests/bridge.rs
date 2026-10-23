@@ -33,6 +33,7 @@ fn config(dir: &std::path::Path) -> BridgeConfig {
         claude_home: dir.join("claude"),
         edit_responses: false,
         auto_forwarding: false,
+        phone_replies_only: false,
         settled_reread_secs: 30,
         transcribe_command: vec![],
     }
@@ -3979,4 +3980,216 @@ async fn an_unconfirmed_profile_update_is_not_retried() {
     );
     assert!(bridge.state.mappings[&observed.key()].rename_uncertain);
     mdk.abort();
+}
+
+fn claude_agent(status: &str) -> Agent {
+    let mut observed = agent();
+    observed.agent = "claude".into();
+    observed.agent_status = status.into();
+    observed.agent_session = Some(herdr_white_noise_bridge::herdr::Session {
+        source: "herdr:claude".into(),
+        agent: "claude".into(),
+        kind: "id".into(),
+        value: "11111111-1111-4111-8111-111111111111".into(),
+    });
+    observed
+}
+
+/// Rows are (uuid, kind, text). Kind is "user", "queued" or "final".
+fn claude_transcript(config: &BridgeConfig, rows: &[(&str, &str, &str)]) {
+    const ID: &str = "11111111-1111-4111-8111-111111111111";
+    let path = config
+        .claude_home
+        .join("projects/project")
+        .join(format!("{ID}.jsonl"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut parent = Value::Null;
+    let mut text = String::new();
+    for (uuid, kind, body) in rows {
+        let row = match *kind {
+            "user" => {
+                json!({"type":"user","uuid":uuid,"parentUuid":parent,"sessionId":ID,"message":{"role":"user","content":body}})
+            }
+            "queued" => {
+                json!({"type":"attachment","uuid":uuid,"parentUuid":parent,"sessionId":ID,"attachment":{"type":"queued_command","prompt":body,"commandMode":"prompt","origin":{"kind":"human"}}})
+            }
+            _ => {
+                json!({"type":"assistant","uuid":uuid,"parentUuid":parent,"sessionId":ID,"message":{"role":"assistant","id":format!("api-{uuid}"),"stop_reason":"end_turn","content":[{"type":"text","text":body}]}})
+            }
+        };
+        text.push_str(&(row.to_string() + "\n"));
+        parent = json!(uuid);
+    }
+    std::fs::write(path, text).unwrap();
+}
+
+fn sent(calls: &Arc<Mutex<Vec<Value>>>, text: &str) -> usize {
+    calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| call["type"] == "send_final" && call["text"] == text)
+        .count()
+}
+
+async fn phone_only_bridge(
+    status: &str,
+) -> (
+    tempfile::TempDir,
+    BridgeConfig,
+    Agent,
+    Arc<Mutex<Vec<Value>>>,
+    Bridge,
+    [tokio::task::JoinHandle<()>; 2],
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    config.phone_replies_only = true;
+    let observed = claude_agent(status);
+    claude_transcript(
+        &config,
+        &[("u0", "user", "Old prompt"), ("a0", "final", "Old final")],
+    );
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+    let herdr = peer_for_agent(&config.herdr_socket, false, calls.clone(), observed.clone()).await;
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.flush().await.unwrap();
+    (dir, config, observed, calls, bridge, [mdk, herdr])
+}
+
+#[tokio::test]
+async fn phone_replies_only_sends_the_reply_to_a_phone_prompt_and_drops_peer_replies() {
+    let (_dir, config, mut observed, calls, mut bridge, peers) = phone_only_bridge("idle").await;
+    claude_transcript(
+        &config,
+        &[
+            ("u0", "user", "Old prompt"),
+            ("a0", "final", "Old final"),
+            ("u1", "user", "From: a peer agent"),
+            ("a1", "final", "Reply to the peer"),
+        ],
+    );
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.flush().await.unwrap();
+    bridge.inbound(&inbound(HEX, "phone-1")).await.unwrap();
+    claude_transcript(
+        &config,
+        &[
+            ("u0", "user", "Old prompt"),
+            ("a0", "final", "Old final"),
+            ("u1", "user", "From: a peer agent"),
+            ("a1", "final", "Reply to the peer"),
+            ("u2", "user", "test prompt"),
+            ("a2", "final", "Reply to the phone"),
+        ],
+    );
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.flush().await.unwrap();
+    drop(bridge);
+    let mut restarted = Bridge::open(config).unwrap();
+    restarted.reconcile(vec![observed]).await.unwrap();
+    restarted.flush().await.unwrap();
+    assert_eq!(sent(&calls, "Reply to the phone"), 1);
+    assert_eq!(sent(&calls, "Reply to the peer"), 0);
+    assert_eq!(sent(&calls, "Old final"), 0);
+    for handle in peers {
+        handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn phone_replies_only_answers_a_prompt_typed_while_the_agent_works() {
+    // Claude Code either injects the held prompt into the running turn or opens a new
+    // turn with it after the running turn ends.
+    for injected in [true, false] {
+        let (_dir, config, mut observed, calls, mut bridge, peers) =
+            phone_only_bridge("working").await;
+        claude_transcript(
+            &config,
+            &[
+                ("u0", "user", "Old prompt"),
+                ("a0", "final", "Old final"),
+                ("u1", "user", "From: a peer agent"),
+            ],
+        );
+        bridge.reconcile(vec![observed.clone()]).await.unwrap();
+        bridge.inbound(&inbound(HEX, "phone-busy")).await.unwrap();
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call["method"] == "agent.prompt")
+                .count(),
+            1,
+            "injected={injected}"
+        );
+        let mut rows = vec![
+            ("u0", "user", "Old prompt"),
+            ("a0", "final", "Old final"),
+            ("u1", "user", "From: a peer agent"),
+        ];
+        if injected {
+            rows.extend([
+                ("q1", "queued", "test prompt"),
+                ("a1", "final", "Reply to the peer and the phone"),
+            ]);
+        } else {
+            rows.extend([
+                ("a1", "final", "Reply to the peer"),
+                ("u2", "user", "test prompt"),
+                ("a2", "final", "Reply to the phone"),
+            ]);
+        }
+        claude_transcript(&config, &rows);
+        observed.agent_status = "idle".into();
+        observed.state_change_seq += 1;
+        bridge.reconcile(vec![observed.clone()]).await.unwrap();
+        bridge.flush().await.unwrap();
+        if injected {
+            assert_eq!(sent(&calls, "Reply to the peer and the phone"), 1);
+        } else {
+            assert_eq!(sent(&calls, "Reply to the phone"), 1);
+            assert_eq!(sent(&calls, "Reply to the peer"), 0);
+        }
+        for handle in peers {
+            handle.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn without_phone_replies_only_a_peer_reply_still_reaches_the_phone() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut observed = claude_agent("idle");
+    claude_transcript(
+        &config,
+        &[("u0", "user", "Old prompt"), ("a0", "final", "Old final")],
+    );
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+    let herdr = peer_for_agent(&config.herdr_socket, false, calls.clone(), observed.clone()).await;
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    claude_transcript(
+        &config,
+        &[
+            ("u0", "user", "Old prompt"),
+            ("a0", "final", "Old final"),
+            ("u1", "user", "From: a peer agent"),
+            ("q1", "queued", "Another peer message"),
+            ("a1", "final", "Reply to the peer"),
+        ],
+    );
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed]).await.unwrap();
+    bridge.flush().await.unwrap();
+    assert_eq!(sent(&calls, "Reply to the peer"), 1);
+    mdk.abort();
+    herdr.abort();
 }
