@@ -64,6 +64,8 @@ pub struct Activity {
     unresolved: bool,
     #[serde(default)]
     phone_turns: Vec<String>,
+    #[serde(default)]
+    phone_open: bool,
 }
 
 impl Activity {
@@ -134,6 +136,15 @@ impl Activity {
 
     pub fn phone_turn(&self, turn: &str) -> bool {
         self.phone_turns.iter().any(|known| known == turn)
+    }
+
+    /// True from a phone submission until the final reply of its turn.
+    pub fn awaiting_phone(&self) -> bool {
+        !self.phone.is_empty() || self.phone_open
+    }
+
+    pub fn track_latest(&mut self, latest: Option<&str>, answered: bool) {
+        self.phone_open = !answered && latest.is_some_and(|turn| self.phone_turn(turn));
     }
 
     pub fn retain_turns(&mut self, live: &[String]) {
