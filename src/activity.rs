@@ -214,9 +214,12 @@ impl Activity {
         }
     }
 
-    pub fn expire_held(&mut self, now: u64) {
+    /// Returns how many confirmed submissions expired.
+    pub fn expire_held(&mut self, now: u64) -> usize {
+        let before = self.phone.iter().filter(|phone| phone.confirmed).count();
         self.phone
             .retain(|phone| !phone.held || now.saturating_sub(phone.held_at) < HELD_PHONE_SECS);
+        before - self.phone.iter().filter(|phone| phone.confirmed).count()
     }
 
     pub fn cancel_phone(&mut self, receipt: &str) {
