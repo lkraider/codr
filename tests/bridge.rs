@@ -3452,9 +3452,7 @@ async fn an_image_is_queued_while_a_prompt_is_pending_or_the_agent_works() {
             assert!(bridge.state.media_pending.is_empty(), "{status}");
             assert_eq!(
                 notices,
-                [
-                    "Media could not be queued. The session may be busy or ended. Wait for it to become idle and try again."
-                ]
+                ["The agent is waiting on a terminal prompt. Answer it at the desk, then resend."]
             );
         } else {
             assert_eq!(bridge.state.media_pending.len(), 1, "{status}");

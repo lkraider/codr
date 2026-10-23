@@ -1172,7 +1172,18 @@ impl Bridge {
         } else if msg["text_truncated"] == true || msg["attachments_truncated"] == true {
             Some("This offline message was truncated by MDK. No prompt was sent. Send a shorter text message.".into())
         } else if !msg["media"].as_array().is_none_or(|a| a.is_empty()) {
-            Some("Media could not be queued. The session may be busy or ended. Wait for it to become idle and try again.".into())
+            Some(
+                if self
+                    .agents
+                    .get(&key)
+                    .is_some_and(|agent| agent.agent_status == "blocked")
+                {
+                    "The agent is waiting on a terminal prompt. Answer it at the desk, then resend."
+                } else {
+                    "Media could not be queued. Another media message may still be in preparation, or the session has ended. Resend it later."
+                }
+                .into(),
+            )
         } else if let Some(agent) = self.agents.get(&key).cloned() {
             if media_busy {
                 Some(
