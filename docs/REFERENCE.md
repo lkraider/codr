@@ -120,7 +120,7 @@ Set `backend = "openrig"` to connect OpenRig seats. The default backend is `herd
 
 After an OpenRig database reset, the stored event number is above every new one. Replies then come from the 60-second `rig ps` reads until the new numbers pass the stored one. To get the event stream back at once, stop **codr**, delete `openrig_event_seq` from the state file, and start **codr** again. An approval at the desk sends no hook, so the phone shows a seat as blocked until its next hook, usually `Stop`.
 
-A phone prompt goes to the seat with `rig send <seat> --raw`. OpenRig refuses input while the agent waits on an interactive prompt. The phone then gets a notice to answer the prompt at the desk and resend. When OpenRig refuses a prompt for another reason, such as `typing_guard_enabled`, the phone gets that reason. **codr** does not retry a refused prompt. Decision cards and terminal context for a blocked agent need **herdr**.
+A phone prompt goes to the seat with `rig send <seat> --raw`, also while the phone shows the seat as blocked. OpenRig refuses input while the agent waits on an interactive prompt. The phone then gets a notice to answer the prompt at the desk and resend. When OpenRig refuses a prompt for another reason, such as `typing_guard_enabled`, the phone gets that reason. **codr** does not retry a refused prompt. Decision cards and terminal context for a blocked agent need **herdr**.
 
 ### Editable progress and separate final replies
 

@@ -380,6 +380,35 @@ async fn a_rig_send_refusal_at_an_interactive_prompt_tells_the_phone_and_is_not_
     peer.abort();
 }
 
+#[tokio::test]
+async fn a_stored_blocked_state_still_tries_rig_send_and_refuses_only_when_rig_send_does() {
+    let (dir, _config, calls, mut bridge, peer) = connected_seat().await;
+    seats(dir.path(), &[node(SEAT, FIRST, "needs_input", 2)]);
+    tick(&mut bridge).await;
+    let key = json!(["openrig", SEAT]).to_string();
+    assert_eq!(bridge.state.mappings[&key].last_agent_status, "blocked");
+    bridge.inbound(&inbound("phone-1", "go on")).await.unwrap();
+    bridge.flush().await.unwrap();
+    assert_eq!(
+        rig_calls(dir.path(), "send"),
+        [format!("send {SEAT} --raw --json -- go on")]
+    );
+    assert!(bridge.state.mappings[&key].pending_prompt);
+    assert_eq!(sent(&calls, BLOCKED), 0);
+
+    send_reply(
+        dir.path(),
+        json!({"ok":false,"sessionName":SEAT,"reason":"target_needs_input",
+            "error":"The target is waiting on an interactive prompt. No text was sent."}),
+        1,
+    );
+    bridge.inbound(&inbound("phone-2", "again")).await.unwrap();
+    bridge.flush().await.unwrap();
+    assert_eq!(rig_calls(dir.path(), "send").len(), 2);
+    assert_eq!(sent(&calls, BLOCKED), 1);
+    peer.abort();
+}
+
 /// Events recorded from a live `/api/events` stream, renamed to the test seat and renumbered from 101.
 fn recorded() -> Vec<String> {
     include_str!("fixtures/openrig-events.jsonl")
