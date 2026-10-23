@@ -57,6 +57,13 @@ fn task(content: &Value, status: &Value) -> Option<Task> {
     })
 }
 
+pub(super) fn tracked(tool: &str) -> bool {
+    matches!(
+        tool,
+        "TodoWrite" | "todowrite" | "TaskCreate" | "TaskUpdate" | "update_plan"
+    )
+}
+
 #[derive(Default)]
 pub(super) struct Tracker {
     pending: HashMap<String, (String, Value)>,
@@ -71,10 +78,7 @@ impl Tracker {
     }
 
     pub fn call(&mut self, id: &str, name: &str, input: &Value) {
-        if matches!(
-            name,
-            "TodoWrite" | "todowrite" | "TaskCreate" | "TaskUpdate" | "update_plan"
-        ) {
+        if tracked(name) {
             self.pending.insert(id.into(), (name.into(), input.clone()));
         }
     }

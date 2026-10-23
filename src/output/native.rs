@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use serde_json::Value;
 use std::{
     fs::{self, File},
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -52,14 +52,25 @@ fn scan(
     Ok(())
 }
 
-pub fn records(path: &Path, mut visit: impl FnMut(Value) -> Result<()>) -> Result<()> {
-    let file = File::open(path)?;
-    let length = file.metadata()?.len();
+pub fn records(path: &Path, visit: impl FnMut(Value) -> Result<()>) -> Result<()> {
     ensure!(
-        length <= MAX_FILE_BYTES,
+        fs::metadata(path)?.len() <= MAX_FILE_BYTES,
         "Native transcript exceeds 128 MiB"
     );
-    let mut reader = BufReader::new(file.take(length));
+    records_from(path, 0, visit).map(drop)
+}
+
+/// Visits the complete records that start at `offset` and returns the offset after the last one.
+pub fn records_from(
+    path: &Path,
+    offset: u64,
+    mut visit: impl FnMut(Value) -> Result<()>,
+) -> Result<u64> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    file.seek(SeekFrom::Start(offset))?;
+    let mut reader = BufReader::new(file.take(length.saturating_sub(offset)));
+    let mut end = offset;
     loop {
         let mut line = Vec::new();
         let bytes = reader
@@ -77,6 +88,7 @@ pub fn records(path: &Path, mut visit: impl FnMut(Value) -> Result<()>) -> Resul
         if line.last() != Some(&b'\n') {
             break;
         }
+        end += bytes as u64;
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
@@ -84,5 +96,5 @@ pub fn records(path: &Path, mut visit: impl FnMut(Value) -> Result<()>) -> Resul
             .map_err(|_| anyhow::anyhow!("Invalid native transcript record"))?;
         visit(row)?;
     }
-    Ok(())
+    Ok(end)
 }
