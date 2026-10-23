@@ -113,6 +113,7 @@ async fn peer_for_agent(
                     }
                     "agent.get" => json!({"result":{"agent":observed}}),
                     "agent.prompt" => json!({"result":{"type":"agent_prompted","agent":observed}}),
+                    "agent.read" => json!({"result":{"read":{"text":"Allow this tool?"}}}),
                     _ => panic!("unexpected method"),
                 }
             };
@@ -4192,4 +4193,68 @@ async fn without_phone_replies_only_a_peer_reply_still_reaches_the_phone() {
     assert_eq!(sent(&calls, "Reply to the peer"), 1);
     mdk.abort();
     herdr.abort();
+}
+
+async fn step(bridge: &mut Bridge, observed: &mut Agent, status: &str) {
+    observed.agent_status = status.into();
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.flush().await.unwrap();
+}
+
+#[tokio::test]
+async fn phone_replies_only_sends_status_notices_only_for_phone_prompts() {
+    let (_dir, config, mut observed, calls, mut bridge, peers) = phone_only_bridge("idle").await;
+    let notices = |calls: &Arc<Mutex<Vec<Value>>>| -> Vec<String> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["type"] == "send_final")
+            .filter_map(|call| call["text"].as_str())
+            .filter(|text| text.starts_with("> "))
+            .map(str::to_owned)
+            .collect()
+    };
+    let peer_turn = [
+        ("u0", "user", "Old prompt"),
+        ("a0", "final", "Old final"),
+        ("u1", "user", "From: a peer agent"),
+    ];
+    claude_transcript(&config, &peer_turn);
+    step(&mut bridge, &mut observed, "working").await;
+    step(&mut bridge, &mut observed, "blocked").await;
+    step(&mut bridge, &mut observed, "working").await;
+    let mut answered = peer_turn.to_vec();
+    answered.push(("a1", "final", "Reply to the peer"));
+    claude_transcript(&config, &answered);
+    step(&mut bridge, &mut observed, "idle").await;
+    let peer_notices = notices(&calls);
+    assert!(
+        peer_notices
+            .iter()
+            .all(|text| text.starts_with("> blocked")),
+        "{peer_notices:?}"
+    );
+    assert!(!peer_notices.is_empty());
+    bridge.inbound(&inbound(HEX, "phone-status")).await.unwrap();
+    step(&mut bridge, &mut observed, "working").await;
+    answered.extend([
+        ("u2", "user", "test prompt"),
+        ("a2", "final", "Reply to the phone"),
+    ]);
+    claude_transcript(&config, &answered);
+    step(&mut bridge, &mut observed, "idle").await;
+    let phone_notices: Vec<_> = notices(&calls).split_off(peer_notices.len());
+    assert_eq!(phone_notices, ["> working", "> idle"]);
+    assert_eq!(sent(&calls, "Reply to the phone"), 1);
+    assert_eq!(sent(&calls, "Reply to the peer"), 0);
+    let mut next = answered.clone();
+    next.push(("u3", "user", "From: another peer"));
+    claude_transcript(&config, &next);
+    step(&mut bridge, &mut observed, "working").await;
+    assert_eq!(notices(&calls).len(), peer_notices.len() + 2);
+    for handle in peers {
+        handle.abort();
+    }
 }
