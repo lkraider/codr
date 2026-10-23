@@ -26,6 +26,9 @@ pub struct BridgeConfig {
     /// Local native user input mutes all groups; authorized phone input wakes them.
     #[serde(default = "automatic_default")]
     pub auto_forwarding: bool,
+    /// Send a final reply only when the turn it answers holds a confirmed phone prompt.
+    #[serde(default)]
+    pub phone_replies_only: bool,
     /// Executable and fixed arguments. The downloaded audio path is appended.
     #[serde(default)]
     pub transcribe_command: Vec<String>,

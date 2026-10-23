@@ -15,3 +15,5 @@ claude_home = "/home/YOUR_USER/.claude"
 # Optional editable progress and transcription notices. Requires MDK edit_message support.
 # The published MDK 0.13.0 binaries do not include that API.
 # edit_responses = true
+# Optional. Send a final reply only when the turn it answers holds a phone prompt.
+# phone_replies_only = true

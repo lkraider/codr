@@ -178,7 +178,7 @@ fn history_from_data(export: &Export) -> SessionHistory {
                 user_inputs.push(if message.parts.is_empty() {
                     crate::activity::UserInput::pending(id)
                 } else {
-                    crate::activity::UserInput::new(id, &text)
+                    crate::activity::UserInput::new(id.clone(), &text).in_turn(Some(id))
                 });
             }
             latest_turn = Some(format!("opencode:{}", info.id));

@@ -7,6 +7,10 @@ use std::collections::HashSet;
 pub struct UserInput {
     pub id: String,
     pub fingerprint: Option<String>,
+    /// The turn whose final reply answers this input.
+    pub turn: Option<String>,
+    /// Delivered into a running turn. It never opens a turn and never mutes forwarding.
+    pub queued: bool,
     complete: bool,
 }
 
@@ -18,6 +22,8 @@ impl UserInput {
             complete: true,
             fingerprint: (!text.trim().is_empty())
                 .then(|| hex::encode(Sha256::digest(text.trim().as_bytes()))),
+            turn: None,
+            queued: false,
         }
     }
 
@@ -25,8 +31,20 @@ impl UserInput {
         Self {
             id,
             fingerprint: None,
+            turn: None,
+            queued: false,
             complete: false,
         }
+    }
+
+    pub fn in_turn(mut self, turn: Option<String>) -> Self {
+        self.turn = turn;
+        self
+    }
+
+    pub fn queued(mut self) -> Self {
+        self.queued = true;
+        self
     }
 }
 
@@ -44,6 +62,8 @@ pub struct Activity {
     phone: Vec<PhoneInput>,
     #[serde(default)]
     unresolved: bool,
+    #[serde(default)]
+    phone_turns: Vec<String>,
 }
 
 impl Activity {
@@ -61,9 +81,9 @@ impl Activity {
             .iter()
             .filter(|input| input.complete && !known.contains(&input.id))
             .collect();
-        let local = fresh.iter().any(|input| {
-            let candidates: Vec<_> = self
-                .phone
+        let phone = &self.phone;
+        let matched = |input: &UserInput| {
+            let candidates: Vec<_> = phone
                 .iter()
                 .filter(|phone| {
                     phone.confirmed
@@ -72,25 +92,52 @@ impl Activity {
                         && !phone.before.contains(&input.id)
                 })
                 .collect();
-            candidates.len() != 1
-                || fresh
+            (candidates.len() == 1
+                && fresh
                     .iter()
                     .filter(|other| {
                         other.fingerprint == candidates[0].fingerprint
                             && !candidates[0].before.contains(&other.id)
                     })
                     .count()
-                    != 1
-        });
+                    == 1)
+                .then(|| candidates[0].receipt.clone())
+        };
+        let local = fresh
+            .iter()
+            .any(|input| !input.queued && matched(input).is_none());
+        let mut consumed = Vec::new();
+        for input in &fresh {
+            if let Some(receipt) = matched(input) {
+                consumed.push(receipt);
+                if let Some(turn) = &input.turn
+                    && !self.phone_turns.contains(turn)
+                {
+                    self.phone_turns.push(turn.clone());
+                }
+            }
+        }
         // A submission can explain only the first new input batch after its checkpoint.
-        self.phone
-            .retain(|phone| !fresh.iter().any(|input| !phone.before.contains(&input.id)));
+        self.phone.retain(|phone| {
+            !consumed.contains(&phone.receipt)
+                && !fresh
+                    .iter()
+                    .any(|input| !input.queued && !phone.before.contains(&input.id))
+        });
         observed.extend(fresh.into_iter().map(|input| input.id.clone()));
         local
     }
 
     pub fn baseline(&mut self, inputs: &[UserInput]) {
         let _ = self.observe(inputs);
+    }
+
+    pub fn phone_turn(&self, turn: &str) -> bool {
+        self.phone_turns.iter().any(|known| known == turn)
+    }
+
+    pub fn retain_turns(&mut self, live: &[String]) {
+        self.phone_turns.retain(|turn| live.contains(turn));
     }
 
     pub fn unresolved(&self) -> bool {

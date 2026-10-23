@@ -74,3 +74,39 @@ fn incomplete_phone_echo_waits_for_text_without_consuming_attribution() {
     assert!(!state.observe(&[input("phone", "hello")]));
     assert!(!state.unresolved());
 }
+
+#[test]
+fn a_phone_echo_records_the_turn_that_answers_it() {
+    let mut state = Activity::default();
+    state.baseline(&[]);
+    state.start_phone("receipt", "hello", &[]);
+    state.confirm_phone("receipt");
+    assert!(!state.observe(&[input("phone", "hello").in_turn(Some("turn-1".into()))]));
+    assert!(state.phone_turn("turn-1"));
+    assert!(state.observe(&[
+        input("phone", "hello").in_turn(Some("turn-1".into())),
+        input("peer", "hello").in_turn(Some("turn-2".into())),
+    ]));
+    assert!(!state.phone_turn("turn-2"));
+    state.retain_turns(&["turn-2".into()]);
+    assert!(!state.phone_turn("turn-1"));
+}
+
+#[test]
+fn queued_input_never_mutes_and_a_queued_phone_echo_marks_the_running_turn() {
+    let mut state = Activity::default();
+    state.baseline(&[input("peer", "work").in_turn(Some("turn-1".into()))]);
+    state.start_phone("receipt", "hello", &[]);
+    state.confirm_phone("receipt");
+    let peer = input("peer", "work").in_turn(Some("turn-1".into()));
+    let other = input("other", "more work")
+        .in_turn(Some("turn-1".into()))
+        .queued();
+    assert!(!state.observe(&[peer.clone(), other.clone()]));
+    assert!(!state.phone_turn("turn-1"));
+    let phone = input("phone", "hello")
+        .in_turn(Some("turn-1".into()))
+        .queued();
+    assert!(!state.observe(&[peer, other, phone]));
+    assert!(state.phone_turn("turn-1"));
+}

@@ -15,6 +15,7 @@ struct Row {
     api_error: bool,
     user_prompt: bool,
     input_text: String,
+    queued_text: Option<String>,
     message: Option<String>,
     stop: Option<String>,
     text: Vec<String>,
@@ -49,6 +50,28 @@ impl Response {
         }
         *self = Self::default();
     }
+}
+
+/// Claude Code records input typed during a running turn as an attachment of that turn.
+fn queued_prompt(kind: &str, private: bool, attachment: &Value) -> Option<String> {
+    if kind != "attachment"
+        || private
+        || attachment["type"] != "queued_command"
+        || attachment["commandMode"] != "prompt"
+    {
+        return None;
+    }
+    let prompt = &attachment["prompt"];
+    prompt.as_str().map(str::to_owned).or_else(|| {
+        prompt.as_array().map(|parts| {
+            parts
+                .iter()
+                .filter(|part| part["type"] == "text")
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    })
 }
 
 pub fn read(home: &Path, session: &str) -> Result<Vec<FinalMessage>> {
@@ -128,6 +151,7 @@ pub(super) fn snapshot(
             } else {
                 String::new()
             },
+            queued_text: queued_prompt(kind, private, &value["attachment"]),
             message: value["message"]["id"].as_str().map(str::to_owned),
             stop: value["message"]["stop_reason"].as_str().map(str::to_owned),
             text,
@@ -201,14 +225,21 @@ pub(super) fn snapshot(
             continue;
         }
         if row.user_prompt {
-            user_inputs.push(crate::activity::UserInput::new(
-                format!("claude:{}", row.id),
-                &row.input_text,
-            ));
+            user_inputs.push(
+                crate::activity::UserInput::new(format!("claude:{}", row.id), &row.input_text)
+                    .in_turn(Some(format!("claude:{}", row.id))),
+            );
             response.finish(&mut replies);
             latest_turn = Some(format!("claude:{}", row.id));
             turns.insert(latest_turn.clone().unwrap());
             tasks.new_turn();
+        }
+        if let Some(text) = &row.queued_text {
+            user_inputs.push(
+                crate::activity::UserInput::new(format!("claude:{}", row.id), text)
+                    .in_turn(latest_turn.clone())
+                    .queued(),
+            );
         }
         if !row.api_error {
             for part in &row.parts {
