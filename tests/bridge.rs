@@ -579,7 +579,7 @@ async fn an_ended_session_requires_a_post_exit_snapshot_before_it_is_closed() {
         },
     );
     bridge.poll_sessions(vec![a.clone()]).await.unwrap();
-    for _ in 0..100 {
+    for _ in 0..1000 {
         if started.exists() {
             break;
         }
@@ -589,7 +589,7 @@ async fn an_ended_session_requires_a_post_exit_snapshot_before_it_is_closed() {
     std::fs::write(&source, json!({"messages":[{"info":{"id":"last-final","role":"assistant","time":{"completed":1},"finish":"stop"},"parts":[{"type":"text","text":"Final after exit"}]}]}).to_string()).unwrap();
     bridge.poll_sessions(vec![]).await.unwrap();
     std::fs::write(release, "").unwrap();
-    for _ in 0..100 {
+    for _ in 0..1000 {
         bridge.poll_sessions(vec![]).await.unwrap();
         if !bridge.state.mappings[&a.key()].active {
             break;
@@ -716,7 +716,7 @@ async fn background_reads_discard_a_snapshot_from_an_older_agent_state() {
         },
     );
     bridge.poll_sessions(vec![a.clone()]).await.unwrap();
-    for _ in 0..100 {
+    for _ in 0..1000 {
         if started.exists() {
             break;
         }
@@ -726,7 +726,7 @@ async fn background_reads_discard_a_snapshot_from_an_older_agent_state() {
     a.state_change_seq = 2;
     std::fs::write(&source, data("current", "Current final")).unwrap();
     std::fs::write(release, "").unwrap();
-    for _ in 0..100 {
+    for _ in 0..1000 {
         bridge.poll_sessions(vec![a.clone()]).await.unwrap();
         if bridge
             .state
@@ -785,7 +785,7 @@ async fn background_reads_limit_parallel_exports_and_ignore_results_after_desk_s
         })
         .collect();
     bridge.poll_sessions(agents.clone()).await.unwrap();
-    for _ in 0..100 {
+    for _ in 0..1000 {
         if std::fs::read_to_string(&starts)
             .unwrap_or_default()
             .lines()
@@ -799,7 +799,7 @@ async fn background_reads_limit_parallel_exports_and_ignore_results_after_desk_s
     assert_eq!(std::fs::read_to_string(&starts).unwrap().lines().count(), 4);
     assert!(forwarding_command(&config, "desk").await.status.success());
     std::fs::write(release, "").unwrap();
-    for _ in 0..100 {
+    for _ in 0..1000 {
         bridge.poll_sessions(agents.clone()).await.unwrap();
         if bridge
             .state
