@@ -2,6 +2,7 @@
 """Convert a downloaded voice message and send it to the Gemini API for transcription."""
 import argparse
 import base64
+import http.client
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,13 @@ MODEL = "gemini-3.5-transcribe"
 
 class TranscriptionError(Exception):
     pass
+
+
+class RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """urllib copies the x-goog-api-key header to any redirect target."""
+
+    def redirect_request(self, *args):
+        return None
 
 
 def key_path():
@@ -67,13 +75,13 @@ def transcribe(audio, ffmpeg, endpoint=ENDPOINT):
     request = urllib.request.Request(endpoint, body, method="POST", headers={
         "Content-Type": "application/json", "x-goog-api-key": key})
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.build_opener(RefuseRedirects).open(request, timeout=120) as response:
             payload = response.read(1048577)
     except urllib.error.HTTPError as error:
         error.close()
         raise TranscriptionError(f"Gemini refused the recording with HTTP {error.code}") from None
-    except (OSError, ValueError):
-        raise TranscriptionError("Gemini could not be reached") from None
+    except (OSError, ValueError, http.client.HTTPException):
+        raise TranscriptionError("The connection to Gemini failed") from None
     if len(payload) > 1048576:
         raise TranscriptionError("The Gemini response is too large")
     return transcript(payload)

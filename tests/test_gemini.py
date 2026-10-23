@@ -28,7 +28,7 @@ def write_wav(audio, ffmpeg, directory):
 
 
 class FakeGemini:
-    def __init__(self, status=200, response=None):
+    def __init__(self, status=200, response=None, headers=(), truncated=False):
         self.requests = []
         owner = self
         body = json.dumps(response).encode() if response is not None else b""
@@ -38,6 +38,13 @@ class FakeGemini:
                 payload = self.rfile.read(int(self.headers["Content-Length"]))
                 owner.requests.append((self.path, self.headers, payload))
                 self.send_response(status)
+                for header in headers:
+                    self.send_header(*header)
+                if truncated:
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(b"1000\r\n" + body[:10])
+                    return
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -46,7 +53,7 @@ class FakeGemini:
                 pass
 
         self.server = HTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, args=(0.05,), daemon=True)
 
     @property
     def url(self):
@@ -126,6 +133,20 @@ class GeminiTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "Gemini refused the recording with HTTP 403")
         self.assertIsNone(raised.exception.__cause__)
 
+    def test_a_redirect_is_refused_without_sending_the_key_to_its_target(self):
+        with FakeGemini(response=answer("text")) as target:
+            for status in (301, 302, 303, 307, 308):
+                with FakeGemini(status=status, headers=[("Location", target.url)]) as server:
+                    with self.assertRaisesRegex(transcribe_gemini.TranscriptionError, f"HTTP {status}"):
+                        self.run_transcribe(server)
+                self.assertEqual(len(server.requests), 1)
+        self.assertEqual(target.requests, [])
+
+    def test_a_truncated_response_is_a_connection_error(self):
+        with FakeGemini(response=answer("text"), truncated=True) as server:
+            with self.assertRaisesRegex(transcribe_gemini.TranscriptionError, "connection to Gemini failed"):
+                self.run_transcribe(server)
+
     def test_an_empty_or_unreadable_transcript_is_an_error(self):
         for response, message in ((answer("  \n"), "no text"), (answer(), "no text"),
                                   ({"status": "completed"}, "no text"), ([], "unreadable"),
@@ -138,7 +159,7 @@ class GeminiTests(unittest.TestCase):
         with FakeGemini() as server:
             url = server.url
         with patch.object(transcribe_gemini, "normalise", side_effect=write_wav):
-            with self.assertRaisesRegex(transcribe_gemini.TranscriptionError, "could not be reached"):
+            with self.assertRaisesRegex(transcribe_gemini.TranscriptionError, "connection to Gemini failed"):
                 transcribe_gemini.transcribe(self.audio, "ffmpeg", url)
 
     def test_the_command_exits_non_zero_with_a_short_message_and_no_stdout(self):
