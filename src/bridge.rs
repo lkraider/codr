@@ -2212,13 +2212,18 @@ impl Bridge {
                 );
             }
             // Deferred media fails again on every pass while the agent works, so it arms the
-            // retries once until recovery succeeds.
+            // retries once while it waits. A recovery that succeeds leaves the media waiting.
             if inbound_deferred || (media_deferred && !media_retried) {
                 retries = 3;
                 retry.reset();
                 media_retried |= media_deferred;
             }
-            if !recovery_due {
+            let media_waiting = self
+                .state
+                .media_pending
+                .iter()
+                .any(|event| event["_codr_prepared_text"].is_string());
+            if !recovery_due && !media_waiting {
                 retries = 0;
                 media_retried = false;
             }

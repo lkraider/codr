@@ -941,3 +941,54 @@ async fn a_phone_prompt_deferred_by_a_stale_idle_snapshot_reaches_the_seat_withi
     assert_eq!(rig_calls(dir.path(), "send").len(), 1);
     mdk.abort();
 }
+
+#[tokio::test]
+async fn deferred_prepared_media_reaches_the_seat_within_seconds() {
+    let (dir, mut config, _calls, bridge, peer) = connected_seat().await;
+    drop(bridge);
+    peer.abort();
+    let path = dir.path().join("state.json");
+    let mut state: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let mut event = inbound("media-1", "");
+    event["message"]["media"] = json!([{"kind":"audio"}]);
+    event["_codr_prepared_text"] = json!("Spoken prompt");
+    state["media_pending"] = json!([event]);
+    std::fs::write(&path, state.to_string()).unwrap();
+    send_reply(dir.path(), json!({"ok":false,"sent":false}), 0);
+    std::fs::remove_file(&config.wn_agent_socket).unwrap();
+    // A closed port keeps the event follower away from a real OpenRig daemon.
+    config.openrig_url = "http://127.0.0.1:9".into();
+    let mdk = streaming_mdk(
+        &config.wn_agent_socket,
+        inbound("unused", "unused"),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .await;
+    let mut bridge = Bridge::open(config).unwrap();
+    let delivered = async {
+        while rig_calls(dir.path(), "send").is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        send_reply(
+            dir.path(),
+            json!({"ok":true,"sessionName":SEAT,"sent":true}),
+            0,
+        );
+        let start = std::time::Instant::now();
+        while rig_calls(dir.path(), "send").len() < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        start.elapsed()
+    };
+    let elapsed = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        tokio::select! {
+            result = bridge.run() => panic!("run stopped: {result:?}"),
+            elapsed = delivered => elapsed,
+        }
+    })
+    .await
+    .expect("the deferred media waited for the 60 s recovery tick");
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    assert_eq!(rig_calls(dir.path(), "send").len(), 2);
+    mdk.abort();
+}
