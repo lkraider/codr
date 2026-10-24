@@ -5,6 +5,7 @@
 ### Changed
 
 - Accept phone prompts while the agent works. A blocked agent still refuses them with the terminal-prompt notice. A prompt sent while media from the same group is being prepared gets its own notice.
+- Accept phone images while the agent works or a phone prompt is pending. An image sent while the agent is blocked gets the terminal-prompt notice. Other refused media gets a notice with the reason.
 
 ### Fixed
 
