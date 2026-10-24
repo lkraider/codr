@@ -1,12 +1,15 @@
 use bech32::ToBase32;
 use herdr_white_noise_bridge::{
-    BridgeConfig, BridgeState, bridge::Bridge, speech::spoken_text, wire::read_line,
+    BridgeConfig, BridgeState,
+    bridge::Bridge,
+    speech::{DEFAULT_ADAPT_PROMPT, adapt_prompt, spoken_text},
+    wire::read_line,
 };
 use serde_json::{Value, json};
 use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
     time::Duration,
 };
 use tokio::{io::AsyncWriteExt, net::UnixListener};
@@ -313,5 +316,157 @@ fn long_text_is_cut_at_a_word_with_a_spoken_note() {
     assert_eq!(
         spoken_text("Short.", true),
         "Short.\nThe reply is cut here."
+    );
+}
+
+const CLEANED: &str =
+    "Result\nThe build passed. See the log.\nCode block skipped.\nTable skipped.\nfmt is clean";
+const FALLBACK: &str = "Translation failed. The original text is spoken.";
+
+async fn adapting_bridge(dir: &Path, adapt: &str) -> Bridge {
+    let path = dir.join("adapt.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\npwd > {:?}\ncat > {:?}\n{adapt}\n",
+            dir.join("adapt-cwd.txt"),
+            dir.join("adapt-in.txt")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join("prompt.md"), "Speak it in Portuguese.\n").unwrap();
+    BridgeState::with_mapping("[\"herdr\",\"w1:p1\"]", GROUP.into())
+        .save(&dir.join("state.json"))
+        .unwrap();
+    let mut config = config(dir, 0);
+    config.speak_adapt_command = vec![path.display().to_string()];
+    config.speak_adapt_prompt_file = Some(dir.join("prompt.md"));
+    Bridge::open(config).unwrap()
+}
+
+async fn speak_once(bridge: &mut Bridge, dir: &Path) -> String {
+    bridge.state.spoken_messages.clear();
+    bridge
+        .inbound(&reaction(PHONE, "😮", BRIDGE))
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        bridge.process_speech().await.unwrap();
+        if !bridge.state.spoken_messages.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(bridge.state.spoken_messages, [MESSAGE]);
+    std::fs::read_to_string(dir.join("adapt-in.txt")).unwrap()
+}
+
+async fn spoken_with(adapt: &str) -> (String, Vec<Value>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Calls::default();
+    let server = connector(&dir.path().join("wn.sock"), calls.clone(), false, REPLY).await;
+    let mut bridge = adapting_bridge(dir.path(), adapt).await;
+    assert_eq!(
+        speak_once(&mut bridge, dir.path()).await,
+        format!("Speak it in Portuguese.\n\n{CLEANED}")
+    );
+    assert_eq!(calls.sent_audio.lock().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("adapt-cwd.txt"))
+            .unwrap()
+            .trim_end(),
+        dir.path()
+            .join("speech")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    server.abort();
+    let spoken = std::fs::read_to_string(dir.path().join("spoken.txt")).unwrap();
+    (spoken, notices(&calls), dir)
+}
+
+#[tokio::test]
+async fn the_adapt_command_output_is_spoken() {
+    let (spoken, notices, _dir) = spoken_with("printf 'O build passou.\\n'").await;
+    assert_eq!(spoken, "O build passou.");
+    assert!(notices.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_or_empty_adapt_command_speaks_the_original_and_tells_the_phone() {
+    for adapt in ["printf 'partial'; exit 1", "printf ' \\n'"] {
+        let (spoken, notices, _dir) = spoken_with(adapt).await;
+        assert_eq!(spoken, CLEANED, "{adapt}");
+        assert_eq!(notices.len(), 1, "{adapt}");
+        assert_eq!(notices[0]["text"], FALLBACK);
+    }
+}
+
+#[tokio::test]
+async fn the_prompt_file_is_read_on_each_reaction_and_falls_back_to_the_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Calls::default();
+    let server = connector(&dir.path().join("wn.sock"), calls.clone(), false, REPLY).await;
+    let mut bridge = adapting_bridge(dir.path(), "printf 'Fala.'").await;
+    let prompt = dir.path().join("prompt.md");
+
+    std::fs::write(&prompt, "Fale em português.").unwrap();
+    assert_eq!(
+        speak_once(&mut bridge, dir.path()).await,
+        format!("Fale em português.\n\n{CLEANED}")
+    );
+    std::fs::write(&prompt, "Fale devagar.").unwrap();
+    assert_eq!(
+        speak_once(&mut bridge, dir.path()).await,
+        format!("Fale devagar.\n\n{CLEANED}")
+    );
+    std::fs::remove_file(&prompt).unwrap();
+    assert_eq!(
+        speak_once(&mut bridge, dir.path()).await,
+        format!("{DEFAULT_ADAPT_PROMPT}\n\n{CLEANED}")
+    );
+    assert!(notices(&calls).is_empty());
+    server.abort();
+}
+
+#[test]
+fn an_unreadable_prompt_file_is_logged_once_until_it_is_readable_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prompt.md");
+    let unreadable = AtomicBool::new(false);
+    let read = || adapt_prompt(Some(&path), &unreadable);
+
+    assert_eq!(read(), (DEFAULT_ADAPT_PROMPT.to_owned(), true));
+    std::fs::write(&path, " \n").unwrap();
+    assert_eq!(read(), (DEFAULT_ADAPT_PROMPT.to_owned(), false));
+    std::fs::write(&path, "Speak it.\n").unwrap();
+    assert_eq!(read(), ("Speak it.".to_owned(), false));
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(read(), (DEFAULT_ADAPT_PROMPT.to_owned(), true));
+    assert_eq!(
+        adapt_prompt(None, &AtomicBool::new(false)),
+        (DEFAULT_ADAPT_PROMPT.to_owned(), false)
+    );
+}
+
+#[test]
+fn the_prompt_file_path_must_be_absolute() {
+    let phone = bech32::encode("npub", [0x11u8; 32].to_base32(), bech32::Variant::Bech32).unwrap();
+    let toml = format!(
+        "phone_npub = {phone:?}\naccount_id_hex = {BRIDGE:?}\nherdr_socket = \"/tmp/h.sock\"\n\
+         wn_agent_socket = \"/tmp/w.sock\"\nstate_path = \"/tmp/state.json\"\n\
+         speak_adapt_command = [\"/bin/cat\"]\n"
+    );
+    assert!(BridgeConfig::from_toml(&toml).is_ok());
+    let error =
+        BridgeConfig::from_toml(&format!("{toml}speak_adapt_prompt_file = \"prompt.md\"\n"))
+            .err()
+            .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "speak_adapt_prompt_file must be absolute"
     );
 }

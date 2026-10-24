@@ -237,6 +237,23 @@ speak_dir = "/Users/you/.local/state/herdr-white-noise-bridge/speech"
 - `speak_reaction` is the trigger emoji. Spoken replies are off when it is unset.
 - `speak_dir` holds the audio until it is sent. It must be an absolute path. **codr** creates it with mode 0700. Each audio is a new file with a unique name. **codr** removes the file after the send, and also when the command or the send fails.
 
+#### Translated speech
+
+`speak_adapt_command` rewrites the text before `speak_command` speaks it, for example into another language. It is off when unset. This example uses Claude Code with Haiku:
+
+```toml
+speak_adapt_command = ["/usr/bin/env", "CLAUDE_CONFIG_DIR=/Users/you/.claude", "/opt/homebrew/bin/claude", "-p", "--model", "haiku", "--tools", "", "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence", "--disable-slash-commands"]
+speak_adapt_prompt_file = "/Users/you/.config/herdr-white-noise-bridge/speak-adapt-prompt.md"
+speak_command = ["/usr/bin/say", "-v", "Luciana (Enhanced)", "--file-format=m4af", "--data-format=aac@44100", "-f", "-", "-o"]
+```
+
+- `speak_adapt_command` is an executable with fixed arguments. It runs in `speak_dir`. **codr** writes the prompt, a blank line and the cleaned text to its stdin. It reads the speech text from stdout.
+- `speak_adapt_prompt_file` is an optional absolute path. **codr** reads it on each reaction, so an edit applies without a restart.
+- When the file is unset, missing or empty, **codr** uses a built-in prompt that translates into Brazilian Portuguese for the voice Luciana. A missing or empty file is logged once. It is logged again only after the file was readable in between.
+- **codr** cleans the output like the original text and cuts it at 4000 characters.
+- When the command fails, prints no text or runs longer than 120 seconds, **codr** speaks the cleaned original text. The phone gets "Translation failed. The original text is spoken." The log gets "Speech translation failed:" with the exit status, without the command output.
+- In the example, `--setting-sources ""` stops the hooks and plugins in that Claude home from running. `--tools ""` and `--strict-mcp-config` remove the tools and MCP servers. `--bare` also skips hooks, but it accepts only `ANTHROPIC_API_KEY` and ignores the Claude login.
+
 The MDK connector sends media only from beneath its `--media-allowed-root`. Start the connector with `--media-allowed-root` set to `speak_dir` or to a folder that contains it. The connector refuses every media send without it.
 
 Fresh setup creates `${XDG_STATE_HOME:-~/.local/state}/herdr-white-noise-bridge/speech`, or `codr-openrig/speech` for the OpenRig bridge. It passes the folder to the connector and writes it as `speak_dir`. Setup leaves existing installations unchanged. Add the argument to the connector service by hand and create the folder with mode 0700 before the connector starts, because the connector refuses to start when the folder is missing.

@@ -64,6 +64,13 @@ pub struct BridgeConfig {
     /// Temporary audio files. The connector sends media only from beneath its `--media-allowed-root`.
     #[serde(default)]
     pub speak_dir: Option<PathBuf>,
+    /// Executable and fixed arguments. The prompt, a blank line and the text arrive on stdin.
+    /// The speech text is read from stdout.
+    #[serde(default)]
+    pub speak_adapt_command: Vec<String>,
+    /// Read on each reaction, so an edit applies without a restart.
+    #[serde(default)]
+    pub speak_adapt_prompt_file: Option<PathBuf>,
 }
 
 fn automatic_default() -> bool {
@@ -156,6 +163,12 @@ impl BridgeConfig {
                         .as_ref()
                         .is_some_and(|dir| dir.is_absolute()),
                 "speak_reaction needs speak_command and an absolute speak_dir"
+            );
+        }
+        if let Some(path) = &config.speak_adapt_prompt_file {
+            ensure!(
+                path.is_absolute(),
+                "speak_adapt_prompt_file must be absolute"
             );
         }
         if let Some(path) = &config.opencode_db {

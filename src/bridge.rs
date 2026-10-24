@@ -24,6 +24,7 @@ pub struct Bridge {
     phone: String,
     media_job: Option<tokio::task::JoinHandle<Result<crate::media::Prepared>>>,
     speech_jobs: Vec<SpeechJob>,
+    speak_prompt_unreadable: std::sync::Arc<std::sync::atomic::AtomicBool>,
     reads: crate::reads::Reads,
     last_snapshot: Vec<Agent>,
     stop_rereads: BTreeMap<String, StopReread>,
@@ -84,6 +85,7 @@ impl Bridge {
             phone,
             media_job: None,
             speech_jobs: vec![],
+            speak_prompt_unreadable: Default::default(),
             reads: crate::reads::Reads::default(),
             last_snapshot: vec![],
             stop_rereads: BTreeMap::new(),
@@ -1523,10 +1525,14 @@ impl Bridge {
         }
         let config = self.config.clone();
         let socket = self.marmot.clone();
+        let unreadable = self.speak_prompt_unreadable.clone();
         let (group, message_id) = (group.to_owned(), id.to_owned());
         let job = tokio::spawn({
             let message_id = message_id.clone();
-            async move { crate::speech::speak_or_report(&config, &socket, &group, &message_id).await }
+            async move {
+                crate::speech::speak_or_report(&config, &socket, &group, &message_id, &unreadable)
+                    .await
+            }
         });
         self.speech_jobs.push(SpeechJob { message_id, job });
     }

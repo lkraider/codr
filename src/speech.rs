@@ -5,12 +5,16 @@ use std::{
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::Path,
     process::Stdio,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 use tokio::io::AsyncWriteExt;
 
 const LIMIT: usize = 4000;
 const NOTHING: &str = "Nothing to speak.";
+pub const DEFAULT_ADAPT_PROMPT: &str = "Translate the text below into Brazilian Portuguese and adapt it for speech. \
+The audio must sound natural in Brazilian Portuguese, so adapt the translation to help the text-to-speech. \
+Apple's enhanced pt-BR voice Luciana speaks it. Adapt the text for that voice. Output only the text to speak.";
 
 /// Turns Markdown into text for a speech engine and cuts it at `LIMIT` characters.
 pub fn spoken_text(markdown: &str, truncated: bool) -> String {
@@ -138,30 +142,37 @@ pub async fn speak_or_report(
     socket: &Socket,
     group: &str,
     message_id: &str,
+    prompt_unreadable: &AtomicBool,
 ) -> Result<()> {
-    let result = speak(config, socket, group, message_id).await;
+    let result = speak(config, socket, group, message_id, prompt_unreadable).await;
     if let Err(error) = &result {
         let text = if nothing_to_speak(error) {
             NOTHING
         } else {
             "Speech failed. The bridge log has the reason."
         };
-        let notice = socket
-            .marmot(json!({"type":"send_final","account_id_hex":config.account_id_hex,"group_id_hex":group,
-                "text":text,"reply_to_message_id_hex":null,
-                "idempotency_key":uuid::Uuid::new_v4().to_string()}))
-            .await;
-        if let Err(error) = notice.and_then(|response| {
-            ensure!(
-                response["type"] == "final_sent",
-                "MDK did not confirm the notice"
-            );
-            Ok(())
-        }) {
-            eprintln!("Speech failure notice failed: {error:#}");
-        }
+        notice(config, socket, group, text).await;
     }
     result
+}
+
+async fn notice(config: &BridgeConfig, socket: &Socket, group: &str, text: &str) {
+    let notice = socket
+        .marmot(
+            json!({"type":"send_final","account_id_hex":config.account_id_hex,"group_id_hex":group,
+            "text":text,"reply_to_message_id_hex":null,
+            "idempotency_key":uuid::Uuid::new_v4().to_string()}),
+        )
+        .await;
+    if let Err(error) = notice.and_then(|response| {
+        ensure!(
+            response["type"] == "final_sent",
+            "MDK did not confirm the notice"
+        );
+        Ok(())
+    }) {
+        eprintln!("Speech notice failed: {error:#}");
+    }
 }
 
 /// Speaks one bridge message and sends the audio to its group. The audio file is removed afterwards.
@@ -170,6 +181,7 @@ async fn speak(
     socket: &Socket,
     group: &str,
     message_id: &str,
+    prompt_unreadable: &AtomicBool,
 ) -> Result<()> {
     ensure!(
         !message_id.is_empty() && message_id.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -200,6 +212,29 @@ async fn speak(
         .mode(0o700)
         .create(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let text = if config.speak_adapt_command.is_empty() {
+        text
+    } else {
+        let (prompt, log) =
+            adapt_prompt(config.speak_adapt_prompt_file.as_deref(), prompt_unreadable);
+        if log {
+            eprintln!("speak_adapt_prompt_file is missing or empty. The built-in prompt is used.");
+        }
+        match adapt(config, &prompt, &text, dir).await {
+            Ok(adapted) => adapted,
+            Err(error) => {
+                eprintln!("Speech translation failed: {error:#}");
+                notice(
+                    config,
+                    socket,
+                    group,
+                    "Translation failed. The original text is spoken.",
+                )
+                .await;
+                text
+            }
+        }
+    };
     let path = tempfile::Builder::new()
         .prefix("spoken-")
         .suffix(".m4a")
@@ -211,6 +246,55 @@ async fn speak(
     };
     let _ = path.close();
     result
+}
+
+/// Reads the prompt file, or gives `DEFAULT_ADAPT_PROMPT` when it is missing or empty.
+/// The flag asks the caller to log. It is true on the first unreadable read after a readable one.
+pub fn adapt_prompt(path: Option<&Path>, unreadable: &AtomicBool) -> (String, bool) {
+    let Some(path) = path else {
+        return (DEFAULT_ADAPT_PROMPT.to_owned(), false);
+    };
+    match std::fs::read_to_string(path) {
+        Ok(prompt) if !prompt.trim().is_empty() => {
+            unreadable.store(false, Ordering::Relaxed);
+            (prompt.trim().to_owned(), false)
+        }
+        _ => (
+            DEFAULT_ADAPT_PROMPT.to_owned(),
+            !unreadable.swap(true, Ordering::Relaxed),
+        ),
+    }
+}
+
+/// Runs `speak_adapt_command` in `dir`. Errors carry no command output, because it holds message text.
+async fn adapt(config: &BridgeConfig, prompt: &str, text: &str, dir: &Path) -> Result<String> {
+    let command = &config.speak_adapt_command;
+    let prompt = format!("{prompt}\n\n{text}");
+    let mut child = tokio::process::Command::new(&command[0])
+        .args(&command[1..])
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let output = tokio::time::timeout(Duration::from_secs(120), async {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(prompt.as_bytes()).await?;
+        drop(stdin);
+        let output = child.wait_with_output().await?;
+        ensure!(
+            output.status.success(),
+            "speak_adapt_command failed: {}",
+            output.status
+        );
+        Ok::<_, anyhow::Error>(output.stdout)
+    })
+    .await
+    .map_err(|_| anyhow!("speak_adapt_command timed out"))??;
+    let adapted = spoken_text(&String::from_utf8_lossy(&output), false);
+    ensure!(!adapted.is_empty(), "speak_adapt_command printed no text");
+    Ok(adapted)
 }
 
 async fn render(config: &BridgeConfig, text: &str, path: &Path) -> Result<()> {

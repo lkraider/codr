@@ -6,6 +6,7 @@
 
 - Send a bridge message back as audio when the phone reacts to it with `speak_reaction`. `speak_command` renders the audio and `speak_dir` holds it until the send.
 - Fresh setup creates a speech folder, passes it to the connector as `--media-allowed-root` and writes it as `speak_dir`.
+- `speak_adapt_command` and `speak_adapt_prompt_file` rewrite the text before it is spoken, for example into another language. When the command fails, the original text is spoken and the phone is told.
 - The connector patch threads media sends that carry `reply_to_message_id_hex` with the same `e` and `q` tags as a text reply.
 - Spoken replies skip emoji. A message with only emoji gets "Nothing to speak." on the phone. Marks such as ✓ and ✗ stay, and a digit keycap such as 1️⃣ is read as its digit.
 
