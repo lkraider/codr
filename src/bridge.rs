@@ -1048,7 +1048,8 @@ impl Bridge {
         Ok(self
             .reads
             .read(&self.config, agent, self.state.forwarding_revision.clone())
-            .await?
+            .await
+            .map_err(read_failed)?
             .history
             .clone())
     }
@@ -1057,7 +1058,8 @@ impl Bridge {
         Ok(self
             .reads
             .read(&self.config, agent, self.state.forwarding_revision.clone())
-            .await?
+            .await
+            .map_err(read_failed)?
             .tasks
             .clone())
     }
@@ -2231,7 +2233,11 @@ impl Bridge {
 }
 
 /// Transcript errors can quote transcript text or CLI stderr, and deferral logs print the chain.
+/// `Pending` passes through, because callers downcast it to stay silent.
 fn read_failed(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<crate::reads::Pending>() {
+        return error;
+    }
     anyhow::anyhow!(
         "Session history read failed: {}",
         output::read_error_message(&error)

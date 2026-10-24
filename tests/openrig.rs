@@ -937,7 +937,7 @@ async fn a_phone_prompt_deferred_by_a_stale_idle_snapshot_reaches_the_seat_withi
     })
     .await
     .expect("the deferred phone prompt waited for the 60 s resync");
-    assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
     assert_eq!(rig_calls(dir.path(), "send").len(), 1);
     mdk.abort();
 }
