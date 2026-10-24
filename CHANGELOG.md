@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Add `phone_replies_only`. With it set, the phone gets only final replies to phone prompts, and working and idle notices stay off for desk turns. A phone prompt that waits behind other held prompts keeps its reply. After more than 30 minutes the bridge stops waiting for it and tells the phone.
+
 ### Changed
 
 - Accept phone prompts while the agent works. A blocked agent still refuses them with the terminal-prompt notice. A prompt sent while media from the same group is being prepared gets its own notice.
