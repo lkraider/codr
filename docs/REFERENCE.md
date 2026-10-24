@@ -219,6 +219,28 @@ The key goes in the `x-goog-api-key` request header. On failure, the script exit
 
 Normalised audio files are temporary and removed after each attempt. MDK manages its downloaded temporary files. Image copies stay in **codr**'s private media directory. Do not commit media, transcripts, or model files to Git.
 
+### Spoken replies
+
+React to a bridge message on the phone with the configured emoji, and **codr** sends the message back as an audio message. The audio goes to the same group as a separate message. It is not a threaded reply. Each message is spoken once. Reactions from other members, other emoji and reactions to messages that the bridge did not send are ignored.
+
+Before speaking, **codr** removes Markdown formatting. A code block is read as "Code block skipped." and a table as "Table skipped." Text above 4000 characters is cut at a word and ends with "The reply is cut here."
+
+On macOS, `say` writes the AAC audio that White Noise plays:
+
+```toml
+speak_command = ["/usr/bin/say", "--file-format=m4af", "--data-format=aac@44100", "-f", "-", "-o"]
+speak_reaction = "😮"
+speak_dir = "/Users/you/.local/state/herdr-white-noise-bridge/speech"
+```
+
+- `speak_command` is an executable with fixed arguments. **codr** writes the text to its stdin and appends the output path. The command must write an `.m4a` file.
+- `speak_reaction` is the trigger emoji. Spoken replies are off when it is unset.
+- `speak_dir` holds the audio until it is sent. It must be an absolute path. **codr** creates it with mode 0700 and removes each file after the send.
+
+The MDK connector sends media only from beneath its `--media-allowed-root`. Start the connector with `--media-allowed-root` set to `speak_dir` or to a folder that contains it. The connector refuses every media send without it.
+
+When speech fails, the bridge log has the reason and the phone gets "Speech failed. The bridge log has the reason." A new reaction tries again.
+
 ## Supported reply sources
 
 | Agent | Final-reply source | Default transcript location |

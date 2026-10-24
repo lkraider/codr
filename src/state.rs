@@ -99,6 +99,9 @@ pub struct BridgeState {
     /// Sequence number of the last OpenRig event read, sent back as `Last-Event-ID`.
     #[serde(default)]
     pub openrig_event_seq: Option<u64>,
+    /// Bridge messages already sent as audio, oldest first.
+    #[serde(default)]
+    pub spoken_messages: Vec<String>,
 }
 
 fn forwarding_default() -> bool {
@@ -118,6 +121,7 @@ impl Default for BridgeState {
             forwarding_resume_pending: false,
             openrig_event_seq: None,
             media_pending: vec![],
+            spoken_messages: vec![],
         }
     }
 }

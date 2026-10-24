@@ -40,6 +40,9 @@ fn config(dir: &std::path::Path) -> BridgeConfig {
         phone_replies_only: false,
         settled_reread_secs: 30,
         transcribe_command: vec![],
+        speak_command: vec![],
+        speak_reaction: None,
+        speak_dir: None,
     }
 }
 fn agent() -> Agent {

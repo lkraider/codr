@@ -6,6 +6,7 @@ pub mod media;
 pub mod openrig;
 pub mod output;
 mod reads;
+pub mod speech;
 pub mod state;
 pub mod wire;
 pub use config::BridgeConfig;
