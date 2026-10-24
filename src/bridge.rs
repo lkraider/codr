@@ -30,7 +30,6 @@ pub struct Bridge {
 }
 
 struct SpeechJob {
-    group: String,
     message_id: String,
     job: tokio::task::JoinHandle<Result<()>>,
 }
@@ -1519,14 +1518,10 @@ impl Bridge {
         let socket = self.marmot.clone();
         let (group, message_id) = (group.to_owned(), id.to_owned());
         let job = tokio::spawn({
-            let (group, message_id) = (group.clone(), message_id.clone());
-            async move { crate::speech::speak(&config, &socket, &group, &message_id).await }
+            let message_id = message_id.clone();
+            async move { crate::speech::speak_or_report(&config, &socket, &group, &message_id).await }
         });
-        self.speech_jobs.push(SpeechJob {
-            group,
-            message_id,
-            job,
-        });
+        self.speech_jobs.push(SpeechJob { message_id, job });
     }
 
     /// Records finished speech. A failed message is spoken again on a new reaction.
@@ -1549,10 +1544,6 @@ impl Bridge {
                 result => {
                     let error = result.map_or_else(anyhow::Error::from, |r| r.unwrap_err());
                     eprintln!("Speech failed: {error:#}");
-                    self.state.enqueue(
-                        &speech.group,
-                        "Speech failed. The bridge log has the reason.",
-                    );
                 }
             }
             self.save()?;

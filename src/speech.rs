@@ -90,8 +90,35 @@ fn inline(text: &str) -> String {
     out
 }
 
+/// Speaks one bridge message. On failure, tells the group directly, because the outbox drops text while At desk.
+pub async fn speak_or_report(
+    config: &BridgeConfig,
+    socket: &Socket,
+    group: &str,
+    message_id: &str,
+) -> Result<()> {
+    let result = speak(config, socket, group, message_id).await;
+    if result.is_err() {
+        let notice = socket
+            .marmot(json!({"type":"send_final","account_id_hex":config.account_id_hex,"group_id_hex":group,
+                "text":"Speech failed. The bridge log has the reason.","reply_to_message_id_hex":null,
+                "idempotency_key":uuid::Uuid::new_v4().to_string()}))
+            .await;
+        if let Err(error) = notice.and_then(|response| {
+            ensure!(
+                response["type"] == "final_sent",
+                "MDK did not confirm the notice"
+            );
+            Ok(())
+        }) {
+            eprintln!("Speech failure notice failed: {error:#}");
+        }
+    }
+    result
+}
+
 /// Speaks one bridge message and sends the audio to its group. The audio file is removed afterwards.
-pub async fn speak(
+async fn speak(
     config: &BridgeConfig,
     socket: &Socket,
     group: &str,

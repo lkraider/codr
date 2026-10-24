@@ -70,6 +70,7 @@ async fn connector(path: &Path, calls: Calls, refuse_media: bool) -> tokio::task
                         .push(std::fs::read(path).unwrap());
                     json!({"type":"final_sent","message_ids_hex":["dd".repeat(32)]})
                 }
+                "send_final" => json!({"type":"final_sent","message_ids_hex":["ef".repeat(32)]}),
                 other => panic!("unexpected request {other}"),
             };
             response["id"] = request["id"].clone();
@@ -95,10 +96,19 @@ async fn bridge(dir: &Path, exit: u8) -> Bridge {
     Bridge::open(config(dir, exit)).unwrap()
 }
 
-async fn settle(bridge: &mut Bridge) {
+fn notices(calls: &Calls) -> Vec<Value> {
+    let requests = calls.requests.lock().unwrap();
+    requests
+        .iter()
+        .filter(|r| r["type"] == "send_final")
+        .cloned()
+        .collect()
+}
+
+async fn settle(bridge: &mut Bridge, calls: &Calls) {
     for _ in 0..200 {
         bridge.process_speech().await.unwrap();
-        if !bridge.state.spoken_messages.is_empty() || !bridge.state.outbox.is_empty() {
+        if !bridge.state.spoken_messages.is_empty() || !notices(calls).is_empty() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -121,7 +131,7 @@ async fn a_phone_reaction_sends_the_spoken_bridge_message_once_and_removes_the_a
         .inbound(&reaction(PHONE, "😮", BRIDGE))
         .await
         .unwrap();
-    settle(&mut bridge).await;
+    settle(&mut bridge, &calls).await;
 
     let requests = calls.requests.lock().unwrap().clone();
     let types: Vec<_> = requests.iter().map(|r| r["type"].clone()).collect();
@@ -141,7 +151,7 @@ async fn a_phone_reaction_sends_the_spoken_bridge_message_once_and_removes_the_a
         "Result\nThe build passed. See the log.\nCode block skipped.\nTable skipped.\nfmt is clean"
     );
     assert_eq!(bridge.state.spoken_messages, [MESSAGE]);
-    assert!(bridge.state.outbox.is_empty());
+    assert!(notices(&calls).is_empty());
 
     bridge
         .inbound(&reaction(PHONE, "😮", BRIDGE))
@@ -172,26 +182,31 @@ async fn reactions_from_another_sender_with_another_emoji_or_on_a_phone_message_
 
     assert!(calls.requests.lock().unwrap().is_empty());
     assert!(bridge.state.spoken_messages.is_empty());
-    assert!(bridge.state.outbox.is_empty());
     server.abort();
 }
 
 #[tokio::test]
-async fn a_failed_speech_command_tells_the_phone_and_removes_the_audio() {
+async fn a_failed_speech_command_tells_the_phone_at_desk_and_removes_the_audio() {
     let dir = tempfile::tempdir().unwrap();
     let calls = Calls::default();
     let server = connector(&dir.path().join("wn.sock"), calls.clone(), false).await;
     let mut bridge = bridge(dir.path(), 1).await;
+    bridge.state.forwarding_enabled = false;
 
     bridge
         .inbound(&reaction(PHONE, "😮", BRIDGE))
         .await
         .unwrap();
-    settle(&mut bridge).await;
+    settle(&mut bridge, &calls).await;
 
-    assert_eq!(calls.requests.lock().unwrap().len(), 1);
-    assert_eq!(bridge.state.outbox.len(), 1);
-    assert!(bridge.state.outbox[0].text.starts_with("Speech failed."));
+    assert_eq!(calls.requests.lock().unwrap().len(), 2);
+    let notice = &notices(&calls)[0];
+    assert_eq!(notice["group_id_hex"], GROUP);
+    assert_eq!(
+        notice["text"],
+        "Speech failed. The bridge log has the reason."
+    );
+    assert!(bridge.state.outbox.is_empty());
     assert!(bridge.state.spoken_messages.is_empty());
     assert_eq!(
         std::fs::read_dir(dir.path().join("speech"))
@@ -213,10 +228,13 @@ async fn a_refused_media_send_tells_the_phone_and_removes_the_audio() {
         .inbound(&reaction(PHONE, "😮", BRIDGE))
         .await
         .unwrap();
-    settle(&mut bridge).await;
+    settle(&mut bridge, &calls).await;
 
-    assert_eq!(calls.requests.lock().unwrap().len(), 2);
-    assert!(bridge.state.outbox[0].text.starts_with("Speech failed."));
+    assert_eq!(calls.requests.lock().unwrap().len(), 3);
+    assert_eq!(
+        notices(&calls)[0]["text"],
+        "Speech failed. The bridge log has the reason."
+    );
     assert!(bridge.state.spoken_messages.is_empty());
     assert_eq!(
         std::fs::read_dir(dir.path().join("speech"))
