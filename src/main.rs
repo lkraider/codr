@@ -209,7 +209,11 @@ fn notify_groups(
     seat: Option<&str>,
 ) -> Result<Vec<String>> {
     anyhow::ensure!(
-        control.enabled && state.forwarding_enabled && !resume_pending(state, control),
+        !resume_pending(state, control),
+        "Away is set; wait for the bridge to apply it, then resend"
+    );
+    anyhow::ensure!(
+        control.enabled && state.forwarding_enabled,
         "Forwarding is At desk; switch to Away before sending a notice"
     );
     if let Some(seat) = seat {

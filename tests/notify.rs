@@ -164,7 +164,7 @@ async fn notify_follows_the_forwarding_control_before_the_worker_copies_it() {
     forwarding::set(&dir.path().join("state.json"), true).unwrap();
     let resuming = notify(&config, &["--seat", SEAT, "Question"]).await;
     assert!(!resuming.status.success());
-    assert!(String::from_utf8_lossy(&resuming.stderr).contains("Forwarding is At desk"));
+    assert!(String::from_utf8_lossy(&resuming.stderr).contains("Away is set; wait for the bridge"));
 
     assert!(calls.lock().unwrap().is_empty());
     server.abort();
