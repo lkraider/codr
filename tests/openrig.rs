@@ -992,3 +992,211 @@ async fn deferred_prepared_media_reaches_the_seat_within_seconds() {
     assert_eq!(rig_calls(dir.path(), "send").len(), 2);
     mdk.abort();
 }
+
+const HELD: &str = "This message is held. The seat's terminal is in copy mode. React 👍 to this notice to send it now.";
+
+/// A seat on tmux server `codr-test` whose fake `tmux` prints `tmux.mode` and clears it on cancel.
+async fn copy_mode_seat(
+    mode: &str,
+) -> (
+    tempfile::TempDir,
+    BridgeConfig,
+    Arc<Mutex<Vec<Value>>>,
+    Bridge,
+    tokio::task::JoinHandle<()>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    let tmux = dir.path().join("tmux");
+    std::fs::write(
+        &tmux,
+        "#!/bin/sh\n\
+         dir=$(dirname \"$0\")\n\
+         printf '%s\\n' \"$*\" >> \"$dir/tmux.log\"\n\
+         case \"$3\" in\n\
+         display-message) cat \"$dir/tmux.mode\" ;;\n\
+         send-keys) echo 0 > \"$dir/tmux.mode\" ;;\n\
+         *) exit 9 ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(dir.path().join("tmux.mode"), mode).unwrap();
+    config.tmux_bin = tmux;
+    transcript(
+        &config,
+        FIRST,
+        &[("u0", "user", "Old prompt"), ("a0", "final", "Old final")],
+    );
+    let mut seat = node(SEAT, FIRST, "idle", 1);
+    seat["tmuxAttachCommand"] = json!(format!("tmux -L codr-test attach -t {SEAT}"));
+    seats(dir.path(), &[seat]);
+    let calls = Arc::new(Mutex::new(vec![]));
+    let peer = mdk(&config.wn_agent_socket, calls.clone()).await;
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    tick(&mut bridge).await;
+    (dir, config, calls, bridge, peer)
+}
+
+fn thumbs_up(emoji: &str) -> Value {
+    json!({"marmot_agent_control":"marmot.agent-control.v2","type":"reaction_added","account_id_hex":"aa".repeat(32),
+        "group_id_hex":GROUP,"event_id_hex":"ee".repeat(32),"target_message_id_hex":"cc".repeat(32),
+        "actor":{"account_id_hex":HEX,"is_self":false},"emoji":emoji,"recorded_at":1,
+        "target":{"message_id_hex":"cc".repeat(32),"availability":"available","sender":{"account_id_hex":"aa".repeat(32)}}})
+}
+
+fn tmux_calls(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("tmux.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_prompt_in_copy_mode_is_held_and_a_thumbs_up_on_the_notice_leaves_copy_mode_and_sends_it()
+{
+    let (dir, _config, calls, mut bridge, peer) = copy_mode_seat("1\n").await;
+    bridge
+        .inbound(&inbound("phone-1", "fix the test"))
+        .await
+        .unwrap();
+    bridge.process_held().await.unwrap();
+    assert!(rig_calls(dir.path(), "send").is_empty());
+    assert_eq!(sent(&calls, HELD), 1);
+    let notice = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|call| call["text"] == HELD)
+        .cloned()
+        .unwrap();
+    assert_eq!(notice["reply_to_message_id_hex"], "phone-1");
+    bridge.process_held().await.unwrap();
+    assert_eq!(sent(&calls, HELD), 1);
+    assert!(rig_calls(dir.path(), "send").is_empty());
+
+    bridge.inbound(&thumbs_up("👍🏽")).await.unwrap();
+    bridge.process_held().await.unwrap();
+    let pane = format!("-L codr-test display-message -p -t {SEAT} #{{pane_in_mode}}");
+    let cancel = format!("-L codr-test send-keys -t {SEAT} -X cancel");
+    assert_eq!(tmux_calls(dir.path()).last(), Some(&cancel));
+    assert!(tmux_calls(dir.path()).contains(&pane));
+    assert_eq!(
+        rig_calls(dir.path(), "send"),
+        [format!("send {SEAT} --raw --json -- fix the test")]
+    );
+    assert!(bridge.state.held_prompts.is_empty());
+
+    bridge.inbound(&thumbs_up("👍️")).await.unwrap();
+    bridge.process_held().await.unwrap();
+    bridge
+        .inbound(&inbound("phone-1", "fix the test"))
+        .await
+        .unwrap();
+    assert_eq!(rig_calls(dir.path(), "send").len(), 1);
+    peer.abort();
+}
+
+#[tokio::test]
+async fn held_prompts_are_sent_in_order_without_a_reaction_when_copy_mode_ends() {
+    let (dir, _config, calls, mut bridge, peer) = copy_mode_seat("1\n").await;
+    for (id, text) in [("phone-1", "first"), ("phone-2", "second")] {
+        bridge.inbound(&inbound(id, text)).await.unwrap();
+    }
+    bridge.inbound(&thumbs_up("👎")).await.unwrap();
+    bridge.process_held().await.unwrap();
+    assert_eq!(sent(&calls, HELD), 2);
+    assert!(rig_calls(dir.path(), "send").is_empty());
+
+    std::fs::write(dir.path().join("tmux.mode"), "0\n").unwrap();
+    bridge.process_held().await.unwrap();
+    assert_eq!(
+        rig_calls(dir.path(), "send"),
+        [
+            format!("send {SEAT} --raw --json -- first"),
+            format!("send {SEAT} --raw --json -- second")
+        ]
+    );
+    assert!(
+        !tmux_calls(dir.path())
+            .iter()
+            .any(|call| call.contains("cancel"))
+    );
+    assert!(bridge.state.held_prompts.is_empty());
+    peer.abort();
+}
+
+#[tokio::test]
+async fn a_held_prompt_survives_a_restart_and_a_replay() {
+    let (dir, config, calls, mut bridge, peer) = copy_mode_seat("1\n").await;
+    bridge
+        .inbound(&inbound("phone-1", "fix the test"))
+        .await
+        .unwrap();
+    bridge.process_held().await.unwrap();
+    drop(bridge);
+
+    let mut bridge = Bridge::open(config).unwrap();
+    tick(&mut bridge).await;
+    bridge
+        .inbound(&inbound("phone-1", "fix the test"))
+        .await
+        .unwrap();
+    bridge.process_held().await.unwrap();
+    assert_eq!(bridge.state.held_prompts.len(), 1);
+    assert_eq!(sent(&calls, HELD), 1);
+    assert!(rig_calls(dir.path(), "send").is_empty());
+
+    std::fs::write(dir.path().join("tmux.mode"), "0\n").unwrap();
+    bridge.process_held().await.unwrap();
+    assert_eq!(rig_calls(dir.path(), "send").len(), 1);
+    peer.abort();
+}
+
+#[tokio::test]
+async fn a_missing_tmux_or_tmux_target_sends_the_prompt_as_before() {
+    let (dir, mut config, _calls, _bridge, peer) = copy_mode_seat("1\n").await;
+    peer.abort();
+    config.tmux_bin = dir.path().join("no-tmux");
+    let calls = Arc::new(Mutex::new(vec![]));
+    std::fs::remove_file(&config.wn_agent_socket).unwrap();
+    let peer = mdk(&config.wn_agent_socket, calls.clone()).await;
+    let mut bridge = Bridge::open(config).unwrap();
+    tick(&mut bridge).await;
+    bridge
+        .inbound(&inbound("phone-1", "fix the test"))
+        .await
+        .unwrap();
+    assert_eq!(rig_calls(dir.path(), "send").len(), 1);
+    assert!(bridge.state.held_prompts.is_empty());
+
+    let (dir, _config, _calls, mut bridge, peer2) = connected_seat().await;
+    bridge
+        .inbound(&inbound("phone-1", "fix the test"))
+        .await
+        .unwrap();
+    assert_eq!(rig_calls(dir.path(), "send").len(), 1);
+    peer.abort();
+    peer2.abort();
+}
+
+#[test]
+fn the_tmux_server_and_target_come_from_the_attach_command() {
+    use openrig::Pane;
+    assert_eq!(
+        Pane::parse("tmux attach -t dev-build@rig"),
+        Some(Pane {
+            server: vec![],
+            target: "dev-build@rig".into()
+        })
+    );
+    assert_eq!(
+        Pane::parse("tmux -S /tmp/rig.sock attach -t dev-build@rig")
+            .unwrap()
+            .server,
+        ["-S", "/tmp/rig.sock"]
+    );
+    assert_eq!(Pane::parse("tmux attach"), None);
+    assert_eq!(Pane::parse("screen -r x"), None);
+}

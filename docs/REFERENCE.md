@@ -122,6 +122,14 @@ After an OpenRig database reset, the stored event number is above every new one.
 
 A phone prompt goes to the seat with `rig send <seat> --raw`, also while the phone shows the seat as blocked. OpenRig refuses input while the agent waits on an interactive prompt. The phone then gets a notice to answer the prompt at the desk and resend. When OpenRig refuses a prompt for another reason, such as `typing_guard_enabled`, the phone gets that reason. **codr** does not retry a refused prompt. Decision cards and terminal context for a blocked agent need **herdr**.
 
+Before a text prompt, **codr** checks if the seat pane is in tmux copy mode with `tmux display-message -p '#{pane_in_mode}'`. In copy mode, tmux takes the Enter and the prompt stays unsent in the seat's input. The pane and its tmux server come from `tmuxAttachCommand` in `rig ps`. `tmux_bin` names the `tmux` executable and defaults to `tmux`.
+
+- In copy mode, **codr** holds the prompt and replies to it with "This message is held. The seat's terminal is in copy mode. React 👍 to this notice to send it now."
+- A 👍 on that notice, with any skin tone, runs `tmux send-keys -X cancel` and sends the prompt. A 👍 on the notice of a prompt that was already sent does nothing.
+- Without a reaction, **codr** checks the pane every 2 seconds. It sends the prompt when copy mode ends. It never leaves copy mode without a 👍, because the person can be reading the scrollback at the desk.
+- Held prompts keep their order and stay in the state file across a restart. A later prompt to the same seat waits behind them.
+- When `tmux` is missing, fails or reports no mode, or `rig ps` gives no `tmuxAttachCommand`, **codr** sends the prompt as before. It logs the cause once per seat until a check succeeds again.
+
 ### Editable progress and separate final replies
 
 Set `edit_responses = true` in the bridge configuration to enable editable progress. The release-matched connector includes the required `edit_message` API.

@@ -4,13 +4,13 @@ use crate::{
     forwarding,
     herdr::{self, Agent},
     openrig, output,
-    state::Mapping,
+    state::{HeldPrompt, Mapping},
     wire::{PROTOCOL, Socket, read_line},
 };
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -28,7 +28,13 @@ pub struct Bridge {
     reads: crate::reads::Reads,
     last_snapshot: Vec<Agent>,
     stop_rereads: BTreeMap<String, StopReread>,
+    /// Seats whose copy-mode check failed since its last success. The failure is logged once.
+    copy_mode_unchecked: BTreeSet<String>,
+    held_due: bool,
+    releasing: Option<String>,
 }
+
+const HELD: &str = "This message is held. The seat's terminal is in copy mode. React 👍 to this notice to send it now.";
 
 struct SpeechJob {
     message_id: String,
@@ -71,6 +77,7 @@ impl Bridge {
         state.account = Some(config.account_id_hex.clone());
         state.phone = Some(phone.clone());
         state.save(&config.state_path)?;
+        let held_due = !state.held_prompts.is_empty();
         let mut bridge = Self {
             herdr: Socket {
                 path: config.herdr_socket.clone(),
@@ -89,6 +96,9 @@ impl Bridge {
             reads: crate::reads::Reads::default(),
             last_snapshot: vec![],
             stop_rereads: BTreeMap::new(),
+            copy_mode_unchecked: BTreeSet::new(),
+            held_due,
+            releasing: None,
         };
         bridge.refresh_forwarding()?;
         Ok(bridge)
@@ -1203,6 +1213,9 @@ impl Bridge {
             "MDK event protocol mismatch"
         );
         if event["type"] == "reaction_added" {
+            if self.force_held(event) {
+                self.save()?;
+            }
             self.reaction(event);
             return Ok(());
         }
@@ -1266,6 +1279,40 @@ impl Bridge {
             self.agents.contains_key(&key) || !self.state.mappings[&key].active,
             "Session identity is uncertain; phone input deferred"
         );
+        let typed = msg["text"].as_str().unwrap_or("");
+        // Enter in copy mode goes to tmux, so the prompt would sit unsent in the seat's input.
+        if self.config.backend == Backend::OpenRig
+            && typed != "/status"
+            && !typed.trim().is_empty()
+            && msg["text_truncated"] != true
+            && msg["attachments_truncated"] != true
+            && msg["media"].as_array().is_none_or(|media| media.is_empty())
+            && self.releasing.as_deref() != Some(id)
+            && let Some(agent) = self.agents.get(&key).cloned()
+            && (self
+                .state
+                .held_prompts
+                .iter()
+                .any(|held| held.group == group)
+                || self.in_copy_mode(&agent).await)
+        {
+            if !self
+                .state
+                .held_prompts
+                .iter()
+                .any(|held| held.message_id == id)
+            {
+                self.state.held_prompts.push(HeldPrompt {
+                    group: group.into(),
+                    message_id: id.into(),
+                    event: event.clone(),
+                    notice_id: None,
+                    force: false,
+                });
+                self.held_due = true;
+            }
+            return self.save();
+        }
         if let Some(agent) = self.agents.get(&key).cloned() {
             self.baseline_forwarding(&key, &agent).await?;
         }
@@ -1496,6 +1543,157 @@ impl Bridge {
             self.state.enqueue(group, &text);
         }
         self.save()
+    }
+
+    async fn in_copy_mode(&mut self, agent: &Agent) -> bool {
+        let seat = agent.seat.clone().unwrap_or_default();
+        let checked = match &agent.pane {
+            Some(pane) => pane.in_copy_mode(&self.config).await,
+            None => Err(anyhow::anyhow!("OpenRig reports no tmux pane")),
+        };
+        match checked {
+            Ok(in_mode) => {
+                self.copy_mode_unchecked.remove(&seat);
+                in_mode
+            }
+            Err(error) => {
+                if self.copy_mode_unchecked.insert(seat.clone()) {
+                    eprintln!(
+                        "Copy mode of {seat} is not checked, so phone prompts are sent as before. Cause: {error:#}"
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    /// Marks the held prompts of a group for sending when the phone reacts 👍 to a held notice.
+    fn force_held(&mut self, event: &Value) -> bool {
+        let thumbs_up = event["emoji"].as_str().is_some_and(|emoji| {
+            emoji
+                .chars()
+                .filter(|c| !matches!(c, '\u{1F3FB}'..='\u{1F3FF}' | '\u{FE0F}'))
+                .eq("👍".chars())
+        });
+        if !thumbs_up
+            || event["account_id_hex"] != self.config.account_id_hex
+            || event["actor"]["account_id_hex"] != self.phone
+        {
+            return false;
+        }
+        let (group, target) = (
+            event["group_id_hex"].as_str(),
+            event["target_message_id_hex"].as_str(),
+        );
+        let mut forced = false;
+        for held in &mut self.state.held_prompts {
+            if target.is_some() && held.notice_id.as_deref() == target && group == Some(&held.group)
+            {
+                held.force = true;
+                forced = true;
+            }
+        }
+        self.held_due |= forced;
+        forced
+    }
+
+    /// Sends held prompts in order when their pane leaves copy mode or the phone reacts 👍.
+    /// While the pane stays in copy mode, each held prompt gets one notice.
+    pub async fn process_held(&mut self) -> Result<()> {
+        self.held_due = false;
+        let mut groups: Vec<String> = vec![];
+        for held in &self.state.held_prompts {
+            if !groups.contains(&held.group) {
+                groups.push(held.group.clone());
+            }
+        }
+        let mut result = Ok(());
+        for group in groups {
+            let agent = self
+                .state
+                .mappings
+                .iter()
+                .find(|(_, mapping)| mapping.group_id_hex.as_deref() == Some(&group))
+                .and_then(|(key, _)| self.agents.get(key))
+                .cloned();
+            let force = self
+                .state
+                .held_prompts
+                .iter()
+                .any(|held| held.group == group && held.force);
+            let in_mode = match &agent {
+                Some(agent) => self.in_copy_mode(agent).await,
+                None => false,
+            };
+            if in_mode && !force {
+                if let Err(error) = self.send_held_notices(&group).await {
+                    result = Err(error);
+                }
+                continue;
+            }
+            if in_mode
+                && let Some(pane) = agent.as_ref().and_then(|agent| agent.pane.as_ref())
+                && let Err(error) = pane.leave_copy_mode(&self.config).await
+            {
+                eprintln!(
+                    "Copy mode could not be left for a forced phone prompt. Cause: {error:#}"
+                );
+            }
+            while let Some(held) = self
+                .state
+                .held_prompts
+                .iter()
+                .find(|held| held.group == group)
+                .cloned()
+            {
+                self.releasing = Some(held.message_id.clone());
+                let sent = self.route_inbound(&held.event, false).await;
+                self.releasing = None;
+                if let Err(error) = sent {
+                    result = Err(error);
+                    break;
+                }
+                self.state
+                    .held_prompts
+                    .retain(|other| other.message_id != held.message_id);
+                self.save()?;
+            }
+        }
+        result
+    }
+
+    async fn send_held_notices(&mut self, group: &str) -> Result<()> {
+        let unnoticed: Vec<String> = self
+            .state
+            .held_prompts
+            .iter()
+            .filter(|held| held.group == group && held.notice_id.is_none())
+            .map(|held| held.message_id.clone())
+            .collect();
+        for id in unnoticed {
+            let response = self
+                .marmot
+                .marmot(
+                    json!({"type":"send_final","account_id_hex":self.config.account_id_hex,
+                    "group_id_hex":group,"text":HELD,"reply_to_message_id_hex":id,
+                    "idempotency_key":uuid::Uuid::new_v4().to_string()}),
+                )
+                .await?;
+            let notice = response["message_ids_hex"][0]
+                .as_str()
+                .filter(|_| response["type"] == "final_sent")
+                .ok_or_else(|| anyhow::anyhow!("MDK did not confirm the held notice"))?;
+            if let Some(held) = self
+                .state
+                .held_prompts
+                .iter_mut()
+                .find(|held| held.message_id == id)
+            {
+                held.notice_id = Some(notice.into());
+            }
+            self.save()?;
+        }
+        Ok(())
     }
 
     fn reaction(&mut self, event: &Value) {
@@ -2152,6 +2350,7 @@ impl Bridge {
         let mut reread_tick = tokio::time::interval(Duration::from_secs(1));
         recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut speech_tick = tokio::time::interval(Duration::from_secs(1));
+        let mut held_tick = tokio::time::interval(Duration::from_secs(2));
         // A deferred phone message retries after a fresh snapshot within seconds, because the
         // OpenRig snapshot and the recovery ticks are 60 s apart.
         let mut retry = tokio::time::interval(Duration::from_secs(2));
@@ -2206,9 +2405,15 @@ impl Bridge {
                 },
                 _ = recovery_tick.tick() => { recovery_due = true; }
                 _ = speech_tick.tick(), if !self.speech_jobs.is_empty() => {}
+                _ = held_tick.tick(), if !self.state.held_prompts.is_empty() => { self.held_due = true; }
             }
             if recovery_due && self.herdr_available {
                 recovery_due = self.recover_inbound().await.is_err();
+            }
+            if self.held_due
+                && let Err(error) = self.process_held().await
+            {
+                eprintln!("Held phone message deferred; it retries. Cause: {error:#}");
             }
             if let Err(error) = self.process_media().await {
                 recovery_due = true;

@@ -102,6 +102,21 @@ pub struct BridgeState {
     /// Bridge messages already sent as audio, oldest first.
     #[serde(default)]
     pub spoken_messages: Vec<String>,
+    /// Phone prompts held while the seat pane is in tmux copy mode, oldest first.
+    #[serde(default)]
+    pub held_prompts: Vec<HeldPrompt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeldPrompt {
+    pub group: String,
+    pub message_id: String,
+    pub event: serde_json::Value,
+    #[serde(default)]
+    pub notice_id: Option<String>,
+    /// The phone reacted 👍 to the notice, so copy mode is left and the prompt is sent.
+    #[serde(default)]
+    pub force: bool,
 }
 
 fn forwarding_default() -> bool {
@@ -122,6 +137,7 @@ impl Default for BridgeState {
             openrig_event_seq: None,
             media_pending: vec![],
             spoken_messages: vec![],
+            held_prompts: vec![],
         }
     }
 }

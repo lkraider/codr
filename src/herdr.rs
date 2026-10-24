@@ -38,6 +38,8 @@ pub struct Agent {
     /// OpenRig session name. The seat keeps its group across Claude session changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<crate::openrig::Pane>,
 }
 
 impl Agent {

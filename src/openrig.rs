@@ -4,6 +4,7 @@ use crate::{
     wire::NotSubmitted,
 };
 use anyhow::{Result, bail, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{process::Stdio, time::Duration};
 use tokio::{
@@ -17,6 +18,79 @@ use tokio::{
 #[derive(Debug, thiserror::Error)]
 #[error("OpenRig refused the prompt: {0}")]
 pub struct Refused(pub String);
+
+/// The seat's tmux pane, from the `tmuxAttachCommand` that `rig ps` reports.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Pane {
+    /// `-L name` or `-S path`, empty for the default server.
+    pub server: Vec<String>,
+    pub target: String,
+}
+
+impl Pane {
+    pub fn parse(attach: &str) -> Option<Self> {
+        let mut words = attach.split_whitespace();
+        if words.next()? != "tmux" {
+            return None;
+        }
+        let (mut server, mut target) = (vec![], None);
+        while let Some(word) = words.next() {
+            match word {
+                "-L" | "-S" => server.extend([word.to_owned(), words.next()?.to_owned()]),
+                "-t" => target = Some(words.next()?.to_owned()),
+                _ => {}
+            }
+        }
+        Some(Self {
+            server,
+            target: target?,
+        })
+    }
+
+    async fn tmux(&self, config: &BridgeConfig, args: &[&str]) -> Result<String> {
+        let output = timeout(
+            Duration::from_secs(5),
+            Command::new(&config.tmux_bin)
+                .args(&self.server)
+                .args(args)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await??;
+        ensure!(output.status.success(), "tmux failed: {}", output.status);
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    pub async fn in_copy_mode(&self, config: &BridgeConfig) -> Result<bool> {
+        // tmux 3.8 prints an empty line and exits 0 for a target that does not exist.
+        match self
+            .tmux(
+                config,
+                &[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &self.target,
+                    "#{pane_in_mode}",
+                ],
+            )
+            .await?
+            .as_str()
+        {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            _ => bail!("tmux did not report the pane mode"),
+        }
+    }
+
+    pub async fn leave_copy_mode(&self, config: &BridgeConfig) -> Result<()> {
+        self.tmux(config, &["send-keys", "-t", &self.target, "-X", "cancel"])
+            .await
+            .map(drop)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Event {
@@ -110,6 +184,7 @@ fn agent(node: &Value) -> Agent {
         foreground_cwd: None,
         terminal_title_stripped: Some(seat.clone()),
         seat: Some(seat),
+        pane: node["tmuxAttachCommand"].as_str().and_then(Pane::parse),
     }
 }
 

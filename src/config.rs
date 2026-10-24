@@ -25,6 +25,9 @@ pub struct BridgeConfig {
     pub openrig_seats: Vec<String>,
     #[serde(default = "default_rig")]
     pub rig_bin: PathBuf,
+    /// Checks whether an OpenRig seat pane is in copy mode before a phone prompt is typed.
+    #[serde(default = "default_tmux")]
+    pub tmux_bin: PathBuf,
     /// Base URL of the OpenRig daemon, which serves the event stream at `/api/events`.
     #[serde(default = "default_openrig_url")]
     pub openrig_url: String,
@@ -83,6 +86,10 @@ fn settled_reread_default() -> u64 {
 
 fn default_rig() -> PathBuf {
     "rig".into()
+}
+
+fn default_tmux() -> PathBuf {
+    "tmux".into()
 }
 
 fn default_openrig_url() -> String {
