@@ -148,29 +148,34 @@ async fn notify_refuses_an_unknown_seat_and_at_desk_while_the_worker_runs() {
 }
 
 #[tokio::test]
-async fn notify_without_a_running_worker_sends_through_the_outbox() {
+async fn notify_without_a_running_worker_sends_directly_and_prints_the_message_id() {
     let dir = tempfile::tempdir().unwrap();
     let config = write_config(dir.path());
     write_state(dir.path(), true);
+    let before = std::fs::read(dir.path().join("state.json")).unwrap();
     let calls = Arc::new(Mutex::new(vec![]));
     let server = mdk(&dir.path().join("wn.sock"), calls.clone()).await;
 
-    let output = notify(&config, &["--seat", SEAT, "Merge the branch?"]).await;
+    let output = notify(&config, &["Merge the branch?"]).await;
 
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let calls = calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0]["group_id_hex"], GROUP);
-    let state = BridgeState::load(&dir.path().join("state.json")).unwrap();
-    assert!(state.outbox.is_empty());
-    assert!(
-        state::try_lock(&dir.path().join("state.json"))
-            .unwrap()
-            .is_some()
+    let printed: Vec<Value> = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert_eq!(printed.len(), 2);
+    assert!(printed.contains(&json!({"group":GROUP,"message_id":MESSAGE})));
+    assert!(printed.contains(&json!({"group":OTHER,"message_id":MESSAGE})));
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    assert_eq!(
+        std::fs::read(dir.path().join("state.json")).unwrap(),
+        before
     );
     server.abort();
 }

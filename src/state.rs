@@ -246,13 +246,10 @@ impl BridgeState {
 }
 
 pub fn lock(path: &Path) -> Result<File> {
-    try_lock(path)?.ok_or_else(|| anyhow::anyhow!("Bridge already runs for this state path"))
-}
-
-/// Returns `None` while another process holds the state lock.
-pub fn try_lock(path: &Path) -> Result<Option<File>> {
     let file = lock_file(path)?;
-    Ok(file.try_lock_exclusive().is_ok().then_some(file))
+    file.try_lock_exclusive()
+        .map_err(|_| anyhow::anyhow!("Bridge already runs for this state path"))?;
+    Ok(file)
 }
 
 /// Splits text below MDK's message-size ceiling.

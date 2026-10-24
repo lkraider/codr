@@ -113,9 +113,8 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let lock = state::try_lock(&config.state_path)?;
-    if let (None, Some(Action::Notify { text, group, seat })) = (&lock, &args.command) {
-        // The running worker owns state.json, so this path only reads it.
+    if let Some(Action::Notify { text, group, seat }) = &args.command {
+        // A running worker owns state.json, so notify only reads it.
         let state = BridgeState::load(&config.state_path)?;
         let marmot = wire::Socket {
             path: config.wn_agent_socket.clone(),
@@ -135,18 +134,10 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    anyhow::ensure!(lock.is_some(), "Bridge already runs for this state path");
+    let _lock = state::lock(&config.state_path)?;
     let mut bridge = Bridge::open(config)?;
     match args.command.unwrap_or(Action::Run) {
         Action::Run => bridge.run().await,
-        Action::Notify { text, group, seat } => {
-            let groups = notify_groups(&bridge.state, group.as_deref(), seat.as_deref())?;
-            for group in groups {
-                bridge.state.enqueue(&group, &text);
-            }
-            bridge.save()?;
-            bridge.flush().await
-        }
         Action::ResolveCreate { key, group, retry } => {
             let m = bridge
                 .state
@@ -202,6 +193,7 @@ async fn main() -> Result<()> {
         Action::Status => unreachable!(),
         Action::CheckReaders => unreachable!(),
         Action::Forwarding { .. } => unreachable!(),
+        Action::Notify { .. } => unreachable!(),
     }
 }
 
