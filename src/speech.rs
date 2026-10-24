@@ -10,6 +10,7 @@ use std::{
 use tokio::io::AsyncWriteExt;
 
 const LIMIT: usize = 4000;
+const NOTHING: &str = "Nothing to speak.";
 
 /// Turns Markdown into text for a speech engine and cuts it at `LIMIT` characters.
 pub fn spoken_text(markdown: &str, truncated: bool) -> String {
@@ -44,8 +45,8 @@ pub fn spoken_text(markdown: &str, truncated: bool) -> String {
         for marker in ["- ", "* ", "+ "] {
             text = text.strip_prefix(marker).unwrap_or(text);
         }
-        let text = inline(text);
-        if !text.trim().is_empty() {
+        let text = without_pictographs(&inline(text));
+        if !text.is_empty() {
             lines.push(text);
         }
     }
@@ -59,6 +60,32 @@ pub fn spoken_text(markdown: &str, truncated: bool) -> String {
         cut.truncate(space);
     }
     format!("{}\nThe reply is cut here.", cut.trim_end())
+}
+
+fn pictograph(c: char) -> bool {
+    matches!(c,
+        '\u{200D}' | '\u{20E3}' | '\u{FE0E}' | '\u{FE0F}'
+        | '\u{231A}'..='\u{231B}' | '\u{2328}' | '\u{23CF}' | '\u{23E9}'..='\u{23FA}'
+        | '\u{25A0}'..='\u{25FF}' | '\u{2600}'..='\u{27BF}' | '\u{2B00}'..='\u{2BFF}'
+        | '\u{1F000}'..='\u{1FAFF}' | '\u{E0020}'..='\u{E007F}')
+}
+
+/// Removes emoji. A keycap such as `1️⃣` loses its digit too.
+fn without_pictographs(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let keycap = |i: usize| {
+        chars[i + 1..]
+            .iter()
+            .find(|&&c| !matches!(c, '\u{FE0E}' | '\u{FE0F}'))
+            == Some(&'\u{20E3}')
+    };
+    let kept: String = chars
+        .iter()
+        .enumerate()
+        .filter(|&(i, &c)| !pictograph(c) && !(matches!(c, '0'..='9' | '#' | '*') && keycap(i)))
+        .map(|(_, &c)| c)
+        .collect();
+    kept.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn inline(text: &str) -> String {
@@ -98,10 +125,15 @@ pub async fn speak_or_report(
     message_id: &str,
 ) -> Result<()> {
     let result = speak(config, socket, group, message_id).await;
-    if result.is_err() {
+    if let Err(error) = &result {
+        let text = if error.to_string() == NOTHING {
+            NOTHING
+        } else {
+            "Speech failed. The bridge log has the reason."
+        };
         let notice = socket
             .marmot(json!({"type":"send_final","account_id_hex":config.account_id_hex,"group_id_hex":group,
-                "text":"Speech failed. The bridge log has the reason.","reply_to_message_id_hex":null,
+                "text":text,"reply_to_message_id_hex":null,
                 "idempotency_key":uuid::Uuid::new_v4().to_string()}))
             .await;
         if let Err(error) = notice.and_then(|response| {
@@ -146,7 +178,7 @@ async fn speak(
         row["text"].as_str().unwrap_or(""),
         row["text_truncated"] == true,
     );
-    ensure!(!text.trim().is_empty(), "The message has no text to speak");
+    ensure!(!text.is_empty(), NOTHING);
     let dir = config.speak_dir.as_ref().context("speak_dir is unset")?;
     std::fs::DirBuilder::new()
         .recursive(true)

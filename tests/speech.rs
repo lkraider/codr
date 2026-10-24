@@ -45,7 +45,12 @@ fn config(dir: &Path, exit: u8) -> BridgeConfig {
     .unwrap()
 }
 
-async fn connector(path: &Path, calls: Calls, refuse_media: bool) -> tokio::task::JoinHandle<()> {
+async fn connector(
+    path: &Path,
+    calls: Calls,
+    refuse_media: bool,
+    text: &'static str,
+) -> tokio::task::JoinHandle<()> {
     let listener = UnixListener::bind(path).unwrap();
     tokio::spawn(async move {
         loop {
@@ -57,7 +62,7 @@ async fn connector(path: &Path, calls: Calls, refuse_media: bool) -> tokio::task
                 "timeline_message_get" => json!({"type":"timeline_message","account_id_hex":BRIDGE,
                     "group_id_hex":GROUP,"message_id_hex":MESSAGE,"message":{"message_id_hex":MESSAGE,
                     "availability":"available","kind":9,"sender":{"account_id_hex":BRIDGE},
-                    "text":REPLY,"text_truncated":false}}),
+                    "text":text,"text_truncated":false}}),
                 "send_media" if refuse_media => {
                     json!({"type":"error","error":{"code":"media_upload_disabled"}})
                 }
@@ -120,7 +125,7 @@ async fn settle(bridge: &mut Bridge, calls: &Calls) {
 async fn a_phone_reaction_sends_the_spoken_bridge_message_once_and_removes_the_audio() {
     let dir = tempfile::tempdir().unwrap();
     let calls = Calls::default();
-    let server = connector(&dir.path().join("wn.sock"), calls.clone(), false).await;
+    let server = connector(&dir.path().join("wn.sock"), calls.clone(), false, REPLY).await;
     let mut bridge = bridge(dir.path(), 0).await;
 
     bridge
@@ -167,7 +172,7 @@ async fn a_phone_reaction_sends_the_spoken_bridge_message_once_and_removes_the_a
 async fn reactions_from_another_sender_with_another_emoji_or_on_a_phone_message_are_ignored() {
     let dir = tempfile::tempdir().unwrap();
     let calls = Calls::default();
-    let server = connector(&dir.path().join("wn.sock"), calls.clone(), false).await;
+    let server = connector(&dir.path().join("wn.sock"), calls.clone(), false, REPLY).await;
     let mut bridge = bridge(dir.path(), 0).await;
 
     for event in [
@@ -189,7 +194,7 @@ async fn reactions_from_another_sender_with_another_emoji_or_on_a_phone_message_
 async fn a_failed_speech_command_tells_the_phone_at_desk_and_removes_the_audio() {
     let dir = tempfile::tempdir().unwrap();
     let calls = Calls::default();
-    let server = connector(&dir.path().join("wn.sock"), calls.clone(), false).await;
+    let server = connector(&dir.path().join("wn.sock"), calls.clone(), false, REPLY).await;
     let mut bridge = bridge(dir.path(), 1).await;
     bridge.state.forwarding_enabled = false;
 
@@ -221,7 +226,7 @@ async fn a_failed_speech_command_tells_the_phone_at_desk_and_removes_the_audio()
 async fn a_refused_media_send_tells_the_phone_and_removes_the_audio() {
     let dir = tempfile::tempdir().unwrap();
     let calls = Calls::default();
-    let server = connector(&dir.path().join("wn.sock"), calls.clone(), true).await;
+    let server = connector(&dir.path().join("wn.sock"), calls.clone(), true, REPLY).await;
     let mut bridge = bridge(dir.path(), 0).await;
 
     bridge
@@ -243,6 +248,48 @@ async fn a_refused_media_send_tells_the_phone_and_removes_the_audio() {
         0
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn a_message_of_only_emoji_runs_no_speech_command_and_tells_the_phone() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Calls::default();
+    let server = connector(
+        &dir.path().join("wn.sock"),
+        calls.clone(),
+        false,
+        "🎉 👍🏽\n\n❤️",
+    )
+    .await;
+    let mut bridge = bridge(dir.path(), 0).await;
+
+    bridge
+        .inbound(&reaction(PHONE, "😮", BRIDGE))
+        .await
+        .unwrap();
+    settle(&mut bridge, &calls).await;
+
+    assert!(!dir.path().join("spoken.txt").exists());
+    assert_eq!(calls.requests.lock().unwrap().len(), 2);
+    assert_eq!(notices(&calls)[0]["text"], "Nothing to speak.");
+    assert!(bridge.state.spoken_messages.is_empty());
+    server.abort();
+}
+
+#[test]
+fn emoji_are_removed_and_letters_accents_and_punctuation_stay() {
+    let text = "Done 🎉 build é😮 passed 👍🏽 ok ❤️ #️⃣ 1️⃣ 👨‍👩‍👧 🇧🇷 🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F} café — naïve, «quoted»! 1 + 2\n\n✅🚀\n- ⭐ Step 3.";
+    assert_eq!(
+        spoken_text(text, false),
+        "Done build é passed ok café — naïve, «quoted»! 1 + 2\nStep 3."
+    );
+}
+
+#[test]
+fn the_cut_counts_only_text_left_after_emoji_removal() {
+    let text = spoken_text(&"😮 word ".repeat(1000), false);
+    let spoken = text.strip_suffix("\nThe reply is cut here.").unwrap();
+    assert!(spoken.ends_with("word") && spoken.chars().count() > 3990);
 }
 
 #[test]
