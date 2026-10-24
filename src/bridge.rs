@@ -1372,7 +1372,12 @@ impl Bridge {
             }) {
             let revision = self.state.forwarding_revision.clone();
             let session = self.agents[&key].agent_session.as_ref().unwrap().clone();
-            let history = self.reads.fresh(&self.config, &session).await?.history;
+            let history = self
+                .reads
+                .fresh(&self.config, &session)
+                .await
+                .map_err(read_failed)?
+                .history;
             self.refresh_forwarding()?;
             ensure!(
                 self.state.forwarding_enabled && self.state.forwarding_revision == revision,
@@ -1752,10 +1757,14 @@ impl Bridge {
             return Ok(false);
         }
         let active = if self.config.opencode_db.is_some() {
-            self.reads.fresh(&self.config, session).await?.decision
+            self.reads
+                .fresh(&self.config, session)
+                .await
+                .map(|snapshot| snapshot.decision)
         } else {
-            output::decision::read(&self.config, session).await?
-        };
+            output::decision::read(&self.config, session).await
+        }
+        .map_err(read_failed)?;
         let Some(active) = active else {
             if looks_like_answer || previous.is_some() {
                 return self.decision_notice(key, group, id, "No supported decision is available yet. Wait for its question card or use the terminal. No answer was sent.");
@@ -2079,6 +2088,26 @@ impl Bridge {
         Ok(info)
     }
 
+    /// Returns false when the backend did not list its agents.
+    async fn resync(&mut self) -> bool {
+        match self.snapshot().await {
+            Ok(agents) => {
+                if self.reconcile(agents).await.is_err() {
+                    eprintln!("Session reconciliation failed; will retry.");
+                }
+                true
+            }
+            Err(_) => {
+                self.herdr_available = false;
+                eprintln!(
+                    "{} is unavailable; waiting for reconnection.",
+                    self.backend_name()
+                );
+                false
+            }
+        }
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         self.reads.background = true;
         let reads_ready = self.reads.notify.clone();
@@ -2115,7 +2144,14 @@ impl Bridge {
         let mut reread_tick = tokio::time::interval(Duration::from_secs(1));
         recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut speech_tick = tokio::time::interval(Duration::from_secs(1));
+        // A deferred phone message retries after a fresh snapshot within seconds, because the
+        // OpenRig snapshot and the recovery ticks are 60 s apart.
+        let mut retry = tokio::time::interval(Duration::from_secs(2));
+        let mut retries = 0u8;
+        let mut media_retried = false;
         loop {
+            let mut inbound_deferred = false;
+            let mut media_deferred = false;
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     subscriber.abort();
@@ -2125,10 +2161,12 @@ impl Bridge {
                     return Ok(());
                 },
                 _ = tick.tick() => {
-                    match self.snapshot().await {
-                        Ok(agents) => if self.reconcile(agents).await.is_err() { eprintln!("Session reconciliation failed; will retry."); },
-                        Err(_) => { self.herdr_available = false; recovery_due = true; eprintln!("{} is unavailable; waiting for reconnection.", self.backend_name()); }
-                    }
+                    if !self.resync().await { recovery_due = true; }
+                },
+                _ = retry.tick(), if retries > 0 => {
+                    retries -= 1;
+                    self.resync().await;
+                    recovery_due = true;
                 },
                 Some(event) = events.recv() => {
                     let mut batch = vec![event];
@@ -2152,7 +2190,11 @@ impl Bridge {
                     if event["type"] == "reconcile_inbound" || event["type"] == "resync_required" {
                         // Refresh current agent identities before recovering any queued phone prompts.
                         recovery_due = true;
-                    } else if self.inbound(&event).await.is_err() { recovery_due = true; eprintln!("Inbound message deferred; will reconcile history."); }
+                    } else if let Err(error) = self.inbound(&event).await {
+                        recovery_due = true;
+                        inbound_deferred = true;
+                        eprintln!("Inbound message deferred; will reconcile history. Cause: {error:#}");
+                    }
                 },
                 _ = recovery_tick.tick() => { recovery_due = true; }
                 _ = speech_tick.tick(), if !self.speech_jobs.is_empty() => {}
@@ -2160,9 +2202,23 @@ impl Bridge {
             if recovery_due && self.herdr_available {
                 recovery_due = self.recover_inbound().await.is_err();
             }
-            if self.process_media().await.is_err() {
+            if let Err(error) = self.process_media().await {
                 recovery_due = true;
-                eprintln!("Prepared media input deferred; will reconcile history.");
+                media_deferred = true;
+                eprintln!(
+                    "Prepared media input deferred; will reconcile history. Cause: {error:#}"
+                );
+            }
+            // Deferred media fails again on every pass while the agent works, so it arms the
+            // retries once until recovery succeeds.
+            if inbound_deferred || (media_deferred && !media_retried) {
+                retries = 3;
+                retry.reset();
+                media_retried |= media_deferred;
+            }
+            if !recovery_due {
+                retries = 0;
+                media_retried = false;
             }
             if self.process_speech().await.is_err() {
                 eprintln!("Speech result could not be saved; it retries.");
@@ -2172,6 +2228,14 @@ impl Bridge {
             }
         }
     }
+}
+
+/// Transcript errors can quote transcript text or CLI stderr, and deferral logs print the chain.
+fn read_failed(error: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Session history read failed: {}",
+        output::read_error_message(&error)
+    )
 }
 
 pub fn now() -> u64 {

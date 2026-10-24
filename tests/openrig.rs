@@ -845,3 +845,99 @@ fn the_herdr_backend_stays_the_default_and_openrig_needs_seats() {
             .ends_with("Managed by codr via HERDR.")
     );
 }
+
+/// An MDK that streams `event` once `released` is set and lists it in the timeline from then on.
+async fn streaming_mdk(
+    path: &Path,
+    event: Value,
+    released: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+    let listener = UnixListener::bind(path).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let event = event.clone();
+            let released = released.clone();
+            tokio::spawn(async move {
+                let mut reader = tokio::io::BufReader::new(stream);
+                let req = read_line(&mut reader).await.unwrap();
+                let msg = &event["message"];
+                let mut response = match req["type"].as_str().unwrap() {
+                    "subscribe_inbound" => json!({"type":"ack"}),
+                    "timeline_list" if released.load(Ordering::SeqCst) => {
+                        json!({"type":"timeline_page",
+                        "has_more_before":false,"messages":[{"message_id_hex":msg["message_id_hex"],
+                        "availability":"available","kind":9,"sender":msg["sender"],"text":msg["text"],
+                        "recorded_at":msg["recorded_at"]}]})
+                    }
+                    "timeline_list" => {
+                        json!({"type":"timeline_page","has_more_before":false,"messages":[]})
+                    }
+                    "send_final" => {
+                        json!({"type":"final_sent","message_ids_hex":["cc".repeat(32)]})
+                    }
+                    _ => json!({"type":"error","error":{"code":"unsupported"}}),
+                };
+                response["id"] = req["id"].clone();
+                response["marmot_agent_control"] = json!("marmot.agent-control.v2");
+                let mut bytes = serde_json::to_vec(&response).unwrap();
+                bytes.push(b'\n');
+                reader.get_mut().write_all(&bytes).await.unwrap();
+                if req["type"] == "subscribe_inbound" {
+                    while !released.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    let mut bytes = serde_json::to_vec(&event).unwrap();
+                    bytes.push(b'\n');
+                    reader.get_mut().write_all(&bytes).await.unwrap();
+                    std::future::pending::<()>().await;
+                }
+            });
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_phone_prompt_deferred_by_a_stale_idle_snapshot_reaches_the_seat_within_seconds() {
+    let (dir, mut config, _calls, bridge, peer) = connected_seat().await;
+    drop(bridge);
+    peer.abort();
+    std::fs::remove_file(&config.wn_agent_socket).unwrap();
+    // A closed port keeps the event follower away from a real OpenRig daemon.
+    config.openrig_url = "http://127.0.0.1:9".into();
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mdk = streaming_mdk(
+        &config.wn_agent_socket,
+        inbound("phone-1", "Fix it"),
+        released.clone(),
+    )
+    .await;
+    let mut bridge = Bridge::open(config).unwrap();
+    let listed = rig_calls(dir.path(), "ps").len();
+    let delivered = async {
+        while rig_calls(dir.path(), "ps").len() == listed {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // The bridge holds the idle snapshot. The seat starts work before the phone prompt arrives.
+        seats(dir.path(), &[node(SEAT, FIRST, "running", 2)]);
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        while rig_calls(dir.path(), "send").is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        start.elapsed()
+    };
+    let elapsed = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        tokio::select! {
+            result = bridge.run() => panic!("run stopped: {result:?}"),
+            elapsed = delivered => elapsed,
+        }
+    })
+    .await
+    .expect("the deferred phone prompt waited for the 60 s resync");
+    assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+    assert_eq!(rig_calls(dir.path(), "send").len(), 1);
+    mdk.abort();
+}
