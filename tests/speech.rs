@@ -281,7 +281,19 @@ fn emoji_are_removed_and_letters_accents_and_punctuation_stay() {
     let text = "Done 🎉 build é😮 passed 👍🏽 ok ❤️ #️⃣ 1️⃣ 👨‍👩‍👧 🇧🇷 🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F} café — naïve, «quoted»! 1 + 2\n\n✅🚀\n- ⭐ Step 3.";
     assert_eq!(
         spoken_text(text, false),
-        "Done build é passed ok café — naïve, «quoted»! 1 + 2\nStep 3."
+        "Done build é passed ok 1 café — naïve, «quoted»! 1 + 2\nStep 3."
+    );
+}
+
+#[test]
+fn result_marks_and_circled_digits_stay_and_keycaps_keep_their_digit() {
+    assert_eq!(
+        spoken_text("✓ fmt ✗ clippy ❶ ✅ ❌ ⭐", false),
+        "✓ fmt ✗ clippy ❶"
+    );
+    assert_eq!(
+        spoken_text("1️⃣ Build 2️⃣ Test #️⃣ *️⃣", false),
+        "1 Build 2 Test"
     );
 }
 

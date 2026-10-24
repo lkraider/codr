@@ -1543,7 +1543,11 @@ impl Bridge {
                 }
                 result => {
                     let error = result.map_or_else(anyhow::Error::from, |r| r.unwrap_err());
-                    eprintln!("Speech failed: {error:#}");
+                    if crate::speech::nothing_to_speak(&error) {
+                        eprintln!("Speech skipped: nothing to speak.");
+                    } else {
+                        eprintln!("Speech failed: {error:#}");
+                    }
                 }
             }
             self.save()?;

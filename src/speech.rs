@@ -62,15 +62,26 @@ pub fn spoken_text(markdown: &str, truncated: bool) -> String {
     format!("{}\nThe reply is cut here.", cut.trim_end())
 }
 
+/// Dingbats, U+2B00 arrows, enclosed alphanumerics and U+1F800 arrows count only at their emoji
+/// code points, so marks such as ✓ ✗ ❶ ➔ 🄰 stay.
 fn pictograph(c: char) -> bool {
     matches!(c,
         '\u{200D}' | '\u{20E3}' | '\u{FE0E}' | '\u{FE0F}'
         | '\u{231A}'..='\u{231B}' | '\u{2328}' | '\u{23CF}' | '\u{23E9}'..='\u{23FA}'
-        | '\u{25A0}'..='\u{25FF}' | '\u{2600}'..='\u{27BF}' | '\u{2B00}'..='\u{2BFF}'
-        | '\u{1F000}'..='\u{1FAFF}' | '\u{E0020}'..='\u{E007F}')
+        | '\u{25A0}'..='\u{25FF}' | '\u{2600}'..='\u{26FF}'
+        | '\u{2702}' | '\u{2705}' | '\u{2708}'..='\u{270D}' | '\u{270F}' | '\u{2712}'
+        | '\u{2714}' | '\u{2716}' | '\u{271D}' | '\u{2721}' | '\u{2728}' | '\u{2733}'
+        | '\u{2734}' | '\u{2744}' | '\u{2747}' | '\u{274C}' | '\u{274E}' | '\u{2753}'..='\u{2755}'
+        | '\u{2757}' | '\u{2763}' | '\u{2764}' | '\u{2795}'..='\u{2797}' | '\u{27A1}'
+        | '\u{27B0}' | '\u{27BF}'
+        | '\u{2B05}'..='\u{2B07}' | '\u{2B1B}' | '\u{2B1C}' | '\u{2B50}' | '\u{2B55}'
+        | '\u{1F000}'..='\u{1F0FF}'
+        | '\u{1F170}' | '\u{1F171}' | '\u{1F17E}' | '\u{1F17F}' | '\u{1F18E}'
+        | '\u{1F191}'..='\u{1F19A}' | '\u{1F1E6}'..='\u{1F1FF}'
+        | '\u{1F200}'..='\u{1F7FF}' | '\u{1F900}'..='\u{1FAFF}' | '\u{E0020}'..='\u{E007F}')
 }
 
-/// Removes emoji. A keycap such as `1️⃣` loses its digit too.
+/// Removes emoji. A digit keycap such as `1️⃣` keeps its digit. `#` and `*` keycaps go whole.
 fn without_pictographs(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let keycap = |i: usize| {
@@ -82,7 +93,7 @@ fn without_pictographs(text: &str) -> String {
     let kept: String = chars
         .iter()
         .enumerate()
-        .filter(|&(i, &c)| !pictograph(c) && !(matches!(c, '0'..='9' | '#' | '*') && keycap(i)))
+        .filter(|&(i, &c)| !pictograph(c) && !(matches!(c, '#' | '*') && keycap(i)))
         .map(|(_, &c)| c)
         .collect();
     kept.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -117,6 +128,10 @@ fn inline(text: &str) -> String {
     out
 }
 
+pub(crate) fn nothing_to_speak(error: &anyhow::Error) -> bool {
+    error.to_string() == NOTHING
+}
+
 /// Speaks one bridge message. On failure, tells the group directly, because the outbox drops text while At desk.
 pub async fn speak_or_report(
     config: &BridgeConfig,
@@ -126,7 +141,7 @@ pub async fn speak_or_report(
 ) -> Result<()> {
     let result = speak(config, socket, group, message_id).await;
     if let Err(error) = &result {
-        let text = if error.to_string() == NOTHING {
+        let text = if nothing_to_speak(error) {
             NOTHING
         } else {
             "Speech failed. The bridge log has the reason."
