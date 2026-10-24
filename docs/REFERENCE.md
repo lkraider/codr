@@ -221,7 +221,7 @@ Normalised audio files are temporary and removed after each attempt. MDK manages
 
 ### Spoken replies
 
-React to a bridge message on the phone with the configured emoji, and **codr** sends the message back as an audio message. The audio is a reply to the spoken message in the same group. The connector from **codr** 0.6.0 ignores the reply target, so with that connector the audio arrives as a separate message. Each message is spoken once. Reactions from other members, other emoji and reactions to messages that the bridge did not send are ignored.
+React to a bridge message on the phone with the configured emoji, and **codr** sends the message back as an audio message. The audio is a reply to the spoken message in the same group. The released 0.6.0 connector ignores the reply target, so with that connector the audio arrives as a separate message. Each message is spoken once. Reactions from other members, other emoji and reactions to messages that the bridge did not send are ignored.
 
 Before speaking, **codr** removes Markdown formatting. A code block is read as "Code block skipped." and a table as "Table skipped." Text above 4000 characters is cut at a word and ends with "The reply is cut here."
 

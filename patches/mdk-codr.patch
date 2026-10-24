@@ -205,7 +205,7 @@ diff --git a/crates/agent-connector/src/tests.rs b/crates/agent-connector/src/te
          &[attachment(b"one"), attachment(b"two")],
      );
      assert_ne!(
-@@ -6675,15 +6690,57 @@ fn send_media_fingerprint_is_content_bound() {
+@@ -6675,15 +6690,65 @@ fn send_media_fingerprint_is_content_bound() {
              "aa",
              "bb",
              Some("caption"),
@@ -249,22 +249,30 @@ diff --git a/crates/agent-connector/src/tests.rs b/crates/agent-connector/src/te
 +}
 +
 +#[test]
-+fn media_reply_tags_match_a_text_reply() {
-+    use crate::messaging::media_reply_tags;
++fn media_upload_request_tags_a_reply_like_a_text_reply() {
++    use crate::messaging::media_upload_request;
 +
 +    let target = "dd".repeat(32);
++    let reply = media_upload_request(Vec::new(), Some("caption".to_owned()), Some(&target));
 +    assert_eq!(
-+        media_reply_tags(Some(&target)),
++        reply.message_tags,
 +        vec![
 +            vec!["e".to_owned(), target.clone()],
 +            vec!["q".to_owned(), target.clone()],
 +        ]
 +    );
-+    assert!(media_reply_tags(None).is_empty());
++    assert_eq!(reply.caption.as_deref(), Some("caption"));
++    assert!(reply.send);
++    assert!(reply.blossom_server.is_none());
++    assert!(
++        media_upload_request(Vec::new(), None, None)
++            .message_tags
++            .is_empty()
++    );
  }
  
  #[tokio::test]
-@@ -7263,6 +7320,123 @@ async fn optional_management_socket_cannot_interrupt_regular_control() {
+@@ -7263,6 +7328,123 @@ async fn optional_management_socket_cannot_interrupt_regular_control() {
      }
  }
  
@@ -388,7 +396,7 @@ diff --git a/crates/agent-connector/src/tests.rs b/crates/agent-connector/src/te
  #[tokio::test]
  async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
      let dir = tempfile::tempdir().unwrap();
-@@ -7337,6 +7511,11 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
+@@ -7337,6 +7519,11 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
              .find(|group| group.group_id_hex == group_id_hex)
              .unwrap();
          assert_eq!(group.profile.name, "Agent group");
@@ -829,7 +837,7 @@ diff --git a/crates/agent-connector/src/messaging.rs b/crates/agent-connector/sr
      attachments: &[MediaUploadAttachmentRequest],
  ) -> String {
      use sha2::{Digest, Sha256};
-@@ -136,17 +139,35 @@ pub(crate) fn send_media_fingerprint(
+@@ -136,17 +139,45 @@ pub(crate) fn send_media_fingerprint(
              ])
          })
          .collect::<Vec<_>>();
@@ -851,22 +859,32 @@ diff --git a/crates/agent-connector/src/messaging.rs b/crates/agent-connector/sr
      hex::encode(Sha256::digest(bytes))
  }
  
-+/// The `e` and `q` tags that `AppMessageIntent::Reply` puts on a text reply.
-+pub(crate) fn media_reply_tags(reply_to_message_id_hex: Option<&str>) -> Vec<Vec<String>> {
-+    reply_to_message_id_hex
-+        .map(|target| {
-+            vec![
-+                vec!["e".to_owned(), target.to_owned()],
-+                vec!["q".to_owned(), target.to_owned()],
-+            ]
-+        })
-+        .unwrap_or_default()
++/// A reply carries the `e` and `q` tags that `AppMessageIntent::Reply` puts on a text reply.
++pub(crate) fn media_upload_request(
++    attachments: Vec<MediaUploadAttachmentRequest>,
++    caption: Option<String>,
++    reply_to_message_id_hex: Option<&str>,
++) -> MediaUploadRequest {
++    MediaUploadRequest {
++        message_tags: reply_to_message_id_hex
++            .map(|target| {
++                vec![
++                    vec!["e".to_owned(), target.to_owned()],
++                    vec!["q".to_owned(), target.to_owned()],
++                ]
++            })
++            .unwrap_or_default(),
++        attachments,
++        caption,
++        send: true,
++        blossom_server: None,
++    }
 +}
 +
  /// Per-blob temp subdir name for a downloaded media attachment: the SHA-256 of
  /// the decrypted bytes the connector actually holds. Computing it locally (as
  /// opposed to trusting the sender-supplied `ciphertext_sha256` field) makes the
-@@ -641,11 +662,16 @@ impl AgentConnector {
+@@ -641,11 +672,16 @@ impl AgentConnector {
          group_id_hex: &str,
          attachments: Vec<AgentControlMediaUpload>,
          caption: Option<String>,
@@ -883,7 +901,7 @@ diff --git a/crates/agent-connector/src/messaging.rs b/crates/agent-connector/sr
          let upload_attachments = read_media_upload_attachments_with_limits(
              &self.media_allowed_roots,
              attachments,
-@@ -661,6 +687,7 @@ impl AgentConnector {
+@@ -661,6 +697,7 @@ impl AgentConnector {
                  account_id_hex,
                  &group_id_hex,
                  caption.as_deref(),
@@ -891,12 +909,21 @@ diff --git a/crates/agent-connector/src/messaging.rs b/crates/agent-connector/sr
                  &upload_attachments,
              );
              match self.idempotency.acquire(&key, &fingerprint).await? {
-@@ -686,7 +713,7 @@ impl AgentConnector {
+@@ -685,13 +722,11 @@ impl AgentConnector {
+             .upload_media(
                  &account.label,
                  &group_id,
-                 MediaUploadRequest {
+-                MediaUploadRequest {
 -                    message_tags: Vec::new(),
-+                    message_tags: media_reply_tags(reply_to_message_id_hex.as_deref()),
-                     attachments: upload_attachments,
+-                    attachments: upload_attachments,
++                media_upload_request(
++                    upload_attachments,
                      caption,
-                     send: true,
+-                    send: true,
+-                    blossom_server: None,
+-                },
++                    reply_to_message_id_hex.as_deref(),
++                ),
+             )
+             .await?;
+         let Some(sent) = result.sent else {
