@@ -374,13 +374,19 @@ Live sessions automatically update their group title and description when the **
 
 ### Completion notice
 
-Stop the worker before using its state-changing CLI. To send a notice to one mapped group:
+Stop the worker before using its other state-changing CLI commands. `notify` also works while the worker runs. To send a notice to one mapped group:
 
 ```sh
 ~/.local/bin/herdr-white-noise-bridge notify --group GROUP_HEX 'The bridge is ready.'
 ```
 
-Without `--group`, the command sends the notice to every mapped group. The command returns success only after MDK confirms publication.
+To send a notice to the group of one OpenRig seat, use `--seat`:
+
+```sh
+~/.local/bin/herdr-white-noise-bridge notify --seat operator-agent@kernel 'Merge the branch?'
+```
+
+Without `--group` or `--seat`, the command sends the notice to every mapped group. The command refuses while forwarding is At desk. It returns success only after MDK confirms publication. While the worker runs, the command reads bridge state without changing it and sends the notice to MDK directly. It then prints one JSON line per sent message, for example `{"group":"…","message_id":"…"}`. The phone answer to a notice reaches the agent of that group as a normal phone prompt.
 
 ## Screenshot provenance
 

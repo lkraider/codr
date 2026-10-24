@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- `notify` works while the bridge runs and prints the MDK message ID. `notify --seat` sends a notice to the group of one OpenRig seat.
+
 ### Fixed
 
 - Keep stable executable paths across Homebrew upgrades and report missing OpenCode executables without exposing transcript data.

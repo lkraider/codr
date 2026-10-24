@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use herdr_white_noise_bridge::{BridgeConfig, BridgeState, bridge::Bridge, forwarding, state};
+use herdr_white_noise_bridge::{
+    BridgeConfig, BridgeState, bridge::Bridge, forwarding, state, wire,
+};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -33,11 +35,14 @@ enum Action {
         #[arg(long)]
         retry: bool,
     },
-    /// Send a text notice to all mapped groups.
+    /// Send a text notice to all mapped groups. Works while the worker runs.
     Notify {
         text: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "seat")]
         group: Option<String>,
+        /// OpenRig seat whose group gets the notice.
+        #[arg(long)]
+        seat: Option<String>,
     },
     /// Clear an uncertain prompt after inspecting the live agent. Does not resubmit it.
     ClearPrompt { key: String },
@@ -108,23 +113,34 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let _lock = state::lock(&config.state_path)?;
+    let lock = state::try_lock(&config.state_path)?;
+    if let (None, Some(Action::Notify { text, group, seat })) = (&lock, &args.command) {
+        // The running worker owns state.json, so this path only reads it.
+        let state = BridgeState::load(&config.state_path)?;
+        let marmot = wire::Socket {
+            path: config.wn_agent_socket.clone(),
+        };
+        for group in notify_groups(&state, group.as_deref(), seat.as_deref())? {
+            for part in state::chunks(text) {
+                let response = marmot.marmot(serde_json::json!({"type":"send_final","account_id_hex":config.account_id_hex,"group_id_hex":group,"text":part,"reply_to_message_id_hex":null,"idempotency_key":uuid::Uuid::new_v4().to_string()})).await?;
+                let message_id = response["message_ids_hex"][0]
+                    .as_str()
+                    .filter(|_| response["type"] == "final_sent")
+                    .ok_or_else(|| anyhow::anyhow!("MDK did not confirm publication"))?;
+                println!(
+                    "{}",
+                    serde_json::json!({"group":group,"message_id":message_id})
+                );
+            }
+        }
+        return Ok(());
+    }
+    anyhow::ensure!(lock.is_some(), "Bridge already runs for this state path");
     let mut bridge = Bridge::open(config)?;
     match args.command.unwrap_or(Action::Run) {
         Action::Run => bridge.run().await,
-        Action::Notify { text, group } => {
-            anyhow::ensure!(
-                bridge.state.forwarding_enabled,
-                "Forwarding is At desk; switch to Away before sending a notice"
-            );
-            let groups: Vec<_> = bridge
-                .state
-                .mappings
-                .values()
-                .filter_map(|m| m.group_id_hex.clone())
-                .filter(|id| group.as_ref().is_none_or(|g| g == id))
-                .collect();
-            anyhow::ensure!(!groups.is_empty(), "No mapped groups exist yet");
+        Action::Notify { text, group, seat } => {
+            let groups = notify_groups(&bridge.state, group.as_deref(), seat.as_deref())?;
             for group in groups {
                 bridge.state.enqueue(&group, &text);
             }
@@ -187,6 +203,37 @@ async fn main() -> Result<()> {
         Action::CheckReaders => unreachable!(),
         Action::Forwarding { .. } => unreachable!(),
     }
+}
+
+fn notify_groups(
+    state: &BridgeState,
+    group: Option<&str>,
+    seat: Option<&str>,
+) -> Result<Vec<String>> {
+    anyhow::ensure!(
+        state.forwarding_enabled,
+        "Forwarding is At desk; switch to Away before sending a notice"
+    );
+    if let Some(seat) = seat {
+        let key = serde_json::to_string(&("openrig", seat))?;
+        let mapping = state
+            .mappings
+            .get(&key)
+            .ok_or_else(|| anyhow::anyhow!("Unknown seat: {seat}"))?;
+        let group = mapping
+            .group_id_hex
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Seat {seat} has no group yet"))?;
+        return Ok(vec![group]);
+    }
+    let groups: Vec<_> = state
+        .mappings
+        .values()
+        .filter_map(|m| m.group_id_hex.clone())
+        .filter(|id| group.is_none_or(|g| g == id))
+        .collect();
+    anyhow::ensure!(!groups.is_empty(), "No mapped groups exist yet");
+    Ok(groups)
 }
 
 async fn check_readers(config: BridgeConfig) -> Result<usize> {
