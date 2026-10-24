@@ -1128,6 +1128,34 @@ async fn held_prompts_are_sent_in_order_without_a_reaction_when_copy_mode_ends()
 }
 
 #[tokio::test]
+async fn a_held_voice_note_is_sent_before_a_text_held_after_it() {
+    let (dir, _config, _calls, mut bridge, peer) = copy_mode_seat("1\n").await;
+    let mut voice = inbound("voice-1", "");
+    voice["message"]["media"] = json!([{"kind":"audio"}]);
+    voice["_codr_prepared_text"] = json!("Spoken prompt");
+    bridge.state.media_pending.push(voice);
+    bridge.process_media().await.unwrap();
+    bridge.process_media().await.unwrap();
+    bridge.inbound(&inbound("phone-2", "after")).await.unwrap();
+    assert_eq!(bridge.state.held_prompts.len(), 2);
+    assert!(rig_calls(dir.path(), "send").is_empty());
+
+    std::fs::write(dir.path().join("tmux.mode"), "0\n").unwrap();
+    bridge.process_held().await.unwrap();
+    bridge.process_media().await.unwrap();
+    assert_eq!(
+        rig_calls(dir.path(), "send"),
+        [
+            format!("send {SEAT} --raw --json -- Spoken prompt"),
+            format!("send {SEAT} --raw --json -- after")
+        ]
+    );
+    assert!(bridge.state.held_prompts.is_empty());
+    assert!(bridge.state.media_pending.is_empty());
+    peer.abort();
+}
+
+#[tokio::test]
 async fn a_held_prompt_survives_a_restart_and_a_replay() {
     let (dir, config, calls, mut bridge, peer) = copy_mode_seat("1\n").await;
     bridge
@@ -1199,4 +1227,113 @@ fn the_tmux_server_and_target_come_from_the_attach_command() {
     );
     assert_eq!(Pane::parse("tmux attach"), None);
     assert_eq!(Pane::parse("screen -r x"), None);
+}
+
+async fn recording_mdk(
+    path: &Path,
+    event: Value,
+    released: Arc<std::sync::atomic::AtomicBool>,
+    calls: Arc<Mutex<Vec<Value>>>,
+) -> tokio::task::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+    let listener = UnixListener::bind(path).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let event = event.clone();
+            let released = released.clone();
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                let mut reader = tokio::io::BufReader::new(stream);
+                let req = read_line(&mut reader).await.unwrap();
+                calls.lock().unwrap().push(req.clone());
+                let mut response = match req["type"].as_str().unwrap() {
+                    "subscribe_inbound" => json!({"type":"ack"}),
+                    "timeline_list" => {
+                        json!({"type":"timeline_page","has_more_before":false,"messages":[]})
+                    }
+                    "send_final" => {
+                        json!({"type":"final_sent","message_ids_hex":["cc".repeat(32)]})
+                    }
+                    _ => json!({"type":"error","error":{"code":"unsupported"}}),
+                };
+                response["id"] = req["id"].clone();
+                response["marmot_agent_control"] = json!("marmot.agent-control.v2");
+                let mut bytes = serde_json::to_vec(&response).unwrap();
+                bytes.push(b'\n');
+                reader.get_mut().write_all(&bytes).await.unwrap();
+                if req["type"] == "subscribe_inbound" {
+                    while !released.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    let mut bytes = serde_json::to_vec(&event).unwrap();
+                    bytes.push(b'\n');
+                    reader.get_mut().write_all(&bytes).await.unwrap();
+                    std::future::pending::<()>().await;
+                }
+            });
+        }
+    })
+}
+
+#[tokio::test]
+async fn the_run_loop_sends_a_held_text_when_copy_mode_ends_and_then_stops_checking() {
+    let (dir, mut config, _c, bridge, peer) = copy_mode_seat("1\n").await;
+    drop(bridge);
+    peer.abort();
+    std::fs::remove_file(&config.wn_agent_socket).unwrap();
+    config.openrig_url = "http://127.0.0.1:9".into();
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = recording_mdk(
+        &config.wn_agent_socket,
+        inbound("phone-1", "fix the test"),
+        released.clone(),
+        calls.clone(),
+    )
+    .await;
+    let mut bridge = Bridge::open(config).unwrap();
+    let listed = rig_calls(dir.path(), "ps").len();
+    let watch = async {
+        while rig_calls(dir.path(), "ps").len() == listed {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
+        while sent(&calls, HELD) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        let held_notices = sent(&calls, HELD);
+        let sends_in_mode = rig_calls(dir.path(), "send").len();
+        std::fs::write(dir.path().join("tmux.mode"), "0\n").unwrap();
+        let off = std::time::Instant::now();
+        while rig_calls(dir.path(), "send").is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let send_after = off.elapsed();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let before = tmux_calls(dir.path()).len();
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let extra = tmux_calls(dir.path()).len() - before;
+        (held_notices, sends_in_mode, send_after, extra)
+    };
+    let (held_notices, sends_in_mode, send_after, extra) =
+        tokio::time::timeout(std::time::Duration::from_secs(70), async {
+            tokio::select! {
+                result = bridge.run() => panic!("run stopped: {result:?}"),
+                result = watch => result,
+            }
+        })
+        .await
+        .expect("timed out");
+    assert_eq!(held_notices, 1);
+    assert_eq!(sends_in_mode, 0);
+    assert!(send_after < std::time::Duration::from_secs(5));
+    assert_eq!(extra, 0);
+    assert_eq!(
+        rig_calls(dir.path(), "send"),
+        [format!("send {SEAT} --raw --json -- fix the test")]
+    );
+    mdk.abort();
 }

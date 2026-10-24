@@ -112,6 +112,9 @@ pub struct HeldPrompt {
     pub group: String,
     pub message_id: String,
     pub event: serde_json::Value,
+    /// A transcribed voice note or image, released through the prepared-media path.
+    #[serde(default)]
+    pub prepared: bool,
     #[serde(default)]
     pub notice_id: Option<String>,
     /// The phone reacted 👍 to the notice, so copy mode is left and the prompt is sent.

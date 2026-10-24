@@ -1214,7 +1214,7 @@ impl Bridge {
         );
         if event["type"] == "reaction_added" {
             if self.force_held(event) {
-                self.save()?;
+                return self.save();
             }
             self.reaction(event);
             return Ok(());
@@ -1306,6 +1306,7 @@ impl Bridge {
                     group: group.into(),
                     message_id: id.into(),
                     event: event.clone(),
+                    prepared,
                     notice_id: None,
                     force: false,
                 });
@@ -1647,15 +1648,33 @@ impl Bridge {
                 .cloned()
             {
                 self.releasing = Some(held.message_id.clone());
-                let sent = self.route_inbound(&held.event, false).await;
+                let sent = self.route_inbound(&held.event, held.prepared).await;
                 self.releasing = None;
                 if let Err(error) = sent {
+                    for other in &mut self.state.held_prompts {
+                        if other.group == group {
+                            other.force = false;
+                        }
+                    }
+                    self.save()?;
                     result = Err(error);
                     break;
                 }
                 self.state
                     .held_prompts
                     .retain(|other| other.message_id != held.message_id);
+                // The guard for media still in preparation would refuse the next held text.
+                if held.prepared
+                    && self.state.mappings.values().any(|mapping| {
+                        mapping.group_id_hex.as_deref() == Some(group.as_str())
+                            && mapping.seen_messages.contains(&held.message_id)
+                    })
+                {
+                    self.state.media_pending.retain(|pending| {
+                        pending["group_id_hex"] != group.as_str()
+                            || pending["message"]["message_id_hex"] != held.message_id.as_str()
+                    });
+                }
                 self.save()?;
             }
         }
@@ -1818,6 +1837,11 @@ impl Bridge {
             && let Some(index) = self.state.media_pending.iter().position(|event| {
                 event["_codr_prepared_text"].is_string()
                     && event["_codr_retry_at"].as_u64().unwrap_or(0) <= now()
+                    && !self.state.held_prompts.iter().any(|held| {
+                        held.prepared
+                            && Some(held.message_id.as_str())
+                                == event["message"]["message_id_hex"].as_str()
+                    })
             })
         {
             let mut event = self.state.media_pending[index].clone();
