@@ -400,6 +400,14 @@ def stored_npub(mdk_home, account_id_hex):
     return bootstrap["npub"]
 
 
+def speech_directory(home, profile):
+    # The connector resolves --media-allowed-root once at startup and refuses to start when it is missing.
+    path = Path(os.environ.get("XDG_STATE_HOME", home / ".local/state")) / profile.directory / "speech"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
+    return path
+
+
 def configure_openrig(owner, seats, runner, check):
     platform_name()
     home = Path.home()
@@ -476,8 +484,9 @@ def configure_openrig(owner, seats, runner, check):
         candidate.write_text(toml_text(dict(values, state_path=Path(temporary) / "state.json")))
         checked = check_readers(bridge, candidate, runner)
     mdk = ensure_mdk(runner)
+    values["speak_dir"] = speech_directory(home, OPENRIG)
     manager.install(services.Service(OPENRIG.transport, "MDK transport for the codr OpenRig bridge",
-        [mdk, "--home", mdk_home, "--socket", mdk_socket,
+        [mdk, "--home", mdk_home, "--socket", mdk_socket, "--media-allowed-root", values["speak_dir"],
          "--relay", "wss://relay.eu.whitenoise.chat", "--relay", "wss://relay.us.whitenoise.chat"]))
     manager.install(services.Service(OPENRIG.bridge, "codr bridge for OpenRig seats",
         [bridge, "--config", config, "run"], environment={"PATH": os.pathsep.join([str(node.parent), services.worker_path()])}))
@@ -596,8 +605,9 @@ def _configure(owner, herdr_socket, runner, check, enable_audio):
     mdk_home = home / ".marmot-agents/herdr"
     mdk_socket = mdk_home / "dev/wn-agent.sock"
     state_path = Path(os.environ.get("XDG_STATE_HOME", home / ".local/state")) / "herdr-white-noise-bridge/state.json"
+    speak_dir = speech_directory(home, HERDR)
     manager.install(services.Service("wn-agent-herdr", "MDK transport for HERDR White Noise remote",
-        [mdk, "--home", mdk_home, "--socket", mdk_socket,
+        [mdk, "--home", mdk_home, "--socket", mdk_socket, "--media-allowed-root", speak_dir,
          "--relay", "wss://relay.eu.whitenoise.chat", "--relay", "wss://relay.us.whitenoise.chat"]))
     manager.install(services.Service("herdr-white-noise-bridge", "HERDR White Noise remote plugin worker",
         [bridge, "--config", config_path, "run"], environment={"PATH": services.worker_path()}))
@@ -609,7 +619,7 @@ def _configure(owner, herdr_socket, runner, check, enable_audio):
         "account_id_hex": result["account_id_hex"], "state_path": state_path, "opencode_bin": opencode,
         "codex_home": Path(os.environ.get("CODEX_HOME", home / ".codex")).resolve(),
         "claude_home": Path(os.environ.get("CLAUDE_CONFIG_DIR", home / ".claude")).resolve(),
-        "transcribe_command": transcribe_command}
+        "transcribe_command": transcribe_command, "speak_dir": speak_dir}
     with tempfile.TemporaryDirectory(prefix="codr-config-check-") as temporary:
         candidate = Path(temporary) / "config.toml"
         candidate.write_text(toml_text(values))

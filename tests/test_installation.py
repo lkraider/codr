@@ -298,6 +298,11 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(config["phone_npub"], "npub1fixture")
             self.assertEqual(config["herdr_socket"], str(self.socket.resolve()))
             self.assertEqual(config["account_id_hex"], "ab" * 32)
+            speech = self.home / "state/herdr-white-noise-bridge/speech"
+            self.assertEqual(config["speak_dir"], str(speech))
+            self.assertEqual(speech.stat().st_mode & 0o777, 0o700)
+            transport = (self.config.parents[1] / "systemd/user/wn-agent-herdr.service").read_text()
+            self.assertIn(f'"--media-allowed-root" "{speech}"', transport)
             unit = self.config.parents[1] / "systemd/user/herdr-white-noise-bridge.service"
             self.assertIn("%%", unit.read_text())
             self.assertIn("--config", unit.read_text())
@@ -728,6 +733,9 @@ class OpenRigSetupTests(unittest.TestCase):
                     self.assertEqual(config["account_id_hex"], "cd" * 32)
                     self.assertEqual(config["wn_agent_socket"], str(self.home / ".marmot-agents/openrig/dev/wn-agent.sock"))
                     self.assertEqual(config["state_path"], str(self.home / "state/codr-openrig/state.json"))
+                    speech = self.home / "state/codr-openrig/speech"
+                    self.assertEqual(config["speak_dir"], str(speech))
+                    self.assertEqual(speech.stat().st_mode & 0o777, 0o700)
                     self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
                     self.assertEqual(result["bridge_npub"], "npub1openrig")
                     if manager == services.LAUNCHD:
@@ -735,12 +743,16 @@ class OpenRigSetupTests(unittest.TestCase):
                         self.assertEqual(plist["ProgramArguments"][1:], ["--config", str(self.config), "run"])
                         self.assertTrue(plist["EnvironmentVariables"]["PATH"].startswith("/opt/node/22/bin" + os.pathsep))
                         self.assertEqual(plist["StandardErrorPath"], str(self.home / "Library/Logs/codr/openrig-bridge.err.log"))
-                        self.assertTrue((self.agents / "io.github.tidley.codr.wn-agent-openrig.plist").exists())
+                        transport = plistlib.loads((self.agents / "io.github.tidley.codr.wn-agent-openrig.plist").read_bytes())
+                        argv = transport["ProgramArguments"]
+                        self.assertEqual(argv[argv.index("--media-allowed-root") + 1], str(speech))
                     else:
                         unit = (self.home / "config/systemd/user/openrig-bridge.service").read_text()
                         self.assertIn('Environment="PATH=/opt/node/22/bin' + os.pathsep, unit)
                         self.assertIn("Requires=wn-agent-openrig.service", unit)
-                        self.assertIn(".marmot-agents/openrig", (self.home / "config/systemd/user/wn-agent-openrig.service").read_text())
+                        transport = (self.home / "config/systemd/user/wn-agent-openrig.service").read_text()
+                        self.assertIn(".marmot-agents/openrig", transport)
+                        self.assertIn(f'"--media-allowed-root" "{speech}"', transport)
                     original = self.config.read_bytes()
                     again = setup.configure(None, runner=self.runner, openrig=True)
                     self.assertEqual(self.config.read_bytes(), original)

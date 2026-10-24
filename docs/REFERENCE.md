@@ -239,6 +239,8 @@ speak_dir = "/Users/you/.local/state/herdr-white-noise-bridge/speech"
 
 The MDK connector sends media only from beneath its `--media-allowed-root`. Start the connector with `--media-allowed-root` set to `speak_dir` or to a folder that contains it. The connector refuses every media send without it.
 
+Fresh setup creates `${XDG_STATE_HOME:-~/.local/state}/herdr-white-noise-bridge/speech`, or `codr-openrig/speech` for the OpenRig bridge. It passes the folder to the connector and writes it as `speak_dir`. Setup leaves existing installations unchanged. Add the argument to the connector service by hand and create the folder with mode 0700 before the connector starts, because the connector refuses to start when the folder is missing.
+
 When speech fails, the bridge log has the reason and the phone gets "Speech failed. The bridge log has the reason." A new reaction tries again.
 
 ## Supported reply sources

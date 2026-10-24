@@ -111,6 +111,7 @@ Repeat `--seat` for each seat that gets a phone group. Setup writes these:
 
 - Configuration `${XDG_CONFIG_HOME:-~/.config}/codr-openrig/config.toml`, with `backend = "openrig"` and `phone_replies_only = true`.
 - State `${XDG_STATE_HOME:-~/.local/state}/codr-openrig/state.json`.
+- Speech folder `${XDG_STATE_HOME:-~/.local/state}/codr-openrig/speech`, mode 0700. The connector gets it as `--media-allowed-root` and the configuration as `speak_dir`.
 - MDK home `~/.marmot-agents/openrig`, with its own bridge identity and socket.
 - On macOS, the LaunchAgents `io.github.tidley.codr.wn-agent-openrig` and `io.github.tidley.codr.openrig-bridge`, with logs in `~/Library/Logs/codr/`. On Linux, the user units `wn-agent-openrig.service` and `openrig-bridge.service`.
 
