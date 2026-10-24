@@ -57,6 +57,8 @@ By default, a new native user prompt in OpenCode, Codex, or Claude Code mutes **
 
 Detection uses transcript polling, not keystrokes. Allow the three-second polling interval plus transcript read time. Output already submitted to MDK cannot be recalled. Do not use automatic handoff as an instantaneous privacy boundary. Set `auto_forwarding = false` in the bridge configuration to disable local-prompt detection and retain the previous manual controls and phone wake behavior.
 
+**codr** rereads the transcript of a settled agent every `settled_reread_secs` seconds, default 30, to find replies when the **herdr** state does not change.
+
 If a native message appears before its text parts, outgoing delivery pauses until attribution is possible. If that session ends with incomplete input, **codr** mutes globally instead; a new authorized phone message can resume the other sessions.
 
 Use the **herdr** action **White Noise forwarding: At desk / Away** to open the control popup. **Toggle White Noise forwarding** switches modes directly and can be bound to a **herdr** shortcut.

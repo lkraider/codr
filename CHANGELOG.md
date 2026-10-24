@@ -5,6 +5,7 @@
 ### Changed
 
 - Accept phone prompts while the agent works. A blocked agent still refuses them with the terminal-prompt notice. A prompt sent while media from the same group is being prepared gets its own notice.
+- Add `settled_reread_secs` to set the transcript reread interval for settled agents. The default stays 30 seconds.
 
 ### Fixed
 
