@@ -6,6 +6,7 @@
 
 - Send a bridge message back as audio when the phone reacts to it with `speak_reaction`. `speak_command` renders the audio and `speak_dir` holds it until the send.
 - Fresh setup creates a speech folder, passes it to the connector as `--media-allowed-root` and writes it as `speak_dir`.
+- The connector patch threads media sends that carry `reply_to_message_id_hex` with the same `e` and `q` tags as a text reply.
 
 ### Changed
 

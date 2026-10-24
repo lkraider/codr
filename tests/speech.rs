@@ -138,6 +138,7 @@ async fn a_phone_reaction_sends_the_spoken_bridge_message_once_and_removes_the_a
     assert_eq!(types, ["timeline_message_get", "send_media"]);
     let attachment = &requests[1]["attachments"][0];
     assert_eq!(requests[1]["group_id_hex"], GROUP);
+    assert_eq!(requests[1]["reply_to_message_id_hex"], MESSAGE);
     assert_eq!(attachment["media_type"], "audio/mp4");
     let path = Path::new(attachment["path"].as_str().unwrap());
     assert_eq!(path.parent().unwrap(), dir.path().join("speech"));

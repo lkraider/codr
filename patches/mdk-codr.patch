@@ -132,6 +132,22 @@ diff --git a/crates/agent-connector/src/connection.rs b/crates/agent-connector/s
              AgentControlRequest::GroupInfo {
                  account_id_hex,
                  group_id_hex,
+@@ -692,6 +722,7 @@ impl AgentConnector {
+                 group_id_hex,
+                 attachments,
+                 caption,
++                reply_to_message_id_hex,
+                 idempotency_key,
+             } => {
+                 self.send_media_response(
+@@ -699,6 +730,7 @@ impl AgentConnector {
+                     &group_id_hex,
+                     attachments,
+                     caption,
++                    reply_to_message_id_hex,
+                     idempotency_key,
+                 )
+                 .await
 diff --git a/crates/agent-connector/src/tests.rs b/crates/agent-connector/src/tests.rs
 --- a/crates/agent-connector/src/tests.rs
 +++ b/crates/agent-connector/src/tests.rs
@@ -143,7 +159,112 @@ diff --git a/crates/agent-connector/src/tests.rs b/crates/agent-connector/src/te
          },
      )
      .await;
-@@ -7263,6 +7264,123 @@ async fn optional_management_socket_cannot_interrupt_regular_control() {
+@@ -6645,10 +6646,22 @@ fn send_media_fingerprint_is_content_bound() {
+         dim: None,
+         thumbhash: None,
+     };
+-    let first = send_media_fingerprint("aa", "bb", Some("caption"), &[attachment(b"same bytes")]);
++    let first = send_media_fingerprint(
++        "aa",
++        "bb",
++        Some("caption"),
++        None,
++        &[attachment(b"same bytes")],
++    );
+     assert_eq!(
+         first,
+-        send_media_fingerprint("aa", "bb", Some("caption"), &[attachment(b"same bytes")],)
++        send_media_fingerprint(
++            "aa",
++            "bb",
++            Some("caption"),
++            None,
++            &[attachment(b"same bytes")],
++        )
+     );
+     assert_ne!(
+         first,
+@@ -6656,17 +6669,19 @@ fn send_media_fingerprint_is_content_bound() {
+             "aa",
+             "bb",
+             Some("caption"),
++            None,
+             &[attachment(b"different bytes")],
+         )
+     );
+     assert_ne!(
+         first,
+-        send_media_fingerprint("aa", "bb", None, &[attachment(b"same bytes")])
++        send_media_fingerprint("aa", "bb", None, None, &[attachment(b"same bytes")])
+     );
+     let ordered = send_media_fingerprint(
+         "aa",
+         "bb",
+         Some("caption"),
++        None,
+         &[attachment(b"one"), attachment(b"two")],
+     );
+     assert_ne!(
+@@ -6675,15 +6690,57 @@ fn send_media_fingerprint_is_content_bound() {
+             "aa",
+             "bb",
+             Some("caption"),
++            None,
+             &[attachment(b"two"), attachment(b"one")],
+         ),
+         "attachment order must change the fingerprint"
+     );
+     assert_ne!(
+         first,
+-        send_media_fingerprint("aa", "cc", Some("caption"), &[attachment(b"same bytes")]),
++        send_media_fingerprint(
++            "aa",
++            "cc",
++            Some("caption"),
++            None,
++            &[attachment(b"same bytes")]
++        ),
+         "destination group must change the fingerprint"
+     );
++    let target = "dd".repeat(32);
++    let reply = send_media_fingerprint(
++        "aa",
++        "bb",
++        Some("caption"),
++        Some(&target),
++        &[attachment(b"same bytes")],
++    );
++    assert_ne!(first, reply, "reply target must change the fingerprint");
++    assert_ne!(
++        reply,
++        send_media_fingerprint(
++            "aa",
++            "bb",
++            Some("caption"),
++            Some(&"ee".repeat(32)),
++            &[attachment(b"same bytes")],
++        ),
++        "another reply target must change the fingerprint"
++    );
++}
++
++#[test]
++fn media_reply_tags_match_a_text_reply() {
++    use crate::messaging::media_reply_tags;
++
++    let target = "dd".repeat(32);
++    assert_eq!(
++        media_reply_tags(Some(&target)),
++        vec![
++            vec!["e".to_owned(), target.clone()],
++            vec!["q".to_owned(), target.clone()],
++        ]
++    );
++    assert!(media_reply_tags(None).is_empty());
+ }
+ 
+ #[tokio::test]
+@@ -7263,6 +7320,123 @@ async fn optional_management_socket_cannot_interrupt_regular_control() {
      }
  }
  
@@ -267,7 +388,7 @@ diff --git a/crates/agent-connector/src/tests.rs b/crates/agent-connector/src/te
  #[tokio::test]
  async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
      let dir = tempfile::tempdir().unwrap();
-@@ -7337,6 +7455,11 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
+@@ -7337,6 +7511,11 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
              .find(|group| group.group_id_hex == group_id_hex)
              .unwrap();
          assert_eq!(group.profile.name, "Agent group");
@@ -463,7 +584,18 @@ diff --git a/crates/agent-control/src/lib.rs b/crates/agent-control/src/lib.rs
      /// Leave a group using the account runtime; returns Ack after success.
      GroupLeave {
          account_id_hex: String,
-@@ -617,6 +635,9 @@ pub enum AgentControlResponse {
+@@ -542,6 +560,10 @@ pub enum AgentControlRequest {
+         group_id_hex: String,
+         attachments: Vec<AgentControlMediaUpload>,
+         caption: Option<String>,
++        /// Optional message this media replies to. The sent kind-9 carries the
++        /// same `e` and `q` tags as a text reply.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        reply_to_message_id_hex: Option<String>,
+         /// Optional client-supplied dedup key. Matching retries return the
+         /// original durable message ids without re-uploading or re-publishing.
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+@@ -617,6 +639,9 @@ pub enum AgentControlResponse {
          message_id_hex: String,
          #[serde(default, skip_serializing_if = "Option::is_none")]
          message: Option<AgentControlTimelineMessage>,
@@ -473,7 +605,7 @@ diff --git a/crates/agent-control/src/lib.rs b/crates/agent-control/src/lib.rs
      },
      TimelinePage {
          account_id_hex: String,
-@@ -667,6 +688,9 @@ pub enum AgentControlResponse {
+@@ -667,6 +692,9 @@ pub enum AgentControlResponse {
      DiagnosticStatus {
          report: AgentControlDiagnosticStatus,
      },
@@ -483,7 +615,7 @@ diff --git a/crates/agent-control/src/lib.rs b/crates/agent-control/src/lib.rs
      GroupCreated {
          group_id_hex: String,
          /// Whether this account's connector recorded creating the group. Defaults
-@@ -1288,6 +1312,29 @@ mod tests {
+@@ -1288,6 +1316,29 @@ mod tests {
          );
      }
  
@@ -513,7 +645,32 @@ diff --git a/crates/agent-control/src/lib.rs b/crates/agent-control/src/lib.rs
      #[test]
      fn group_create_frames_round_trip_with_optional_fields() {
          for optional in [false, true] {
-@@ -1907,6 +1954,7 @@ mod tests {
+@@ -1652,20 +1703,24 @@ mod tests {
+             group_id_hex: "cc".repeat(32),
+             attachments: vec![upload()],
+             caption: Some("look".to_owned()),
++            reply_to_message_id_hex: None,
+             idempotency_key: None,
+         };
+         let value = serde_json::to_value(&without).unwrap();
+         assert!(value.get("idempotency_key").is_none());
++        assert!(value.get("reply_to_message_id_hex").is_none());
+ 
+         let with = AgentControlRequest::SendMedia {
+             account_id_hex: "aa".repeat(32),
+             group_id_hex: "cc".repeat(32),
+             attachments: vec![upload()],
+             caption: Some("look".to_owned()),
++            reply_to_message_id_hex: Some("dd".repeat(32)),
+             idempotency_key: Some("media-key-1".to_owned()),
+         };
+         let value = serde_json::to_value(&with).unwrap();
+         assert_eq!(value["idempotency_key"], "media-key-1");
++        assert_eq!(value["reply_to_message_id_hex"], "dd".repeat(32));
+         let round_tripped: AgentControlRequest = serde_json::from_value(value).unwrap();
+         assert_eq!(round_tripped, with);
+     }
+@@ -1907,6 +1962,7 @@ mod tests {
                      account_id_hex: account(),
                      group_id_hex: group(),
                      message_id_hex: message(),
@@ -521,7 +678,15 @@ diff --git a/crates/agent-control/src/lib.rs b/crates/agent-control/src/lib.rs
                  },
                  "timeline_message_get",
              ),
-@@ -2265,6 +2313,26 @@ mod tests {
+@@ -2231,6 +2287,7 @@ mod tests {
+                         thumbhash: None,
+                     }],
+                     caption: Some("look".to_owned()),
++                    reply_to_message_id_hex: None,
+                     idempotency_key: None,
+                 },
+                 "send_media",
+@@ -2265,6 +2322,26 @@ mod tests {
          }
      }
  
@@ -621,7 +786,15 @@ diff --git a/crates/agent-connector/src/bootstrap.rs b/crates/agent-connector/sr
 diff --git a/integrations/terminal-harness/src/control.rs b/integrations/terminal-harness/src/control.rs
 --- a/integrations/terminal-harness/src/control.rs
 +++ b/integrations/terminal-harness/src/control.rs
-@@ -467,6 +467,7 @@ fn response_name(response: &AgentControlResponse) -> &'static str {
+@@ -251,6 +251,7 @@ impl ControlClient {
+                     group_id_hex: group_ref.to_owned(),
+                     attachments,
+                     caption,
++                    reply_to_message_id_hex: None,
+                     idempotency_key: Some(idempotency_key),
+                 },
+                 self.response_timeout_at_least(MIN_MEDIA_SEND_RESPONSE_TIMEOUT),
+@@ -467,6 +468,7 @@ fn response_name(response: &AgentControlResponse) -> &'static str {
          AgentControlResponse::Allowlist { .. } => "allowlist",
          AgentControlResponse::InvitePolicy { .. } => "invite_policy",
          AgentControlResponse::DiagnosticStatus { .. } => "diagnostic_status",
@@ -629,3 +802,101 @@ diff --git a/integrations/terminal-harness/src/control.rs b/integrations/termina
          AgentControlResponse::GroupCreated { .. } => "group_created",
          AgentControlResponse::GroupInfo { .. } => "group_info",
          AgentControlResponse::GroupProfileUpdated { .. } => "group_profile_updated",
+@@ -747,6 +749,7 @@ mod tests {
+                     attachments,
+                     caption,
+                     idempotency_key,
++                    ..
+                 } => {
+                     assert_eq!(account_id_hex, "account");
+                     assert_eq!(group_id_hex, "group");
+diff --git a/crates/agent-connector/src/messaging.rs b/crates/agent-connector/src/messaging.rs
+--- a/crates/agent-connector/src/messaging.rs
++++ b/crates/agent-connector/src/messaging.rs
+@@ -115,11 +115,14 @@ pub(crate) fn send_final_fingerprint(
+ /// Server-derived fingerprint of a media send. Local paths are deliberately
+ /// excluded; retries may stage the same bytes under a different private path.
+ /// Attachment order, safe metadata, caption, destination, and plaintext bytes
+-/// are all bound so one key cannot return ids for a different album.
++/// are all bound so one key cannot return ids for a different album. The reply
++/// target joins the preimage only when present, so unthreaded sends keep the
++/// fingerprints recorded before the field existed.
+ pub(crate) fn send_media_fingerprint(
+     account_id_hex: &str,
+     group_id_hex: &str,
+     caption: Option<&str>,
++    reply_to_message_id_hex: Option<&str>,
+     attachments: &[MediaUploadAttachmentRequest],
+ ) -> String {
+     use sha2::{Digest, Sha256};
+@@ -136,17 +139,35 @@ pub(crate) fn send_media_fingerprint(
+             ])
+         })
+         .collect::<Vec<_>>();
+-    let preimage = serde_json::json!([
++    let mut preimage = serde_json::json!([
+         SEND_MEDIA_FINGERPRINT_VERSION,
+         account_id_hex,
+         group_id_hex,
+         caption,
+         attachments,
+     ]);
++    if let Some(target) = reply_to_message_id_hex {
++        preimage
++            .as_array_mut()
++            .expect("send_media fingerprint preimage is an array")
++            .push(serde_json::json!(target));
++    }
+     let bytes = serde_json::to_vec(&preimage).expect("send_media fingerprint preimage cannot fail");
+     hex::encode(Sha256::digest(bytes))
+ }
+ 
++/// The `e` and `q` tags that `AppMessageIntent::Reply` puts on a text reply.
++pub(crate) fn media_reply_tags(reply_to_message_id_hex: Option<&str>) -> Vec<Vec<String>> {
++    reply_to_message_id_hex
++        .map(|target| {
++            vec![
++                vec!["e".to_owned(), target.to_owned()],
++                vec!["q".to_owned(), target.to_owned()],
++            ]
++        })
++        .unwrap_or_default()
++}
++
+ /// Per-blob temp subdir name for a downloaded media attachment: the SHA-256 of
+ /// the decrypted bytes the connector actually holds. Computing it locally (as
+ /// opposed to trusting the sender-supplied `ciphertext_sha256` field) makes the
+@@ -641,11 +662,16 @@ impl AgentConnector {
+         group_id_hex: &str,
+         attachments: Vec<AgentControlMediaUpload>,
+         caption: Option<String>,
++        reply_to_message_id_hex: Option<String>,
+         idempotency_key: Option<String>,
+     ) -> Result<AgentControlResponse, ConnectorError> {
+         let account = self.local_account_for_account_id(account_id_hex)?;
+         let group_id_hex = normalize_hex(group_id_hex)?;
+         let group_id = GroupId::new(hex::decode(&group_id_hex)?);
++        let reply_to_message_id_hex = reply_to_message_id_hex
++            .as_deref()
++            .map(normalize_hex)
++            .transpose()?;
+         let upload_attachments = read_media_upload_attachments_with_limits(
+             &self.media_allowed_roots,
+             attachments,
+@@ -661,6 +687,7 @@ impl AgentConnector {
+                 account_id_hex,
+                 &group_id_hex,
+                 caption.as_deref(),
++                reply_to_message_id_hex.as_deref(),
+                 &upload_attachments,
+             );
+             match self.idempotency.acquire(&key, &fingerprint).await? {
+@@ -686,7 +713,7 @@ impl AgentConnector {
+                 &account.label,
+                 &group_id,
+                 MediaUploadRequest {
+-                    message_tags: Vec::new(),
++                    message_tags: media_reply_tags(reply_to_message_id_hex.as_deref()),
+                     attachments: upload_attachments,
+                     caption,
+                     send: true,

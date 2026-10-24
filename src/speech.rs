@@ -159,7 +159,7 @@ async fn speak(
         .tempfile_in(dir)?
         .into_temp_path();
     let result = match render(config, &text, &path).await {
-        Ok(()) => send_audio(config, socket, group, &path).await,
+        Ok(()) => send_audio(config, socket, group, message_id, &path).await,
         error => error,
     };
     let _ = path.close();
@@ -197,13 +197,14 @@ async fn send_audio(
     config: &BridgeConfig,
     socket: &Socket,
     group: &str,
+    message_id: &str,
     path: &Path,
 ) -> Result<()> {
     let response = socket
         .marmot(
             json!({"type":"send_media","account_id_hex":config.account_id_hex,"group_id_hex":group,
         "attachments":[{"path":path,"media_type":"audio/mp4","file_name":"spoken-reply.m4a"}],
-        "caption":null,"idempotency_key":uuid::Uuid::new_v4().to_string()}),
+        "caption":null,"reply_to_message_id_hex":message_id,"idempotency_key":uuid::Uuid::new_v4().to_string()}),
         )
         .await?;
     ensure!(
