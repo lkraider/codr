@@ -140,10 +140,9 @@ async fn a_phone_reaction_sends_the_spoken_bridge_message_once_and_removes_the_a
     assert_eq!(requests[1]["group_id_hex"], GROUP);
     assert_eq!(attachment["media_type"], "audio/mp4");
     let path = Path::new(attachment["path"].as_str().unwrap());
-    assert_eq!(
-        path,
-        dir.path().join("speech").join(format!("{MESSAGE}.m4a"))
-    );
+    assert_eq!(path.parent().unwrap(), dir.path().join("speech"));
+    let name = path.file_name().unwrap().to_str().unwrap();
+    assert!(name.starts_with("spoken-") && name.ends_with(".m4a") && !name.contains(MESSAGE));
     assert_eq!(calls.sent_audio.lock().unwrap()[0], b"m4a audio");
     assert!(!path.exists());
     assert_eq!(

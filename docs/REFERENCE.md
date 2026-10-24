@@ -235,7 +235,7 @@ speak_dir = "/Users/you/.local/state/herdr-white-noise-bridge/speech"
 
 - `speak_command` is an executable with fixed arguments. **codr** writes the text to its stdin and appends the output path. The command must write an `.m4a` file.
 - `speak_reaction` is the trigger emoji. Spoken replies are off when it is unset.
-- `speak_dir` holds the audio until it is sent. It must be an absolute path. **codr** creates it with mode 0700 and removes each file after the send.
+- `speak_dir` holds the audio until it is sent. It must be an absolute path. **codr** creates it with mode 0700. Each audio is a new file with a unique name. **codr** removes the file after the send, and also when the command or the send fails.
 
 The MDK connector sends media only from beneath its `--media-allowed-root`. Start the connector with `--media-allowed-root` set to `speak_dir` or to a folder that contains it. The connector refuses every media send without it.
 

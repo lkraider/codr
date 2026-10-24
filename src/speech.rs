@@ -153,12 +153,16 @@ async fn speak(
         .mode(0o700)
         .create(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    let path = dir.join(format!("{message_id}.m4a"));
+    let path = tempfile::Builder::new()
+        .prefix("spoken-")
+        .suffix(".m4a")
+        .tempfile_in(dir)?
+        .into_temp_path();
     let result = match render(config, &text, &path).await {
         Ok(()) => send_audio(config, socket, group, &path).await,
         error => error,
     };
-    let _ = std::fs::remove_file(&path);
+    let _ = path.close();
     result
 }
 
