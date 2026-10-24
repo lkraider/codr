@@ -1,6 +1,6 @@
 use bech32::ToBase32;
 use herdr_white_noise_bridge::{
-    BridgeState,
+    BridgeState, forwarding,
     state::{self, Mapping},
     wire::read_line,
 };
@@ -143,6 +143,29 @@ async fn notify_refuses_an_unknown_seat_and_at_desk_while_the_worker_runs() {
 
     let both = notify(&config, &["--seat", SEAT, "--group", GROUP, "Question"]).await;
     assert!(!both.status.success());
+    assert!(calls.lock().unwrap().is_empty());
+    server.abort();
+}
+
+#[tokio::test]
+async fn notify_follows_the_forwarding_control_before_the_worker_copies_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    write_state(dir.path(), true);
+    let _worker = state::lock(&dir.path().join("state.json")).unwrap();
+    let calls = Arc::new(Mutex::new(vec![]));
+    let server = mdk(&dir.path().join("wn.sock"), calls.clone()).await;
+
+    forwarding::set(&dir.path().join("state.json"), false).unwrap();
+    let desk = notify(&config, &["--seat", SEAT, "Question"]).await;
+    assert!(!desk.status.success());
+    assert!(String::from_utf8_lossy(&desk.stderr).contains("Forwarding is At desk"));
+
+    forwarding::set(&dir.path().join("state.json"), true).unwrap();
+    let resuming = notify(&config, &["--seat", SEAT, "Question"]).await;
+    assert!(!resuming.status.success());
+    assert!(String::from_utf8_lossy(&resuming.stderr).contains("Forwarding is At desk"));
+
     assert!(calls.lock().unwrap().is_empty());
     server.abort();
 }

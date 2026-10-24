@@ -386,7 +386,7 @@ To send a notice to the group of one OpenRig seat, use `--seat`:
 ~/.local/bin/herdr-white-noise-bridge notify --seat operator-agent@kernel 'Merge the branch?'
 ```
 
-Without `--group` or `--seat`, the command sends the notice to every mapped group. The command refuses while forwarding is At desk. The command reads bridge state without changing it and sends the notice to MDK directly. It returns success only after MDK confirms publication, and prints one JSON line per sent message, for example `{"group":"…","message_id":"…"}`. A failed notice exits non-zero and is not kept for a later retry. The phone answer to a notice reaches the agent of that group as a normal phone prompt.
+Without `--group` or `--seat`, the command sends the notice to every mapped group. The command refuses while forwarding is At desk. It also refuses after a switch to Away until the worker applies the switch. The command reads bridge state without changing it and sends the notice to MDK directly. It returns success only after MDK confirms publication, and prints one JSON line per sent message, for example `{"group":"…","message_id":"…"}`. A failed notice exits non-zero and is not kept for a later retry. Each run uses a new idempotency key, so a retry after a lost MDK reply can send the notice twice. The phone answer to a notice reaches the agent of that group as a normal phone prompt.
 
 ## Screenshot provenance
 

@@ -101,9 +101,7 @@ async fn main() -> Result<()> {
     if matches!(args.command, Some(Action::Status)) {
         let s = BridgeState::load(&config.state_path)?;
         let control = forwarding::load(&config.state_path)?;
-        let resume_pending = control.enabled
-            && (s.forwarding_resume_pending
-                || s.forwarding_revision.as_deref().unwrap_or("initial") != control.revision);
+        let resume_pending = resume_pending(&s, &control);
         let forwarding_enabled = control.enabled && s.forwarding_enabled && !resume_pending;
         for (key, m) in s.mappings {
             println!(
@@ -119,7 +117,8 @@ async fn main() -> Result<()> {
         let marmot = wire::Socket {
             path: config.wn_agent_socket.clone(),
         };
-        for group in notify_groups(&state, group.as_deref(), seat.as_deref())? {
+        let control = forwarding::load(&config.state_path)?;
+        for group in notify_groups(&state, &control, group.as_deref(), seat.as_deref())? {
             for part in state::chunks(text) {
                 let response = marmot.marmot(serde_json::json!({"type":"send_final","account_id_hex":config.account_id_hex,"group_id_hex":group,"text":part,"reply_to_message_id_hex":null,"idempotency_key":uuid::Uuid::new_v4().to_string()})).await?;
                 let message_id = response["message_ids_hex"][0]
@@ -197,13 +196,20 @@ async fn main() -> Result<()> {
     }
 }
 
+fn resume_pending(state: &BridgeState, control: &forwarding::Forwarding) -> bool {
+    control.enabled
+        && (state.forwarding_resume_pending
+            || state.forwarding_revision.as_deref().unwrap_or("initial") != control.revision)
+}
+
 fn notify_groups(
     state: &BridgeState,
+    control: &forwarding::Forwarding,
     group: Option<&str>,
     seat: Option<&str>,
 ) -> Result<Vec<String>> {
     anyhow::ensure!(
-        state.forwarding_enabled,
+        control.enabled && state.forwarding_enabled && !resume_pending(state, control),
         "Forwarding is At desk; switch to Away before sending a notice"
     );
     if let Some(seat) = seat {
