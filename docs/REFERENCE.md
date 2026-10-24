@@ -11,7 +11,7 @@ The bridge uses one dedicated MDK identity across all mapped groups. Setup keeps
 - New sessions create groups and invite the configured phone `npub`.
 - Group names pair the **herdr** tab label and workspace: `[cd] <tab name> (<workspace>)`, for example `[cd] review (Acme)`. A workspace without a label leaves `[cd] <tab name>`. Workspace and agent details also appear in the group description. Repository names and agent-generated conversation topics do not determine the chat name.
 - A phone message prompts only the agent mapped to that group.
-- Prompts sent while that agent is busy or blocked are not queued. Wait for idle and resend. Supported decision answers use their separate blocked-session route.
+- A prompt sent while that agent works goes to the agent. A blocked agent refuses a prompt with a notice to answer the terminal prompt at the desk and resend. Supported decision answers use their separate blocked-session route.
 - Final replies come from completed stored agent messages. They exclude reasoning and tool output.
 - Working, idle, blocked, and ended notices appear in the group. Blocked notices can include a labelled terminal excerpt. Unsupported OpenCode blockers use a short notice. Separate `done` notices are suppressed; the final reply signals completion.
 - `/status` reports the mapped session state.

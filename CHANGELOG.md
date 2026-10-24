@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- Accept phone prompts while the agent works. A blocked agent still refuses them with the terminal-prompt notice. A prompt sent while media from the same group is being prepared gets its own notice.
+
 ### Fixed
 
 - Keep stable executable paths across Homebrew upgrades and report missing OpenCode executables without exposing transcript data.
