@@ -90,7 +90,7 @@ fn rig_calls(dir: &Path, command: &str) -> Vec<String> {
         .collect()
 }
 
-/// Rows are (uuid, kind, text). Kind is "user" or "final".
+/// Rows are (uuid, kind, text). Kind is "user", "queued" (typed during a running turn) or "final".
 fn transcript(config: &BridgeConfig, id: &str, rows: &[(&str, &str, &str)]) {
     let path = config
         .claude_home
@@ -100,7 +100,9 @@ fn transcript(config: &BridgeConfig, id: &str, rows: &[(&str, &str, &str)]) {
     let mut parent = Value::Null;
     let mut text = String::new();
     for (uuid, kind, body) in rows {
-        let row = if *kind == "user" {
+        let row = if *kind == "queued" {
+            json!({"type":"attachment","uuid":uuid,"parentUuid":parent,"sessionId":id,"attachment":{"type":"queued_command","commandMode":"prompt","prompt":body}})
+        } else if *kind == "user" {
             json!({"type":"user","uuid":uuid,"parentUuid":parent,"sessionId":id,"message":{"role":"user","content":body}})
         } else {
             json!({"type":"assistant","uuid":uuid,"parentUuid":parent,"sessionId":id,"message":{"role":"assistant","id":format!("api-{uuid}"),"stop_reason":"end_turn","content":[{"type":"text","text":body}]}})
@@ -162,8 +164,22 @@ async fn connected_seat() -> (
     Bridge,
     tokio::task::JoinHandle<()>,
 ) {
+    connected_seat_with(false).await
+}
+
+async fn connected_seat_with(phone_replies_only: bool) -> (
+    tempfile::TempDir,
+    BridgeConfig,
+    Arc<Mutex<Vec<Value>>>,
+    Bridge,
+    tokio::task::JoinHandle<()>,
+) {
     let dir = tempfile::tempdir().unwrap();
-    let config = config(dir.path());
+    let mut config = config(dir.path());
+    if phone_replies_only {
+        config.auto_forwarding = false;
+        config.phone_replies_only = true;
+    }
     transcript(
         &config,
         FIRST,
@@ -1385,4 +1401,89 @@ async fn each_seat_reads_its_transcript_from_its_own_claude_home() {
     openrig::snapshot(&config).await.unwrap();
     assert_eq!(rig_calls(dir.path(), "seat status a@workshop").len(), 1);
     assert_eq!(rig_calls(dir.path(), "seat status c@workshop").len(), 2);
+}
+
+/// The finals sent to the phone, without the connection notice.
+fn finals(calls: &Arc<Mutex<Vec<Value>>>) -> Vec<String> {
+    calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| call["type"] == "send_final")
+        .filter_map(|call| call["text"].as_str())
+        .filter(|text| !text.starts_with("Connected to OpenRig"))
+        .map(str::to_owned)
+        .collect()
+}
+
+const OLD: [(&str, &str, &str); 2] = [("u0", "user", "Old prompt"), ("a0", "final", "Old final")];
+
+async fn turn(dir: &Path, bridge: &mut Bridge, seq: u64) {
+    seats(dir, &[node(SEAT, FIRST, "running", seq)]);
+    tick(bridge).await;
+    seats(dir, &[node(SEAT, FIRST, "idle", seq + 1)]);
+    tick(bridge).await;
+}
+
+#[tokio::test]
+async fn a_peer_turn_ends_with_stop_and_sends_nothing_to_the_phone() {
+    let (dir, config, calls, mut bridge, peer) = connected_seat_with(true).await;
+    let rows = [OLD[0], OLD[1], ("u1", "user", "From a peer"), ("a1", "final", "Reply to the peer")];
+    transcript(&config, FIRST, &rows);
+    seats(dir.path(), &[node(SEAT, FIRST, "running", 2)]);
+    tick(&mut bridge).await;
+    bridge.apply_events(vec![status(3, "idle", true)]).await.unwrap();
+    bridge.flush().await.unwrap();
+    turn(dir.path(), &mut bridge, 4).await;
+    assert_eq!(finals(&calls), Vec::<String>::new());
+    peer.abort();
+}
+
+#[tokio::test]
+async fn a_phone_turn_sends_exactly_its_answer_and_a_later_peer_turn_sends_nothing() {
+    let (dir, config, calls, mut bridge, peer) = connected_seat_with(true).await;
+    bridge.inbound(&inbound("phone-1", "Fix it")).await.unwrap();
+    let mut rows = vec![OLD[0], OLD[1], ("u1", "user", "Fix it"), ("a1", "final", "Fixed")];
+    transcript(&config, FIRST, &rows);
+    turn(dir.path(), &mut bridge, 2).await;
+    assert_eq!(finals(&calls), ["Fixed"]);
+    rows.extend([("u2", "user", "From a peer"), ("a2", "final", "Reply to the peer")]);
+    transcript(&config, FIRST, &rows);
+    turn(dir.path(), &mut bridge, 4).await;
+    assert_eq!(finals(&calls), ["Fixed"]);
+    peer.abort();
+}
+
+/// A phone prompt typed while a peer turn runs. Claude Code either takes it into that turn
+/// (a `queued_command` row, one reply answers both) or runs it as its own turn afterwards.
+async fn phone_prompt_during_a_peer_turn(injected: bool) -> Vec<String> {
+    let (dir, config, calls, mut bridge, peer) = connected_seat_with(true).await;
+    let mut rows = vec![OLD[0], OLD[1], ("u1", "user", "From a peer")];
+    transcript(&config, FIRST, &rows);
+    seats(dir.path(), &[node(SEAT, FIRST, "running", 2)]);
+    tick(&mut bridge).await;
+    bridge.inbound(&inbound("phone-1", "Phone question")).await.unwrap();
+    if injected {
+        rows.extend([("q1", "queued", "Phone question"), ("a1", "final", "Reply to both")]);
+    } else {
+        rows.extend([
+            ("a1", "final", "Reply to the peer"),
+            ("u2", "user", "Phone question"),
+            ("a2", "final", "Phone answer"),
+        ]);
+    }
+    transcript(&config, FIRST, &rows);
+    turn(dir.path(), &mut bridge, 3).await;
+    peer.abort();
+    finals(&calls)
+}
+
+#[tokio::test]
+async fn a_phone_prompt_run_after_a_peer_turn_sends_only_its_own_answer() {
+    assert_eq!(phone_prompt_during_a_peer_turn(false).await, ["Phone answer"]);
+}
+
+#[tokio::test]
+async fn a_phone_prompt_taken_into_a_peer_turn_gets_that_turns_one_reply() {
+    assert_eq!(phone_prompt_during_a_peer_turn(true).await, ["Reply to both"]);
 }
