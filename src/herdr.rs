@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Session {
     pub source: String,
     pub agent: String,
@@ -13,6 +13,16 @@ pub struct Session {
     /// The Claude config directory that holds this session's transcript. `claude_home` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<std::path::PathBuf>,
+}
+
+/// Two sessions are the same session when source, agent, kind and value match.
+/// `home` says where to read it and is not part of that identity, so a stored mapping
+/// from before `home` existed still matches the live session.
+impl PartialEq for Session {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.source, &self.agent, &self.kind, &self.value)
+            == (&other.source, &other.agent, &other.kind, &other.value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -223,4 +233,25 @@ pub async fn choose(socket: &Socket, agent: &Agent, choice: usize) -> Result<()>
         "Decision shortcut was not confirmed"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::Session;
+
+    #[test]
+    fn a_session_is_the_same_with_or_without_its_home() {
+        let mut session = Session {
+            source: "openrig".into(),
+            agent: "claude".into(),
+            kind: "id".into(),
+            value: "x".into(),
+            home: None,
+        };
+        let stored: Session = serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        session.home = Some("/h".into());
+        assert_eq!(stored, session);
+        session.value = "y".into();
+        assert_ne!(stored, session);
+    }
 }
