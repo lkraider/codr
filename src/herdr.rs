@@ -10,6 +10,9 @@ pub struct Session {
     pub agent: String,
     pub kind: String,
     pub value: String,
+    /// The Claude config directory that holds this session's transcript. `claude_home` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

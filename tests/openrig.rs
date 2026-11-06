@@ -41,6 +41,7 @@ fn config(dir: &Path) -> BridgeConfig {
          printf '%s\\n' \"$*\" >> \"$dir/rig.log\"\n\
          case \"$1\" in\n\
          ps) cat \"$dir/ps.json\" ;;\n\
+         seat) cat \"$dir/home-$3.json\" 2>/dev/null || exit 9 ;;\n\
          send) cat \"$dir/send.json\"; exit \"$(cat \"$dir/send.exit\")\" ;;\n\
          *) exit 9 ;;\n\
          esac\n",
@@ -1336,4 +1337,52 @@ async fn the_run_loop_sends_a_held_text_when_copy_mode_ends_and_then_stops_check
         [format!("send {SEAT} --raw --json -- fix the test")]
     );
     mdk.abort();
+}
+
+/// Each seat's transcript is read from the Claude home `rig seat status` names for it.
+/// A seat with no known home reads `claude_home`.
+#[tokio::test]
+async fn each_seat_reads_its_transcript_from_its_own_claude_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    config.openrig_seats = ["a@workshop", "b@workshop", "c@workshop"].map(Into::into).into();
+    let (ids, homes) = (
+        ["aaaaaaaa-1111-4111-8111-111111111111", "bbbbbbbb-2222-4222-8222-222222222222", "cccccccc-3333-4333-8333-333333333333"],
+        [dir.path().join("home-a"), dir.path().join("home-b")],
+    );
+    seats(
+        dir.path(),
+        &[
+            node("a@workshop", ids[0], "idle", 1),
+            node("b@workshop", ids[1], "idle", 1),
+            node("c@workshop", ids[2], "idle", 1),
+        ],
+    );
+    for (seat, home) in ["a@workshop", "b@workshop"].iter().zip(&homes) {
+        std::fs::write(
+            dir.path().join(format!("home-{seat}.json")),
+            json!({"runtime_home":{"variable":"CLAUDE_CONFIG_DIR","home":home,"source":"member"}}).to_string(),
+        )
+        .unwrap();
+    }
+    let mut own = config.clone();
+    for (id, home) in ids.iter().zip([&homes[0], &homes[1], &config.claude_home]) {
+        own.claude_home = home.clone();
+        transcript(&own, id, &[("u1", "user", "hi"), ("f1", "final", &format!("reply {id}"))]);
+    }
+    let agents = openrig::snapshot(&config).await.unwrap();
+    assert_eq!(agents.len(), 3);
+    for (agent, id) in agents.iter().zip(ids) {
+        let session = agent.agent_session.as_ref().unwrap();
+        let history = herdr_white_noise_bridge::output::read_history(&config, session)
+            .await
+            .unwrap();
+        assert_eq!(history.finals.last().unwrap().text, format!("reply {id}"));
+    }
+    assert_eq!(agents[0].agent_session.as_ref().unwrap().home.as_deref(), Some(homes[0].as_path()));
+    assert_eq!(agents[2].agent_session.as_ref().unwrap().home, None);
+    // A found home is kept; the seat without one is asked about again.
+    openrig::snapshot(&config).await.unwrap();
+    assert_eq!(rig_calls(dir.path(), "seat status a@workshop").len(), 1);
+    assert_eq!(rig_calls(dir.path(), "seat status c@workshop").len(), 2);
 }

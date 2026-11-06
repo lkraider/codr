@@ -6,7 +6,13 @@ use crate::{
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{process::Stdio, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    process::Stdio,
+    sync::{LazyLock, Mutex},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -124,7 +130,7 @@ pub async fn snapshot(config: &BridgeConfig) -> Result<Vec<Agent>> {
     .await??;
     ensure!(output.status.success(), "OpenRig did not list its seats");
     let nodes: Vec<Value> = serde_json::from_slice(&output.stdout)?;
-    Ok(nodes
+    let mut agents: Vec<Agent> = nodes
         .iter()
         .filter(|node| {
             node["sessionStatus"] == "running"
@@ -133,7 +139,50 @@ pub async fn snapshot(config: &BridgeConfig) -> Result<Vec<Agent>> {
                     .is_some_and(|name| config.openrig_seats.iter().any(|seat| seat == name))
         })
         .map(agent)
-        .collect())
+        .collect();
+    for agent in &mut agents {
+        if let Some(session) = &mut agent.agent_session {
+            session.home = claude_home(config, agent.seat.as_deref().unwrap_or_default(), &session.value).await;
+        }
+    }
+    Ok(agents)
+}
+
+/// Homes already found, by seat and Claude session id. A failed lookup is not kept, so the next refresh tries again.
+static HOMES: LazyLock<Mutex<HashMap<(String, String), PathBuf>>> =
+    LazyLock::new(Default::default);
+
+/// The Claude config directory the seat launches with, from `rig seat status`.
+/// `None` means the caller reads `claude_home`.
+async fn claude_home(config: &BridgeConfig, seat: &str, id: &str) -> Option<PathBuf> {
+    let key = (seat.to_owned(), id.to_owned());
+    if let Some(home) = HOMES.lock().unwrap().get(&key) {
+        return Some(home.clone());
+    }
+    let output = timeout(
+        Duration::from_secs(10),
+        Command::new(&config.rig_bin)
+            .args(["seat", "status", seat, "--json"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let status: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let home = &status["runtime_home"];
+    let dir = home["home"].as_str().filter(|dir| !dir.is_empty())?;
+    if home["variable"] != "CLAUDE_CONFIG_DIR" {
+        return None;
+    }
+    let dir = PathBuf::from(dir);
+    HOMES.lock().unwrap().insert(key, dir.clone());
+    Some(dir)
 }
 
 fn agent(node: &Value) -> Agent {
@@ -150,6 +199,7 @@ fn agent(node: &Value) -> Agent {
             agent: "claude".into(),
             kind: "id".into(),
             value: token.into(),
+            home: None,
         });
     let decided = &node["activityState"];
     let status = if decided["needsInput"]["count"].as_u64().unwrap_or(0) > 0 {

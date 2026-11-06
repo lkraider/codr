@@ -81,6 +81,7 @@ fn fallback_session() -> herdr_white_noise_bridge::herdr::Session {
         agent: "opencode".into(),
         kind: "id".into(),
         value: "ses_fixture".into(),
+        home: None,
     }
 }
 
@@ -655,6 +656,7 @@ async fn installed_database_matches_export_and_reports_incremental_read_cost() {
         agent: "opencode".into(),
         kind: "id".into(),
         value: id.clone(),
+        home: None,
     };
     let mut cli = config;
     cli.opencode_db = None;

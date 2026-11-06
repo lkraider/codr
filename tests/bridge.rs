@@ -2623,6 +2623,7 @@ async fn native_round_trip(provider: &str, legacy_mapping: bool) {
         agent: provider.into(),
         kind: "id".into(),
         value: ID.into(),
+        home: None,
     });
     let path = if provider == "codex" {
         config
@@ -2739,6 +2740,7 @@ async fn legacy_native_session_that_exited_before_upgrade_does_not_replay_histor
             agent: provider.into(),
             kind: "id".into(),
             value: ID.into(),
+            home: None,
         });
         let (path, rows) = if provider == "codex" {
             (
@@ -4077,6 +4079,7 @@ fn claude_agent(status: &str) -> Agent {
         agent: "claude".into(),
         kind: "id".into(),
         value: "11111111-1111-4111-8111-111111111111".into(),
+        home: None,
     });
     observed
 }
