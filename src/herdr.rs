@@ -2,7 +2,84 @@ use crate::wire::Socket;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Workspace {
+    pub workspace_id: String,
+    pub label: String,
+}
+
+impl Workspace {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.workspace_id.is_empty()
+                && self.workspace_id.len() <= 128
+                && self
+                    .workspace_id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b':'))
+                && self.label.len() <= 4096,
+            "Invalid workspace information"
+        );
+        Ok(())
+    }
+
+    pub fn display(&self) -> String {
+        let label: String = self
+            .label
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(80)
+            .collect();
+        format!(
+            "{} ({})",
+            if label.trim().is_empty() {
+                "Unnamed"
+            } else {
+                label.trim()
+            },
+            self.workspace_id
+        )
+    }
+}
+
+pub async fn workspaces(socket: &Socket) -> Result<Vec<Workspace>> {
+    let response = socket.herdr("workspace.list", json!({})).await?;
+    ensure!(
+        response["result"]["type"] == "workspace_list",
+        "Invalid workspace list response"
+    );
+    let rows = response["result"]["workspaces"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Workspace list is unavailable"))?;
+    ensure!(rows.len() <= 1000, "Workspace list exceeds its limit");
+    let workspaces: Vec<Workspace> =
+        serde_json::from_value(serde_json::Value::Array(rows.clone()))?;
+    let mut seen = HashSet::new();
+    for workspace in &workspaces {
+        workspace.validate()?;
+        ensure!(
+            seen.insert(&workspace.workspace_id),
+            "Duplicate workspace ID"
+        );
+    }
+    Ok(workspaces)
+}
+
+pub async fn workspace(socket: &Socket, id: &str) -> Result<Workspace> {
+    let response = socket
+        .herdr("workspace.get", json!({"workspace_id":id}))
+        .await?;
+    ensure!(
+        response["result"]["type"] == "workspace_info",
+        "Invalid workspace response"
+    );
+    let workspace: Workspace = serde_json::from_value(response["result"]["workspace"].clone())?;
+    workspace.validate()?;
+    ensure!(workspace.workspace_id == id, "Workspace identity changed");
+    Ok(workspace)
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Session {
@@ -71,15 +148,29 @@ impl Agent {
     pub fn settled(&self) -> bool {
         matches!(self.agent_status.as_str(), "idle" | "done")
     }
+
+    /// Format the introduction label using current bracketed agent codes.
     pub fn title(&self) -> String {
         let raw = self
             .terminal_title_stripped
             .as_deref()
             .unwrap_or(&self.agent);
-        raw.chars().filter(|c| !c.is_control()).take(60).collect()
+        let clean: String = raw.chars().filter(|c| !c.is_control()).take(60).collect();
+        match clean.split_once(" | ") {
+            Some((label, topic))
+                if label.len() == 2 && label.bytes().all(|byte| byte.is_ascii_uppercase()) =>
+            {
+                format!("[{}] {topic}", label.to_ascii_lowercase())
+            }
+            _ => clean,
+        }
     }
 
     pub fn group_name(&self) -> String {
+        self.group_name_with_suffix(None)
+    }
+
+    pub fn group_name_with_suffix(&self, suffix: Option<&str>) -> String {
         let fallback = if self.tab_id.is_empty() {
             "session"
         } else {
@@ -90,7 +181,7 @@ impl Agent {
             .as_deref()
             .filter(|label| !label.trim().is_empty())
             .unwrap_or(fallback);
-        group_name_with_workspace(raw, self.workspace_label.as_deref())
+        group_name_with_workspace(raw, self.workspace_label.as_deref(), suffix)
     }
 
     pub fn group_description(&self) -> String {
@@ -115,24 +206,42 @@ impl Agent {
                 .collect::<String>()
         };
         format!(
-            "Workspace: {}\nAgent: {}\nManaged by codr via {}.",
+            "Hi! This is your chat with {}.\n\nSend /help in any Codr chat to see available commands.\n\nWorkspace: {}\nAgent: {}\nManaged by codr via {}.",
+            clean(&self.group_name()),
             clean(workspace),
             clean(agent),
             if self.seat.is_some() {
                 "OpenRig"
             } else {
-                "HERDR"
+                "herdr"
             }
         )
     }
 }
 
 pub fn group_name(label: &str) -> String {
-    group_name_with_workspace(label, None)
+    group_name_with_workspace(label, None, None)
 }
 
-/// `[cd] <tab> (<workspace>)`, trimmed to MDK's 256-byte title limit.
-fn group_name_with_workspace(label: &str, workspace: Option<&str>) -> String {
+pub fn status_label(status: &str) -> String {
+    let mut characters = status.chars();
+    let punctuation = if matches!(status, "working" | "blocked") {
+        "..."
+    } else {
+        "."
+    };
+    match characters.next() {
+        Some(first) => format!(
+            "{}{}{punctuation}",
+            first.to_uppercase(),
+            characters.as_str()
+        ),
+        None => "Unknown.".into(),
+    }
+}
+
+/// `<tab> (<workspace>)`, trimmed to MDK's 256-byte title limit.
+fn group_name_with_workspace(label: &str, workspace: Option<&str>, suffix: Option<&str>) -> String {
     const LIMIT: usize = 256;
     let clean = |text: &str| -> String { text.chars().filter(|c| !c.is_control()).collect() };
     let mut label = clean(label).trim().to_owned();
@@ -142,16 +251,17 @@ fn group_name_with_workspace(label: &str, workspace: Option<&str>) -> String {
     let mut workspace = workspace
         .map(|value| clean(value).trim().to_owned())
         .filter(|value| !value.is_empty());
-    let mut name = group_title(&label, workspace.as_deref());
+    let suffix = suffix.filter(|s| matches!(*s, "opencode" | "codex" | "claude"));
+    let mut name = group_title(&label, workspace.as_deref(), suffix);
     // Keep the tab label primary: shorten the workspace before the tab.
     while name.len() > LIMIT {
         if let Some(value) = workspace.as_mut().filter(|value| !value.is_empty()) {
             value.pop();
             *value = value.trim_end().to_owned();
-            name = group_title(&label, Some(value.as_str()));
+            name = group_title(&label, Some(value.as_str()), suffix);
         } else if !label.is_empty() {
             label.pop();
-            name = group_title(&label, None);
+            name = group_title(&label, None, suffix);
         } else {
             break;
         }
@@ -159,18 +269,19 @@ fn group_name_with_workspace(label: &str, workspace: Option<&str>) -> String {
     name
 }
 
-fn group_title(label: &str, workspace: Option<&str>) -> String {
-    const PREFIX: &str = "[cd] ";
-    match workspace.filter(|value| !value.is_empty()) {
-        Some(workspace) => format!("{PREFIX}{label} ({workspace})"),
-        None => format!("{PREFIX}{}", label.trim_end()),
+fn group_title(label: &str, workspace: Option<&str>, suffix: Option<&str>) -> String {
+    match (workspace.filter(|value| !value.is_empty()), suffix) {
+        (Some(workspace), Some(agent)) => format!("{label} ({workspace} - {agent})"),
+        (Some(workspace), None) => format!("{label} ({workspace})"),
+        (None, Some(agent)) => format!("{} ({agent})", label.trim_end()),
+        (None, None) => label.trim_end().to_owned(),
     }
 }
 
 pub async fn snapshot(socket: &Socket) -> Result<Vec<Agent>> {
     let response = socket.herdr("session.snapshot", json!({})).await?;
     let agents = &response["result"]["snapshot"]["agents"];
-    ensure!(agents.is_array(), "HERDR did not return a session snapshot");
+    ensure!(agents.is_array(), "herdr did not return a session snapshot");
     let mut agents: Vec<Agent> = serde_json::from_value(agents.clone())?;
     let labels: HashMap<&str, String> = response["result"]["snapshot"]["tabs"]
         .as_array()
@@ -209,7 +320,7 @@ pub async fn get(socket: &Socket, agent: &Agent) -> Result<Agent> {
     let current: Agent = serde_json::from_value(response["result"]["agent"].clone())?;
     ensure!(
         current.key() == agent.key() && current.terminal_id == agent.terminal_id,
-        "HERDR agent changed"
+        "herdr agent changed"
     );
     Ok(current)
 }

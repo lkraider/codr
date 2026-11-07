@@ -1,6 +1,85 @@
 use herdr_white_noise_bridge::output::final_messages_v2;
 use serde_json::json;
 
+#[tokio::test]
+async fn v2_pending_question_is_read_from_live_forms_not_the_completed_export() {
+    use herdr_white_noise_bridge::{BridgeConfig, herdr::Session, output};
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let cli = root.path().join("opencode");
+    std::fs::write(
+        &cli,
+        r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 2
+case "$1" in
+  --pure) exit 2 ;;
+  session) printf '%s' '{"messages":[{"type":"user","id":"user","text":"prompt"}]}' ;;
+  api) [ "$2" = get ] && [ "$3" = /api/session/ses_fixture/form ] || exit 2
+       cat forms.json ;;
+  *) exit 2 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let forms = root.path().join("forms.json");
+    std::fs::write(&forms, json!({"data":[{
+        "id":"frm_question", "sessionID":"ses_fixture", "title":"Questions",
+        "metadata":{"kind":"question","tool":{"messageID":"msg_pending","id":"call_pending"}},
+        "fields":[{"key":"q0","title":"Scope","description":"Which next step?","type":"string",
+            "options":[{"value":"Proceed","label":"Proceed","description":"Continue"},
+                       {"value":"Review","label":"Review","description":"Review first"}],"custom":true}]
+    }]}).to_string()).unwrap();
+    let config: BridgeConfig = serde_json::from_value(json!({
+        "phone_npub":"unused", "account_id_hex":"aa".repeat(32),
+        "state_path":root.path().join("state.json"), "herdr_socket":root.path().join("herdr.sock"),
+        "wn_agent_socket":root.path().join("mdk.sock"), "opencode_bin":cli
+    }))
+    .unwrap();
+    let session = Session {
+        source: "herdr:opencode".into(),
+        agent: "opencode".into(),
+        kind: "id".into(),
+        value: "ses_fixture".into(),
+        home: None,
+    };
+    let snapshot = output::read_snapshot(&config, &session).await.unwrap();
+    assert!(snapshot.history.finals.is_empty());
+    let decision = snapshot
+        .decision
+        .expect("The live question is absent from V2 exports");
+    assert_eq!(decision.id, "msg_pending:call_pending");
+    assert!(decision.supported());
+    assert_eq!(decision.choice("Review").unwrap(), 2);
+    assert!(decision.matches_visible("Which next step?\n1. Proceed\nContinue\n2. Review\nReview first\n3. Type your own answer\n↑↓ select enter submit esc dismiss"));
+    assert_eq!(
+        output::decision::read(&config, &session)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        decision.id
+    );
+    std::fs::write(&forms, r#"{"data":[]}"#).unwrap();
+    assert!(
+        output::decision::read(&config, &session)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    std::fs::remove_file(&forms).unwrap();
+    let snapshot = output::read_snapshot(&config, &session).await.unwrap();
+    assert!(
+        snapshot.decision.is_none(),
+        "A failed live read cannot reuse a stale question"
+    );
+    assert_eq!(
+        snapshot.history.user_inputs.len(),
+        1,
+        "Question API failures do not block history reads"
+    );
+}
+
 #[test]
 fn v2_export_keeps_only_completed_replies_from_stopped_turns() {
     let export = json!({

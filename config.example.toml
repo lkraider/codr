@@ -9,11 +9,16 @@ state_path = "/home/YOUR_USER/.local/state/herdr-white-noise-bridge/state.json"
 opencode_bin = "/absolute/path/to/opencode"
 # Optional incremental reader. Select the database for the mapped OpenCode sessions.
 # opencode_db = "/home/YOUR_USER/.local/share/opencode/opencode.db"
+# Recommended for V2: read the existing local server without starting/recovering it.
+# This takes precedence over opencode_db; a failed read retries, with no CLI fallback.
+# opencode_service_file = "/home/YOUR_USER/.local/state/opencode/service.json"
 # Optional transcript roots. Defaults use CODEX_HOME / CLAUDE_CONFIG_DIR, or these home directories.
 codex_home = "/home/YOUR_USER/.codex"
 claude_home = "/home/YOUR_USER/.claude"
 # Optional editable progress and transcription notices. Requires MDK edit_message support.
 # The published MDK 0.13.0 binaries do not include that API.
+# Standalone owner-only control chat for /new and general commands.
+# control_chat = true
 # edit_responses = true
 # Optional. Send a final reply only when the turn it answers holds a phone prompt.
 # phone_replies_only = true

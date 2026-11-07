@@ -10,6 +10,11 @@ spec.loader.exec_module(source)
 
 
 class ConnectorSourceTests(unittest.TestCase):
+    def test_release_pin_matches_mdk_014_cohort(self):
+        settings = source.tomllib.loads((source.ROOT / "connector.toml").read_text())
+        self.assertEqual(settings["version"], "0.14.0")
+        self.assertEqual(settings["revision"], "3fb4b4759ac676b0c21c4c3527074866c9fa4c89")
+
     def test_unexpected_revision_is_rejected_before_any_patch_or_write(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(source.subprocess, "check_output", return_value="unexpected\n"), patch.object(source.subprocess, "run") as run:
             with self.assertRaisesRegex(RuntimeError, "pinned revision"):

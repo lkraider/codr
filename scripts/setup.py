@@ -29,7 +29,7 @@ if __name__ == "__main__":
 import tomllib
 
 import services
-from install import InstallError, connector_path, install_connector, platform_name, version
+from install import InstallError, connector_path, install_connector, platform_name, version, sha256
 from phonon import configure_phonon
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -101,7 +101,7 @@ def read_snapshot(path):
     response = control_request(path, {"method": "session.snapshot", "params": {}})
     snapshot = response.get("result", {}).get("snapshot")
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("agents"), list):
-        raise SetupError("HERDR did not return a session snapshot")
+        raise SetupError("herdr did not return a session snapshot")
     return snapshot
 
 
@@ -117,6 +117,42 @@ def local_accounts(path):
             if time.monotonic() >= deadline:
                 raise SetupError(f"MDK socket {path} is unavailable; inspect its transport service")
             time.sleep(0.25)
+
+
+def publish_default_profile(socket_path, result, record_path):
+    """Name only a newly created identity, journalling before the public profile write."""
+    account = result["account_id_hex"]
+    if not isinstance(account, str) or not re.fullmatch(r"[0-9a-f]{64}", account):
+        raise SetupError("Invalid bridge account for profile publication")
+    previous = json.loads(record_path.read_text()) if record_path.exists() else {}
+    if previous and (not isinstance(previous, dict) or previous.get("account_id_hex") != account):
+        raise SetupError("Stored bootstrap identity differs from the selected bridge account")
+    result = {**previous, **result}
+    status = previous.get("default_profile_status")
+    if status is not None:
+        if status not in ("pending", "unconfirmed", "published", "preserved"):
+            raise SetupError("Stored profile publication needs inspection")
+        result["default_profile_status"] = "unconfirmed" if status == "pending" else status
+        return result
+    if result.get("created") is not True:
+        result["default_profile_status"] = "preserved"
+        return result
+    result["default_profile_status"] = "pending"
+    result["default_profile_name"] = "👾"
+    private_write(record_path, json.dumps(result, indent=2) + "\n")
+    try:
+        response = control_request(socket_path, {"marmot_agent_control": "marmot.agent-control.v2",
+            "type": "account_publish_profile", "account_id_hex": account, "name": "👾", "display_name": "👾"})
+        expected = {"marmot_agent_control": "marmot.agent-control.v2", "type": "profile_published",
+            "account_id_hex": account, "name": "👾", "display_name": "👾"}
+        if not isinstance(response, dict) or any(response.get(key) != value for key, value in expected.items()):
+            raise SetupError("Default profile publication was not confirmed")
+    except (SetupError, OSError, ValueError):
+        result["default_profile_status"] = "unconfirmed"
+        return result
+    result["default_profile_status"] = "published"
+    private_write(record_path, json.dumps(result, indent=2) + "\n")
+    return result
 
 
 def ensure_mdk(runner):
@@ -350,14 +386,14 @@ def config_path(profile):
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / profile.directory / "config.toml"
 
 
-def configure(owner, herdr_socket=None, runner=run, check=False, enable_audio=None, openrig=False, seats=()):
+def configure(owner, herdr_socket=None, runner=run, check=False, enable_audio=None, enable_portr=None, openrig=False, seats=()):
     if openrig or seats:
-        if herdr_socket or enable_audio:
-            raise SetupError("The OpenRig bridge takes no herdr socket and no audio setup")
+        if herdr_socket or enable_audio or enable_portr is not None:
+            raise SetupError("The OpenRig bridge takes no herdr socket, no audio setup and no portr setting")
         steps = lambda: configure_openrig(owner, list(seats), runner, check)
         directory = config_path(OPENRIG).parent
     else:
-        steps = lambda: _configure(owner, herdr_socket, runner, check, enable_audio)
+        steps = lambda: _configure(owner, herdr_socket, runner, check, enable_audio, enable_portr)
         directory = config_path(HERDR).parent
     if check:
         return steps()
@@ -508,7 +544,9 @@ def configure_openrig(owner, seats, runner, check):
             "phone_round_trip": "requires user confirmation"}
 
 
-def _configure(owner, herdr_socket, runner, check, enable_audio):
+def _configure(owner, herdr_socket, runner, check, enable_audio, enable_portr):
+    if check and enable_portr is not None:
+        raise SetupError("--check cannot apply --portr or --no-portr")
     platform_name()
     home = Path.home()
     config_root = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")).resolve()
@@ -525,7 +563,7 @@ def _configure(owner, herdr_socket, runner, check, enable_audio):
             raise SetupError("Existing configuration belongs to a different phone; nothing was replaced")
         selected = herdr_socket or os.environ.get("HERDR_SOCKET_PATH")
         if selected and Path(selected).resolve() != Path(existing["herdr_socket"]).resolve():
-            raise SetupError("Existing configuration targets another HERDR server; nothing was replaced")
+            raise SetupError("Existing configuration targets another herdr server; nothing was replaced")
         runner([str(bridge), "--config", str(config_path), "status"])
         original_config = config_path.read_text()
         repaired_opencode = repair_opencode_bin(bridge, existing, config_path, runner, check)
@@ -537,6 +575,35 @@ def _configure(owner, herdr_socket, runner, check, enable_audio):
                 private_write(config_path, original_config)
                 raise
         checked = check_readers(bridge, config_path, runner)
+        portr_changed = False
+        if not check and enable_portr is not None and existing.get("portr_enabled", False) != enable_portr:
+            text = config_path.read_text()
+            value = str(enable_portr).lower()
+            expected = {**existing, "portr_enabled": enable_portr}
+            if "portr_enabled" in existing:
+                # Matching text can be inside a multiline setting; choose by parsed meaning.
+                pattern = r"(?m)^([ \t]*portr_enabled[ \t]*=[ \t]*)(?:true|false)([ \t]*(?:#[^\n]*)?)$"
+                for match in re.finditer(pattern, text):
+                    candidate = text[:match.start()] + match[1] + value + match[2] + text[match.end():]
+                    try:
+                        if tomllib.loads(candidate) == expected:
+                            text = candidate
+                            break
+                    except tomllib.TOMLDecodeError:
+                        continue
+                else:
+                    raise SetupError("Could not change portr_enabled; inspect the configuration")
+            else:
+                text += ("" if text.endswith("\n") else "\n") + f"portr_enabled = {value}\n"
+            if tomllib.loads(text) != expected:
+                raise SetupError("Portr setting would change other configuration; nothing was written")
+            with tempfile.TemporaryDirectory(prefix="codr-portr-check-") as temporary:
+                candidate = Path(temporary) / "config.toml"
+                candidate.write_text(text)
+                runner([str(bridge), "--config", str(candidate), "status"])
+            private_write(config_path, text)
+            existing["portr_enabled"] = enable_portr
+            portr_changed = True
         if not check:
             upgrade_transport(existing, config_root, runner)
         if not check and enable_audio:
@@ -563,9 +630,15 @@ def _configure(owner, herdr_socket, runner, check, enable_audio):
         report = {"configuration": str(config_path), "existing_configuration_preserved": True,
                   "bridge_account_id": existing["account_id_hex"], "phone_round_trip": "requires user confirmation",
                   "checked_session_readers": checked, "reader_validation": "passed" if checked else "deferred: no live supported sessions"}
-        npub = stored_npub(Path(existing["wn_agent_socket"]).parent.parent, existing["account_id_hex"])
-        if npub:
-            report["bridge_npub"] = npub
+        report["portr_enabled"] = existing.get("portr_enabled", False)
+        report["portr_restart_required"] = portr_changed
+        bootstrap_file = Path(existing["wn_agent_socket"]).parent.parent / "codr-bootstrap.json"
+        if bootstrap_file.exists():
+            bootstrap = json.loads(bootstrap_file.read_text())
+            if bootstrap.get("account_id_hex") != existing["account_id_hex"]:
+                raise SetupError("Stored bootstrap identity differs from the configured bridge account")
+            report["bridge_npub"] = bootstrap["npub"]
+            report["default_profile_status"] = bootstrap.get("default_profile_status", "preserved")
         return report
     if check:
         raise SetupError("No existing codr configuration to check")
@@ -606,10 +679,15 @@ def _configure(owner, herdr_socket, runner, check, enable_audio):
     mdk_socket = mdk_home / "dev/wn-agent.sock"
     state_path = Path(os.environ.get("XDG_STATE_HOME", home / ".local/state")) / "herdr-white-noise-bridge/state.json"
     speak_dir = speech_directory(home, HERDR)
-    manager.install(services.Service("wn-agent-herdr", "MDK transport for HERDR White Noise remote",
-        [mdk, "--home", mdk_home, "--socket", mdk_socket, "--media-allowed-root", speak_dir,
-         "--relay", "wss://relay.eu.whitenoise.chat", "--relay", "wss://relay.us.whitenoise.chat"]))
-    manager.install(services.Service("herdr-white-noise-bridge", "HERDR White Noise remote plugin worker",
+    image_spool = state_path.with_suffix(".outbound-media")
+    image_spool.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if image_spool.is_symlink() or not image_spool.is_dir() or image_spool.stat().st_mode & 0o077:
+        raise SetupError("The outbound image spool must be a private directory")
+    manager.install(services.Service("wn-agent-herdr", "MDK transport for herdr White Noise remote",
+        [mdk, "--home", mdk_home, "--socket", mdk_socket,
+         "--relay", "wss://relay.eu.whitenoise.chat", "--relay", "wss://relay.us.whitenoise.chat",
+         "--media-allowed-root", image_spool, "--media-allowed-root", speak_dir]))
+    manager.install(services.Service("herdr-white-noise-bridge", "herdr White Noise remote plugin worker",
         [bridge, "--config", config_path, "run"], environment={"PATH": services.worker_path()}))
     mdk_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     manager.reload()
@@ -620,18 +698,136 @@ def _configure(owner, herdr_socket, runner, check, enable_audio):
         "codex_home": Path(os.environ.get("CODEX_HOME", home / ".codex")).resolve(),
         "claude_home": Path(os.environ.get("CLAUDE_CONFIG_DIR", home / ".claude")).resolve(),
         "transcribe_command": transcribe_command, "speak_dir": speak_dir}
+    # Old release binaries reject unknown fields; phone-only setup needs no desktop setting.
+    if enable_portr is True:
+        values["portr_enabled"] = True
     with tempfile.TemporaryDirectory(prefix="codr-config-check-") as temporary:
         candidate = Path(temporary) / "config.toml"
         candidate.write_text(toml_text(values))
         runner([str(bridge), "--config", str(candidate), "status"])
+    result = publish_default_profile(mdk_socket, result, mdk_home / "codr-bootstrap.json")
     private_write(mdk_home / "codr-bootstrap.json", json.dumps(result, indent=2) + "\n")
     private_write(config_path, toml_text(values))
     manager.start("herdr-white-noise-bridge")
     manager.is_active(["wn-agent-herdr", "herdr-white-noise-bridge"])
     return {"configuration": str(config_path), "bridge_npub": result["npub"], "herdr_socket": str(herdr_socket),
+            "default_profile_status": result["default_profile_status"], "default_profile_name": result.get("default_profile_name"),
+            "portr_enabled": values.get("portr_enabled", False), "portr_restart_required": False,
             "detected_sessions": len(snapshot["agents"]), "supported_agents": sorted(available),
             "checked_session_readers": checked, "reader_validation": "passed" if checked else "deferred: no live supported sessions",
             "phone_round_trip": "requires user confirmation"}
+
+
+def configure_combined(config_path, messaging_home, backup, previous_connector, approved=False, runner=run):
+    """Explicit existing-account handover. Never stop services or restore account state."""
+    if not approved:
+        raise SetupError("Combined handover requires explicit approval after stopping services and backing up account credentials locally")
+    paths = [Path(p) for p in (config_path, messaging_home, backup, previous_connector)]
+    if not all(p.is_absolute() for p in paths):
+        raise SetupError("Combined handover paths must be absolute")
+    config_path, home, backup, previous_connector = [p.resolve() for p in paths]
+    if not config_path.is_file() or not home.is_dir() or not backup.is_dir() or not previous_connector.is_file():
+        raise SetupError("Existing configuration, messaging home, private backup and previous connector are required")
+    if backup.is_relative_to(home) or home.is_relative_to(backup):
+        raise SetupError("The backup must be separate from the live messaging home")
+    metadata = backup.stat()
+    if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+        raise SetupError("The backup must be private and owned by this user")
+    with setup_lock(config_path.parent):
+        config = tomllib.loads(config_path.read_text())
+        if not Path(config["state_path"]).is_absolute() or not Path(config["wn_agent_socket"]).is_absolute():
+            raise SetupError("Existing state and messaging socket paths must be absolute for managed handover")
+        state_path = Path(config["state_path"]).resolve()
+        if json.loads(state_path.read_text()).get("update_job") is not None:
+            raise SetupError("Resolve the pending independent update before service handover; do not start a second installer")
+        identity = home / "codr-bootstrap.json"
+        if not identity.is_file() or json.loads(identity.read_text()).get("account_id_hex") != config["account_id_hex"]:
+            raise SetupError("The messaging home's recorded identity does not match the existing configuration")
+        root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        manager = services.for_host(runner, private_write, root, error=SetupError)
+        old_names = ("herdr-white-noise-bridge", "wn-agent-herdr")
+        if manager.backend == services.SYSTEMD:
+            for name in (*old_names, "codr"):
+                if int(runner(["systemctl", "--user", "show", name + ".service", "--property=MainPID", "--value"]).strip() or "0"):
+                    raise SetupError("Stop both old services and any combined service before handover")
+                active = runner(["systemctl", "--user", "show", name + ".service", "--property=ActiveState", "--value"]).strip()
+                if active not in ("inactive", "failed", ""):
+                    raise SetupError("Wait for services to stop before handover")
+            for name in old_names:
+                state = runner(["systemctl", "--user", "show", name + ".service", "--property=UnitFileState", "--value"]).strip()
+                if state not in ("disabled", "masked", ""):
+                    raise SetupError("Disable the old service startup before handover")
+            old_paths = [manager.unit_root / (name + ".service") for name in old_names]
+        else:
+            if any(manager.loaded(name) for name in (*old_names, "codr")):
+                raise SetupError("Boot out old and combined launchd jobs before handover")
+            disabled = runner(["launchctl", "print-disabled", manager.domain()])
+            if any(not re.search(r'"' + re.escape(services.LABEL_PREFIX + "." + name) + r'"\s*=>\s*true', disabled) for name in old_names):
+                raise SetupError("Disable old launchd job startup before handover")
+            old_paths = [manager.path(name) for name in old_names]
+        if runner([str(previous_connector), "--version"]).strip() != f"wn-agent {MDK_VERSION}":
+            raise SetupError("The old connector is outside the supported cohort; migration needs separate approval")
+        binary = Path.home() / ".local/bin/herdr-white-noise-bridge"
+        info = json.loads(runner([str(binary), "update-info", "--full"]))
+        if ("embedded-mdk" not in info.get("runtimes", []) or info.get("storage_cohort") != "mdk-" + ".".join(MDK_VERSION.split(".")[:2])
+                or info.get("connector", {}).get("version") != MDK_VERSION):
+            raise SetupError("The installed executable is not a compatible combined runtime")
+        pairs = [(config_path, backup / "config.toml"), (state_path, backup / "state.json")]
+        if any(path.is_symlink() for path in backup.rglob("*")):
+            raise SetupError("The private backup must not link to live files")
+        source_files = set()
+        for source in home.rglob("*"):
+            if source.is_symlink():
+                raise SetupError("Symlinked account storage needs manual backup inspection")
+            if source.is_file():
+                source_files.add(source.relative_to(home))
+                pairs.append((source, backup / "mdk-home" / source.relative_to(home)))
+        saved_files = {path.relative_to(backup / "mdk-home") for path in (backup / "mdk-home").rglob("*") if path.is_file()}
+        if source_files != saved_files:
+            raise SetupError("The account backup file set differs from the stopped home")
+        pairs.extend((path, backup / "services" / path.name) for path in old_paths if path.exists())
+        if not (backup / "previous").is_file() or (backup / "previous").is_symlink():
+            raise SetupError("Keep the previous executable in the private backup")
+        if any(not saved.is_file() or saved.is_symlink() or sha256(source) != sha256(saved) for source, saved in pairs):
+            raise SetupError("The stopped private backup does not match existing account, state, config or services")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+            control.settimeout(1)
+            try:
+                control.connect(str(config["wn_agent_socket"]))
+            except (FileNotFoundError, ConnectionRefusedError):
+                pass
+            except OSError as error:
+                raise SetupError("Messaging socket ownership needs local inspection before handover") from error
+            else:
+                raise SetupError("An unmanaged messaging socket owner is still running; nothing was installed")
+        # The embedded runtime repeats socket/home ownership checks. A failed
+        # start is not permission to recreate an identity or rewind MLS state.
+        runner([str(binary), "--config", str(config_path), "status"])
+        manager.install(services.combined_service(binary, config_path, home))
+        manager.reload()
+        if manager.backend == services.SYSTEMD:
+            runner(["systemctl", "--user", "enable", "codr.service"])
+        try:
+            if manager.backend == services.LAUNCHD:
+                runner(["launchctl", "enable", manager.domain() + "/" + services.LABEL_PREFIX + ".codr"])
+            manager.start("codr")
+            manager.is_active("codr")
+            accounts = local_accounts(Path(config["wn_agent_socket"]))
+            if not any(account.get("account_id_hex") == config["account_id_hex"] and account.get("local_signing") is True for account in accounts):
+                raise SetupError("The combined service did not confirm the existing messaging identity")
+        except Exception as error:
+            try:
+                if manager.backend == services.SYSTEMD:
+                    runner(["systemctl", "--user", "stop", "codr.service"])
+                    runner(["systemctl", "--user", "disable", "codr.service"])
+                else:
+                    runner(["launchctl", "bootout", manager.domain() + "/" + services.LABEL_PREFIX + ".codr"])
+                    runner(["launchctl", "disable", manager.domain() + "/" + services.LABEL_PREFIX + ".codr"])
+            except Exception:
+                raise SetupError("Combined startup and cleanup need local inspection; account data was not restored") from error
+            raise SetupError("Combined startup failed; inspect locally before restarting compatible services. Account data was not restored") from error
+        return {"service":"codr", "configuration":str(config_path), "messaging_home":str(home),
+                "existing_configuration_preserved":True, "phone_round_trip":"requires user confirmation"}
 
 
 def main():
@@ -641,16 +837,43 @@ def main():
     parser.add_argument("--openrig", action="store_true", help="Configure the separate bridge for OpenRig seats")
     parser.add_argument("--seat", dest="seats", action="append", default=[], metavar="SEAT", help="OpenRig seat session name for the phone, such as operator-agent@kernel; repeat for each seat; implies --openrig")
     parser.add_argument("--check", action="store_true", help="Validate an existing configuration without changing services")
+    parser.add_argument("--combined-home", type=Path, help="Hand over an existing MDK account home to the single codr service")
+    parser.add_argument("--backup", type=Path, help="Private stopped backup containing mdk-home, config.toml, state.json, services and previous executable")
+    parser.add_argument("--previous-connector", type=Path, help="Existing connector executable used to verify the storage cohort")
+    parser.add_argument("--approve-handover", action="store_true", help="Confirm old services are stopped/disabled and a complete private backup includes secret-store credentials")
     audio = parser.add_mutually_exclusive_group()
     audio.add_argument("--phonon", dest="enable_audio", action="store_true", default=None, help="Install or reuse the local Phonon-2 worker, including on an existing installation")
     audio.add_argument("--no-audio", dest="enable_audio", action="store_false", help="Skip audio setup on a fresh installation")
+    desktop = parser.add_mutually_exclusive_group()
+    desktop.add_argument("--portr", dest="enable_portr", action="store_true", default=None,
+        help="Enable the optional portr desktop/SSH endpoint; does not install SSH or the desktop app")
+    desktop.add_argument("--no-portr", dest="enable_portr", action="store_false", default=None,
+        help="Disable the optional desktop endpoint (fresh installations default to disabled)")
     args = parser.parse_args()
     openrig = args.openrig or bool(args.seats)
-    if not args.npub and not config_path(OPENRIG if openrig else HERDR).exists() and sys.stdin.isatty():
+    config = config_path(OPENRIG if openrig else HERDR)
+    if not args.npub and not config.exists() and sys.stdin.isatty():
         args.npub = input("Your White Noise public npub: ").strip()
+    if not args.check and not openrig and not config.exists() and args.enable_portr is None and sys.stdin.isatty():
+        try:
+            args.enable_portr = input("Enable optional portr desktop/SSH access? [y/N]: ").strip().lower() in ("y", "yes")
+        except EOFError:
+            args.enable_portr = False
     try:
-        print(json.dumps(configure(args.npub, args.herdr_socket, check=args.check, enable_audio=args.enable_audio,
-                                   openrig=openrig, seats=args.seats), indent=2))
+        if args.combined_home is not None:
+            if openrig or args.check or args.backup is None or args.previous_connector is None or args.enable_portr is not None or args.enable_audio is not None or args.npub or args.herdr_socket:
+                raise SetupError("Use --combined-home with --backup, --previous-connector and --approve-handover; do not combine it with other setup changes")
+            print(json.dumps(configure_combined(config, args.combined_home, args.backup, args.previous_connector, args.approve_handover), indent=2))
+            return 0
+        if not openrig and not args.check and tuple(map(int, version().split("."))) >= (0, 10, 0):
+            raise SetupError("0.10 uses one combined service. For an existing account, use the approved --combined-home handover. Fresh identity setup remains available through 0.9 local setup before handover.")
+        report = configure(args.npub, args.herdr_socket, check=args.check, enable_audio=args.enable_audio,
+                           enable_portr=args.enable_portr, openrig=openrig, seats=args.seats)
+        print(json.dumps(report, indent=2))
+        if report.get("default_profile_status") == "unconfirmed":
+            print("Default profile publication was not confirmed. The existing identity was kept; inspect its profile before trying another publication. Phone setup can still be used.")
+        if report.get("portr_restart_required"):
+            print("Portr setting saved. Apply it by restarting only the codr worker after all active work is idle. Setup did not restart the worker for this setting.")
         print("Accept a verified bridge invitation in White Noise, then send /status and a harmless test prompt.")
     except (SetupError, InstallError, OSError, ValueError, KeyError) as error:
         print(f"codr setup: {error}", file=sys.stderr)

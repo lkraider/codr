@@ -108,7 +108,7 @@ impl Socket {
         } else {
             ensure!(
                 ack["result"]["type"] == "subscription_started",
-                "HERDR subscription rejected"
+                "herdr subscription rejected"
             );
         }
         Ok(reader)

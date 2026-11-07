@@ -27,6 +27,7 @@ pub(super) fn snapshot(
     let mut turns = std::collections::BTreeSet::new();
     let mut has_started_turn = false;
     let mut user_inputs = Vec::new();
+    let mut recent_messages = Vec::new();
     native::records(&path, |row| {
         tasks.codex_record(&row);
         let payload = &row["payload"];
@@ -36,6 +37,13 @@ pub(super) fn snapshot(
                 "codex:user:{}:{}",
                 user_inputs.len(),
                 row["timestamp"].as_str().unwrap_or("")
+            );
+            super::record_message(
+                &mut recent_messages,
+                "You",
+                &id,
+                text,
+                super::source_timestamp(&row["timestamp"]),
             );
             user_inputs
                 .push(crate::activity::UserInput::new(id, text).in_turn(latest_turn.clone()));
@@ -94,6 +102,13 @@ pub(super) fn snapshot(
             .ok_or_else(|| anyhow::anyhow!("Codex completion lacks its turn ID"))?;
         let id = format!("codex:{turn}");
         if seen.insert(id.clone()) {
+            super::record_message(
+                &mut recent_messages,
+                "Agent",
+                &id,
+                text,
+                super::source_timestamp(&row["timestamp"]),
+            );
             replies.push(FinalMessage {
                 turn: Some(id.clone()),
                 id,
@@ -108,10 +123,13 @@ pub(super) fn snapshot(
     );
     Ok((
         super::SessionHistory {
+            activity_at: native::modified_at(&path),
             finals: replies,
             latest_turn,
             turns: turns.into_iter().collect(),
             user_inputs,
+            recent_messages: recent_messages[recent_messages.len().saturating_sub(3)..].to_vec(),
+            last_messages: recent_messages,
         },
         tasks.latest,
     ))

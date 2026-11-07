@@ -22,6 +22,14 @@ spec.loader.exec_module(setup)
 
 
 class InstallerTests(unittest.TestCase):
+    def test_combined_release_installs_one_executable_without_a_connector_download(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.dict(os.environ, {"HOME":temporary}), patch.object(installer,"version",return_value="0.10.0"), patch.object(installer,"platform_name",return_value="linux-x86_64"), patch.object(installer,"install_bundle") as install:
+                self.assertEqual(installer.main(),0)
+            self.assertEqual(install.call_count,1)
+            self.assertIn("codr-v0.10.0-linux-x86_64.tar.gz",install.call_args.args[0])
+            self.assertEqual(install.call_args.args[1],"herdr-white-noise-bridge")
+
     def test_release_installs_its_dedicated_connector_before_the_bridge(self):
         with tempfile.TemporaryDirectory() as temporary:
             with patch.dict(os.environ, {"HOME": temporary}), patch.object(installer, "version", return_value="0.6.0"), patch.object(installer, "platform_name", return_value="linux-x86_64"), patch.object(installer, "install_bundle") as install:
@@ -90,14 +98,215 @@ class InstallerTests(unittest.TestCase):
 
 
 class ManifestTests(unittest.TestCase):
-    def test_manifest_declares_both_host_platforms(self):
+    def test_release_manifest_declares_linux_and_macos_and_matches_the_package_version(self):
         manifest = setup.tomllib.loads((SCRIPTS.parent / "herdr-plugin.toml").read_text())
-        self.assertIn("linux", manifest["platforms"])
-        self.assertIn("macos", manifest["platforms"])
+        self.assertEqual(manifest["platforms"], ["linux", "macos"])
         self.assertEqual(manifest["version"], setup.tomllib.loads((SCRIPTS.parent / "Cargo.toml").read_text())["package"]["version"])
 
 
 class SetupTests(unittest.TestCase):
+    def test_new_bridge_identity_publishes_the_alien_display_name(self):
+        opencode = self.home / ".local/bin/opencode"
+        opencode.write_text("fixture")
+        opencode.chmod(0o700)
+        def find(name, candidates=()):
+            return str(opencode) if name == "opencode" else "/usr/bin/" + name
+        with self.mocks(), patch.object(setup, "find_executable", side_effect=find):
+            report = setup.configure("npub1fixture", self.socket, self.runner)
+        self.assertEqual(self.profile_calls, [{"marmot_agent_control":"marmot.agent-control.v2", "type":"account_publish_profile", "account_id_hex":"ab" * 32, "name":"👾", "display_name":"👾"}])
+        self.assertEqual(report["default_profile_status"], "published")
+        self.assertEqual(report["default_profile_name"], "👾")
+        self.assertEqual(setup.tomllib.loads(self.config.read_text())["account_id_hex"], "ab" * 32)
+        stored = json.loads((self.home / ".marmot-agents/herdr/codr-bootstrap.json").read_text())
+        self.assertEqual(stored["label"], "herdr-bridge")
+        self.assertEqual(stored["default_profile_status"], "published")
+        self.assertEqual(stored["default_profile_name"], "👾")
+        self.profile_calls.clear()
+        with self.mocks(), patch.object(setup, "find_executable", side_effect=find):
+            setup.configure(None, self.socket, self.runner)
+            setup.configure(None, self.socket, self.runner, check=True)
+        self.assertEqual(self.profile_calls, [])
+
+    def test_reused_bridge_account_keeps_its_existing_profile(self):
+        account={"label":"herdr-bridge","account_id_hex":"ab" * 32,"local_signing":True}
+        with self.mocks(), patch.object(setup, "local_accounts", return_value=[account]):
+            report=setup.configure("npub1fixture", self.socket, self.runner)
+        self.assertEqual(self.profile_calls, [])
+        self.assertEqual(report["default_profile_status"], "preserved")
+
+    def test_an_unconfirmed_profile_is_reported_and_not_republished_on_setup_retry(self):
+        def unavailable(path, payload):
+            self.profile_calls.append(payload)
+            raise TimeoutError("lost acknowledgement")
+        with self.mocks(), patch.object(setup, "control_request", side_effect=unavailable):
+            report=setup.configure("npub1fixture", self.socket, self.runner)
+        self.assertEqual(report["default_profile_status"], "unconfirmed")
+        self.assertEqual(len(self.profile_calls), 1)
+        self.config.unlink()  # Synthetic interrupted setup; no live configuration is used.
+        account={"label":"herdr-bridge","account_id_hex":"ab" * 32,"local_signing":True}
+        with self.mocks(), patch.object(setup, "local_accounts", return_value=[account]):
+            report=setup.configure("npub1fixture", self.socket, self.runner)
+        self.assertEqual(len(self.profile_calls), 1)
+        self.assertEqual(report["default_profile_status"], "unconfirmed")
+
+    def test_profile_acknowledgements_must_match_protocol_identity_and_name(self):
+        good={"marmot_agent_control":"marmot.agent-control.v2","type":"profile_published","account_id_hex":"ab" * 32,"name":"👾","display_name":"👾"}
+        for field,wrong in [("marmot_agent_control","wrong"),("type","ack"),("account_id_hex","99" * 32),("name","Other"),("display_name","Other")]:
+            with self.subTest(field=field), patch.object(setup,"control_request",return_value={**good,field:wrong}) as request:
+                path=self.home / f"profile-{field}.json"
+                result=setup.publish_default_profile(self.socket,{"account_id_hex":"ab" * 32,"created":True},path)
+                self.assertEqual(result["default_profile_status"],"unconfirmed")
+                result=setup.publish_default_profile(self.socket,{"account_id_hex":"ab" * 32,"created":True},path)
+                self.assertEqual(result["default_profile_status"],"unconfirmed")
+                self.assertEqual(request.call_count,1)
+
+    def test_profile_publication_requires_a_saved_intent(self):
+        with patch.object(setup,"private_write",side_effect=OSError("cannot save intent")), patch.object(setup,"control_request") as request:
+            with self.assertRaises(OSError):
+                setup.publish_default_profile(self.socket,{"account_id_hex":"ab" * 32,"created":True},self.home / "profile.json")
+        request.assert_not_called()
+
+    def test_pending_profile_intent_is_not_republished_after_a_crash(self):
+        path = self.home / "profile-pending.json"
+        path.write_text(json.dumps({"account_id_hex":"ab" * 32,"default_profile_status":"pending","default_profile_name":"Pat"}))
+        with patch.object(setup, "control_request") as request:
+            result = setup.publish_default_profile(self.socket, {"account_id_hex":"ab" * 32,"created":True}, path)
+        self.assertEqual(result["default_profile_status"], "unconfirmed")
+        self.assertEqual(result["default_profile_name"], "Pat")
+        request.assert_not_called()
+
+    def test_profile_record_cannot_be_reused_for_another_identity(self):
+        path = self.home / "profile-other.json"
+        path.write_text(json.dumps({"account_id_hex":"99" * 32,"default_profile_status":"published"}))
+        with patch.object(setup, "control_request") as request:
+            with self.assertRaises(setup.SetupError):
+                setup.publish_default_profile(self.socket, {"account_id_hex":"ab" * 32,"created":True}, path)
+        request.assert_not_called()
+
+    def test_fresh_portr_access_is_off_unless_explicitly_selected(self):
+        with self.mocks():
+            report = setup.configure("npub1fixture", self.socket, self.runner)
+        self.assertIs(setup.tomllib.loads(self.config.read_text()).get("portr_enabled", False), False)
+        self.assertIs(report["portr_enabled"], False)
+
+    def test_portr_opt_in_does_not_install_or_configure_ssh(self):
+        with self.mocks():
+            report = setup.configure("npub1fixture", self.socket, self.runner, enable_portr=True)
+        self.assertIs(setup.tomllib.loads(self.config.read_text())["portr_enabled"], True)
+        self.assertIs(report["portr_enabled"], True)
+        self.assertFalse(report["portr_restart_required"])
+        self.assertFalse(any(Path(call[0]).name in {"ssh", "sshd", "ssh-keygen"} for call in self.calls))
+
+    def test_phone_only_config_remains_readable_by_releases_without_desktop_fields(self):
+        with self.mocks():
+            setup.configure("npub1fixture", self.socket, self.runner, enable_portr=False)
+        self.assertNotIn("portr_enabled", setup.tomllib.loads(self.config.read_text()))
+
+    def test_existing_portr_preference_is_preserved_without_an_option(self):
+        with self.mocks():
+            setup.configure("npub1fixture", self.socket, self.runner, enable_portr=True)
+            before = self.config.read_bytes()
+            report = setup.configure(None, self.socket, self.runner)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertIs(report["portr_enabled"], True)
+        self.assertFalse(report["portr_restart_required"])
+        self.assertEqual(self.bootstrap_count, 1)
+
+    def test_existing_portr_option_changes_only_the_setting_without_restarting(self):
+        with self.mocks():
+            setup.configure("npub1fixture", self.socket, self.runner, enable_portr=True)
+            original = self.config.read_text() + "# Keep this comment\n"
+            self.config.write_text(original)
+            for enabled in [False, True]:
+                self.calls.clear()
+                previous = setup.tomllib.loads(self.config.read_text())["portr_enabled"]
+                report = setup.configure(None, self.socket, self.runner, enable_portr=enabled)
+                original = original.replace(f"portr_enabled = {str(previous).lower()}", f"portr_enabled = {str(enabled).lower()}")
+                self.assertEqual(self.config.read_text(), original)
+                self.assertIs(report["portr_enabled"], enabled)
+                self.assertTrue(report["portr_restart_required"])
+                self.assertFalse(any("restart" in call or "stop" in call for call in self.calls))
+        self.assertEqual(self.bootstrap_count, 1)
+
+    def test_check_cannot_apply_a_portr_choice(self):
+        with self.mocks():
+            setup.configure("npub1fixture", self.socket, self.runner)
+            before = self.config.read_bytes()
+            self.calls.clear()
+            with self.assertRaises(setup.SetupError):
+                setup.configure(None, self.socket, self.runner, check=True, enable_portr=True)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(self.calls, [])
+
+    def test_portr_update_preserves_an_inline_comment_and_validates_before_writing(self):
+        with self.mocks():
+            setup.configure("npub1fixture", self.socket, self.runner, enable_portr=True)
+            original = self.config.read_text().replace("portr_enabled = true", "portr_enabled = false  # optional desktop")
+            self.config.write_text(original)
+            def fail_candidate(argv):
+                if any("codr-portr-check-" in str(arg) for arg in argv):
+                    raise setup.SetupError("Invalid candidate")
+                return self.runner(argv)
+            with self.assertRaises(setup.SetupError):
+                setup.configure(None, self.socket, fail_candidate, enable_portr=True)
+            self.assertEqual(self.config.read_text(), original)
+            setup.configure(None, self.socket, self.runner, enable_portr=True)
+        self.assertEqual(self.config.read_text(), original.replace("portr_enabled = false", "portr_enabled = true"))
+
+    def test_old_configs_remain_disabled_and_can_explicitly_add_portr(self):
+        with self.mocks():
+            setup.configure("npub1fixture", self.socket, self.runner)
+            original = self.config.read_text().replace("portr_enabled = false\n", "") + "# retained\n"
+            self.config.write_text(original)
+            report = setup.configure(None, self.socket, self.runner)
+            self.assertFalse(report["portr_enabled"])
+            self.assertEqual(self.config.read_text(), original)
+            setup.configure(None, self.socket, self.runner, enable_portr=True)
+        self.assertEqual(self.config.read_text(), original + "portr_enabled = true\n")
+
+    def test_portr_setting_inside_a_multiline_command_is_not_changed(self):
+        with self.mocks():
+            setup.configure("npub1fixture", self.socket, self.runner, enable_portr=True)
+            original = self.config.read_text()
+            setting = next(line for line in original.splitlines() if line.startswith("transcribe_command ="))
+            original = original.replace(setting, 'transcribe_command = ["/usr/bin/python3", "-c", \'\'\'\nportr_enabled = true\nprint("keep this command")\n\'\'\']')
+            self.config.write_text(original)
+            before = setup.tomllib.loads(original)
+            report = setup.configure(None, self.socket, self.runner, enable_portr=False)
+        after = setup.tomllib.loads(self.config.read_text())
+        self.assertFalse(after["portr_enabled"])
+        self.assertEqual(after["transcribe_command"], before["transcribe_command"])
+        self.assertEqual(after, {**before, "portr_enabled": False})
+        self.assertFalse(report["portr_enabled"])
+
+    def test_setup_cli_portr_selection_is_explicit_and_defaults_to_unspecified(self):
+        for arguments, expected in [([], None), (["--portr"], True), (["--no-portr"], False)]:
+            with self.subTest(arguments=arguments), patch.object(setup, "version", return_value="0.9.0"), patch.object(setup.sys, "argv", ["setup.py", "--npub", "npub1fixture", *arguments]), patch.object(setup.sys.stdin, "isatty", return_value=False), patch.object(setup, "configure", return_value={}) as configure, patch.object(setup.sys, "stdout", io.StringIO()):
+                self.assertEqual(setup.main(), 0)
+                self.assertIs(configure.call_args.kwargs["enable_portr"], expected)
+
+    def test_interactive_fresh_setup_offers_portr_with_no_as_the_default(self):
+        for answer, expected in [("", False), ("n", False), ("yes", True)]:
+            with self.subTest(answer=answer), patch.object(setup, "version", return_value="0.9.0"), patch.object(setup.sys, "argv", ["setup.py", "--npub", "npub1fixture"]), patch.object(setup.sys.stdin, "isatty", return_value=True), patch("builtins.input", return_value=answer) as prompt, patch.object(setup, "configure", return_value={}) as configure, patch.object(setup.sys, "stdout", io.StringIO()):
+                self.assertEqual(setup.main(), 0)
+                prompt.assert_called_once()
+                self.assertIn("[y/N]", prompt.call_args.args[0])
+                self.assertIs(configure.call_args.kwargs["enable_portr"], expected)
+
+    def test_existing_interactive_setup_does_not_prompt_for_portr_again(self):
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text("# existing setup\n")
+        with patch.object(setup, "version", return_value="0.9.0"), patch.object(setup.sys, "argv", ["setup.py"]), patch.object(setup.sys.stdin, "isatty", return_value=True), patch("builtins.input") as prompt, patch.object(setup, "configure", return_value={}) as configure, patch.object(setup.sys, "stdout", io.StringIO()):
+            self.assertEqual(setup.main(), 0)
+            prompt.assert_not_called()
+            self.assertIsNone(configure.call_args.kwargs["enable_portr"])
+
+    def test_combined_version_refuses_legacy_two_service_setup(self):
+        with patch.object(setup, "version", return_value="0.10.0"), patch.object(setup.sys, "argv", ["setup.py", "--npub", "npub1fixture"]), patch.object(setup.sys.stdin, "isatty", return_value=False), patch.object(setup, "configure") as configure, patch.object(setup.sys, "stderr", io.StringIO()) as errors:
+            self.assertEqual(setup.main(), 1)
+            configure.assert_not_called()
+            self.assertIn("--combined-home", errors.getvalue())
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.home = Path(self.temporary.name)
@@ -111,13 +320,14 @@ class SetupTests(unittest.TestCase):
         self.socket = self.home / "named-herdr.sock"
         self.calls = []
         self.bootstrap_count = 0
+        self.profile_calls = []
         self.config = self.home / "config space %/herdr-white-noise-bridge/config.toml"
 
     def runner(self, argv):
         self.calls.append([str(a) for a in argv])
         if "bootstrap" in argv:
             self.bootstrap_count += 1
-            return json.dumps({"account_id_hex": "ab" * 32, "npub": "npub1bridge", "label": "herdr-bridge", "key_package_published": True})
+            return json.dumps({"account_id_hex": "ab" * 32, "npub": "npub1bridge", "label": "herdr-bridge", "key_package_published": True, "created":"--no-create" not in argv})
         if "--version" in argv:
             return f"wn-agent {setup.MDK_VERSION}"
         if "check-readers" in argv:
@@ -130,7 +340,13 @@ class SetupTests(unittest.TestCase):
             ensure_mdk=lambda runner: Path("/usr/bin/wn-agent"),
             read_snapshot=lambda path: {"agents": []},
             local_accounts=lambda path: [],
+            control_request=self.profile_control,
             configure_phonon=lambda *args: ["/usr/bin/python3", "/example/transcribe.py", "--socket", "/example/phonon.sock"])
+
+    def profile_control(self, path, payload):
+        self.profile_calls.append(payload)
+        self.assertEqual(payload["type"], "account_publish_profile")
+        return {"marmot_agent_control":"marmot.agent-control.v2","type":"profile_published","account_id_hex":payload["account_id_hex"],"name":"👾","display_name":"👾"}
 
     def test_connector_selection_uses_the_release_owned_path_not_a_shared_executable(self):
         dedicated = installer.connector_path(installer.version())
@@ -139,8 +355,8 @@ class SetupTests(unittest.TestCase):
             dedicated.parent.mkdir(parents=True, exist_ok=True)
             dedicated.write_text("fixture")
         with patch.object(setup, "install_connector", side_effect=install) as download:
-            self.assertEqual(setup.ensure_mdk(lambda argv: "wn-agent 0.13.0"), dedicated)
-            self.assertEqual(setup.ensure_mdk(lambda argv: "wn-agent 0.13.0"), dedicated)
+            self.assertEqual(setup.ensure_mdk(lambda argv: f"wn-agent {setup.MDK_VERSION}"), dedicated)
+            self.assertEqual(setup.ensure_mdk(lambda argv: f"wn-agent {setup.MDK_VERSION}"), dedicated)
             self.assertEqual(download.call_count, 1)
 
     def test_managed_transport_upgrade_changes_only_the_executable(self):
@@ -260,7 +476,22 @@ class SetupTests(unittest.TestCase):
         calls = []
         def runner(argv):
             calls.append(argv)
-            return "wn-agent 0.14.0" if "--version" in argv else ""
+            return "wn-agent 0.15.0" if "--version" in argv else ""
+        with patch.object(setup, "ensure_mdk", return_value=installer.connector_path(installer.version())):
+            with self.assertRaisesRegex(setup.SetupError, "supported MDK cohort"):
+                setup.upgrade_transport(setup.tomllib.loads(self.config.read_text()), self.config.parents[1], runner)
+        self.assertEqual(unit.read_bytes(), original)
+        self.assertFalse(any("stop" in argv for argv in calls))
+
+    def test_013_storage_requires_manual_migration_before_services_are_stopped(self):
+        with self.mocks():
+            setup.configure("npub1fixture", self.socket, self.runner)
+        unit = self.config.parents[1] / "systemd/user/wn-agent-herdr.service"
+        original = unit.read_bytes()
+        calls = []
+        def runner(argv):
+            calls.append(argv)
+            return "wn-agent 0.13.0" if "--version" in argv else ""
         with patch.object(setup, "ensure_mdk", return_value=installer.connector_path(installer.version())):
             with self.assertRaisesRegex(setup.SetupError, "supported MDK cohort"):
                 setup.upgrade_transport(setup.tomllib.loads(self.config.read_text()), self.config.parents[1], runner)
@@ -471,6 +702,15 @@ class SetupTests(unittest.TestCase):
         plist = plistlib.loads((agents / "io.github.tidley.codr.herdr-white-noise-bridge.plist").read_bytes())
         self.assertIn("--config", plist["ProgramArguments"])
         self.assertEqual(plist["KeepAlive"], {"SuccessfulExit": False})
+
+    def test_fresh_setup_allows_only_the_private_outbound_image_spool(self):
+        with self.mocks():
+            setup.configure("npub1fixture", self.socket, self.runner)
+        config = setup.tomllib.loads(self.config.read_text())
+        spool = Path(config["state_path"]).with_suffix(".outbound-media")
+        unit = self.config.parents[1] / "systemd/user/wn-agent-herdr.service"
+        self.assertIn(setup.unit_argument("--media-allowed-root") + " " + setup.unit_argument(spool), unit.read_text())
+        self.assertEqual(spool.stat().st_mode & 0o777, 0o700)
 
     def test_broken_unrelated_cli_does_not_block_an_observed_native_agent(self):
         def find(name, candidates=()):

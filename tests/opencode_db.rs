@@ -38,6 +38,182 @@ fn complete() -> Value {
 }
 
 #[test]
+fn database_projection_keeps_last_replay_bounded_and_recent_at_three() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("opencode.db");
+    let db = database(&path);
+    for i in 0..105 {
+        let id = format!("user{i:03}");
+        message(&db, &id, i, json!({"role":"user"}));
+        part(
+            &db,
+            &format!("text{i:03}"),
+            &id,
+            json!({"type":"text","text":format!("Message{i:03}")}),
+        );
+    }
+    let snapshot = Reader::default()
+        .read(&path, "ses_fixture")
+        .unwrap()
+        .snapshot;
+    assert_eq!(snapshot.history.recent_messages.len(), 3);
+    assert_eq!(snapshot.history.last_messages.len(), 100);
+    assert!(snapshot.history.last(4).unwrap().contains("Message101"));
+    assert!(!snapshot.history.last(4).unwrap().contains("Message100"));
+    assert!(snapshot.history.last(100).unwrap().contains("Message005"));
+    assert!(!snapshot.history.last(100).unwrap().contains("Message004"));
+}
+
+#[test]
+fn recent_excerpt_uses_the_database_creation_clock_when_json_has_no_creation_time() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("opencode.db");
+    let db = database(&path);
+    message(&db, "answer", 1_793_189_594_000, complete());
+    part(
+        &db,
+        "text",
+        "answer",
+        json!({"type":"text","text":"Answer"}),
+    );
+    let mut reader = Reader::default();
+    assert_eq!(
+        reader
+            .read(&path, "ses_fixture")
+            .unwrap()
+            .snapshot
+            .history
+            .catch_up()
+            .as_deref(),
+        Some("**Agent:**\n_2026-10-28 12:13:14 UTC_\nAnswer")
+    );
+}
+
+#[test]
+fn sync_excerpt_tracks_database_user_and_assistant_messages_after_updates() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("opencode.db");
+    let db = database(&path);
+    for (id, role, text, at) in [
+        ("old", "user", "Old prompt", 1),
+        ("first", "assistant", "Earlier answer", 2),
+        ("question", "user", "Follow-up", 3),
+        ("last", "assistant", "Latest answer", 4),
+    ] {
+        message(
+            &db,
+            id,
+            at,
+            if role == "assistant" {
+                complete()
+            } else {
+                json!({"role":role})
+            },
+        );
+        part(&db, id, id, json!({"type":"text","text":text}));
+    }
+    let mut reader = Reader::default();
+    assert_eq!(
+        reader
+            .read(&path, "ses_fixture")
+            .unwrap()
+            .snapshot
+            .history
+            .catch_up()
+            .as_deref(),
+        Some(
+            "**Agent:**\n_1970-01-01 00:00:00 UTC_\nEarlier answer\n\n---\n\n**You:**\n_1970-01-01 00:00:00 UTC_\nFollow-up\n\n---\n\n**Agent:**\n_1970-01-01 00:00:00 UTC_\nLatest answer"
+        )
+    );
+    part(
+        &db,
+        "last",
+        "last",
+        json!({"type":"text","text":"Updated answer"}),
+    );
+    event(
+        &db,
+        1,
+        "message.part.updated.1",
+        json!({"part":{"messageID":"last"}}),
+    );
+    assert_eq!(
+        reader
+            .read(&path, "ses_fixture")
+            .unwrap()
+            .snapshot
+            .history
+            .catch_up()
+            .as_deref(),
+        Some(
+            "**Agent:**\n_1970-01-01 00:00:00 UTC_\nEarlier answer\n\n---\n\n**You:**\n_1970-01-01 00:00:00 UTC_\nFollow-up\n\n---\n\n**Agent:**\n_1970-01-01 00:00:00 UTC_\nUpdated answer"
+        )
+    );
+}
+
+/// Sync recency includes database content changes, even when message JSON clocks are old.
+#[test]
+fn sync_activity_tracks_message_and_part_update_columns() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("opencode.db");
+    let db = database(&path);
+    message(&db, "reply", 1, complete());
+    part(&db, "text", "reply", json!({"type":"text","text":"reply"}));
+    let mut reader = Reader::default();
+    assert_eq!(
+        reader
+            .read(&path, "ses_fixture")
+            .unwrap()
+            .snapshot
+            .history
+            .activity_at,
+        Some(0)
+    );
+    db.execute("UPDATE message SET time_updated=12345000", [])
+        .unwrap();
+    event(&db, 1, "message.updated.1", json!({"info":{"id":"reply"}}));
+    assert_eq!(
+        reader
+            .read(&path, "ses_fixture")
+            .unwrap()
+            .snapshot
+            .history
+            .activity_at,
+        Some(12345)
+    );
+    db.execute("UPDATE part SET time_updated=23456000", [])
+        .unwrap();
+    event(
+        &db,
+        2,
+        "message.part.updated.1",
+        json!({"part":{"messageID":"reply"}}),
+    );
+    assert_eq!(
+        reader
+            .read(&path, "ses_fixture")
+            .unwrap()
+            .snapshot
+            .history
+            .activity_at,
+        Some(23456)
+    );
+    db.execute_batch(
+        "ALTER TABLE message DROP COLUMN time_updated; ALTER TABLE part DROP COLUMN time_updated;",
+    )
+    .unwrap();
+    assert_eq!(
+        Reader::default()
+            .read(&path, "ses_fixture")
+            .unwrap()
+            .snapshot
+            .history
+            .activity_at,
+        Some(0)
+    );
+}
+
+#[test]
 fn attachment_only_database_input_is_complete_local_activity() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("opencode.db");
@@ -587,6 +763,17 @@ async fn worker_uses_sqlite_without_a_cli_and_restart_keeps_final_deduplication(
             .final_ids
             .contains(&"new".into())
     );
+    let received = bridge.state.mappings[&agent.key()].last_received_at;
+    assert!(received > 0, "new replies record observation time");
+    // Use a distinct persisted time so a same-second rewrite cannot pass.
+    let received = 1;
+    bridge
+        .state
+        .mappings
+        .get_mut(&agent.key())
+        .unwrap()
+        .last_received_at = received;
+    bridge.save().unwrap();
     drop(bridge);
     let mut bridge = Bridge::open(config).unwrap();
     bridge
@@ -603,6 +790,11 @@ async fn worker_uses_sqlite_without_a_cli_and_restart_keeps_final_deduplication(
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(bridge.state.mappings[&agent.key()].last_export_at > 0);
+    assert_eq!(
+        bridge.state.mappings[&agent.key()].last_received_at,
+        received,
+        "unchanged history and restarts retain the original reply time"
+    );
     assert_eq!(
         bridge
             .state

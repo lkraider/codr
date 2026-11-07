@@ -6,7 +6,7 @@ use herdr_white_noise_bridge::{
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(version, about = "White Noise remote for local HERDR agent sessions")]
+#[command(version, about = "White Noise remote for local herdr agent sessions")]
 struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
@@ -16,12 +16,37 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Run in the foreground. HERDR starts this worker through the plugin manifest.
-    Run,
+    /// Print the worker's version and update compatibility cohort without opening state.
+    UpdateInfo {
+        /// Include combined-runtime capabilities for 0.10 and newer helpers.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Run in the foreground. herdr starts this worker through the plugin manifest.
+    Run {
+        /// Enable the optional same-user portr desktop endpoint for this run.
+        #[arg(long = "portr", alias = "porter", conflicts_with = "no_porter")]
+        porter: bool,
+        /// Disable the portr endpoint, including when enabled in configuration.
+        #[arg(long = "no-portr", alias = "no-porter")]
+        no_porter: bool,
+        /// Host MDK messaging inside this process using an existing account home.
+        /// Stop the external connector and back up its home before handover.
+        #[arg(long)]
+        messaging_home: Option<PathBuf>,
+    },
+    /// Forward desktop JSON requests to the running plugin.
+    Porter {
+        /// Keep stdin/stdout open for multiplexed requests and change notifications.
+        #[arg(long)]
+        stream: bool,
+    },
     /// Print public routing state without message contents.
     Status,
     /// Validate live session history readers without changing bridge state.
     CheckReaders,
+    /// Approve a paused replacement after inspection. Stop only the worker first.
+    ConfirmSessionChange { key: String },
     /// Control global White Noise forwarding without stopping the worker.
     Forwarding {
         #[arg(value_enum, default_value = "status")]
@@ -61,6 +86,15 @@ enum ForwardingMode {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(Action::UpdateInfo { full }) = &args.command {
+        let mut info = herdr_white_noise_bridge::update::info()?;
+        if !full {
+            info.as_object_mut().unwrap().remove("runtimes");
+            info.as_object_mut().unwrap().remove("storage_cohort");
+        }
+        println!("{info}");
+        return Ok(());
+    }
     let config_path = args.config.unwrap_or_else(|| {
         let root = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -70,6 +104,13 @@ async fn main() -> Result<()> {
         root.join("herdr-white-noise-bridge/config.toml")
     });
     let config = BridgeConfig::load(&config_path)?;
+    if let Some(Action::Porter { stream }) = &args.command {
+        return if *stream {
+            herdr_white_noise_bridge::porter::forward_stream(&config.state_path).await
+        } else {
+            herdr_white_noise_bridge::porter::forward(&config.state_path).await
+        };
+    }
     if matches!(args.command, Some(Action::CheckReaders)) {
         let checked = check_readers(config).await?;
         println!("{}", serde_json::json!({"checked_sessions":checked}));
@@ -106,7 +147,7 @@ async fn main() -> Result<()> {
         for (key, m) in s.mappings {
             println!(
                 "{}",
-                serde_json::json!({"session":key,"group":m.group_id_hex,"creating_uncertain":m.creating,"active":m.active,"state":m.last_agent_status,"pending_prompt":m.pending_prompt,"forwarding_enabled":forwarding_enabled,"forwarding_resume_pending":resume_pending})
+                serde_json::json!({"session":key,"group":m.group_id_hex,"control":m.control,"creating_uncertain":m.creating,"active":m.active,"state":m.last_agent_status,"session_change_from":m.session_change_from,"pending_prompt":m.pending_prompt,"queued_prompts":m.prompt_queue.len(),"queue_submission_uncertain":m.queue_flight.as_ref().is_some_and(|flight| !flight.confirmed),"native_acceptance_pending":m.submissions.len(),"native_acceptance_overdue":m.submissions.iter().filter(|submission| submission.overdue(herdr_white_noise_bridge::bridge::now())).count(),"unresolved_progress":s.outbox.iter().filter(|item| Some(&item.group)==m.group_id_hex.as_ref() && item.response.as_ref().is_some_and(|delivery| delivery.finished && delivery.target.is_none() && delivery.initial_text.is_some() && !delivery.durable)).count(),"forwarding_enabled":forwarding_enabled,"forwarding_resume_pending":resume_pending})
             );
         }
         return Ok(());
@@ -135,8 +176,48 @@ async fn main() -> Result<()> {
     }
     let _lock = state::lock(&config.state_path)?;
     let mut bridge = Bridge::open(config)?;
-    match args.command.unwrap_or(Action::Run) {
-        Action::Run => bridge.run().await,
+    bridge.update_config_path = Some(std::fs::canonicalize(config_path)?);
+    match args.command.unwrap_or(Action::Run {
+        porter: false,
+        no_porter: false,
+        messaging_home: None,
+    }) {
+        Action::Run {
+            porter,
+            no_porter,
+            messaging_home,
+        } => {
+            let messaging_home = messaging_home
+                .map(|home| -> Result<PathBuf> {
+                    anyhow::ensure!(home.is_absolute(), "Messaging home must be absolute");
+                    Ok(std::fs::canonicalize(home)?)
+                })
+                .transpose()?;
+            bridge.update_messaging_home = messaging_home.clone();
+            let messaging = match messaging_home {
+                Some(home) => Some(
+                    herdr_white_noise_bridge::messaging::EmbeddedMessaging::start(
+                        &bridge.config,
+                        home,
+                    )
+                    .await?,
+                ),
+                None => None,
+            };
+            let enabled = !no_porter && (porter || bridge.config.portr_enabled);
+            let result = tokio::select! {
+                result = bridge.run(enabled) => result,
+                result = terminate_signal() => {
+                    result?;
+                    bridge.save()
+                }
+            };
+            if let Some(messaging) = messaging {
+                messaging.shutdown().await?;
+            }
+            result
+        }
+        Action::Porter { .. } | Action::UpdateInfo { .. } => unreachable!(),
         Action::ResolveCreate { key, group, retry } => {
             let m = bridge
                 .state
@@ -169,6 +250,8 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("Unknown session key"))?;
             mapping.pending_prompt = false;
             mapping.completion_pending = false;
+            mapping.queue_flight = None;
+            mapping.submissions.clear();
             if let Some(decision) = mapping.decision.as_mut() {
                 decision.submitted = false;
                 decision.announced = false;
@@ -188,6 +271,7 @@ async fn main() -> Result<()> {
             }
             bridge.save()
         }
+        Action::ConfirmSessionChange { key } => bridge.confirm_session_change(&key).await,
         Action::RenameGroups => bridge.rename_groups().await,
         Action::Status => unreachable!(),
         Action::CheckReaders => unreachable!(),
@@ -231,11 +315,18 @@ fn notify_groups(
     let groups: Vec<_> = state
         .mappings
         .values()
+        .filter(|m| !m.control)
         .filter_map(|m| m.group_id_hex.clone())
         .filter(|id| group.is_none_or(|g| g == id))
         .collect();
     anyhow::ensure!(!groups.is_empty(), "No mapped groups exist yet");
     Ok(groups)
+}
+
+async fn terminate_signal() -> Result<()> {
+    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    signal.recv().await;
+    Ok(())
 }
 
 async fn check_readers(config: BridgeConfig) -> Result<usize> {

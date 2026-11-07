@@ -50,6 +50,121 @@ impl UserInput {
     }
 }
 
+/// Terminal delivery is not native acceptance. Keep an independent, private
+/// receipt until an unambiguous new native input has the submitted fingerprint.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Submission {
+    pub receipt: String,
+    before: Option<Vec<String>>,
+    fingerprint: Option<String>,
+    pub submitted_at: u64,
+    pub warned: bool,
+}
+
+impl Submission {
+    pub fn new(receipt: &str, text: &str, inputs: Option<&[UserInput]>, at: u64) -> Self {
+        Self {
+            receipt: receipt.into(),
+            before: inputs.map(|inputs| inputs.iter().map(|input| input.id.clone()).collect()),
+            fingerprint: UserInput::new(String::new(), text).fingerprint,
+            submitted_at: at,
+            warned: false,
+        }
+    }
+
+    pub fn overdue(&self, at: u64) -> bool {
+        at.saturating_sub(self.submitted_at) >= 60
+    }
+
+    pub fn observe(submissions: &mut Vec<Self>, inputs: &[UserInput]) {
+        // Match the whole group: one echo must not confirm two equal submissions,
+        // nor may two equal native inputs be attributed to one phone receipt.
+        let accepted: Vec<_> = submissions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, submission)| {
+                let fingerprint = submission.fingerprint.as_ref()?;
+                let peers: Vec<_> = submissions
+                    .iter()
+                    .filter(|other| other.fingerprint.as_ref() == Some(fingerprint))
+                    .collect();
+                let mut ids = HashSet::new();
+                let echoes: Vec<_> = inputs
+                    .iter()
+                    .filter(|input| {
+                        input.complete
+                            && input.fingerprint.as_ref() == Some(fingerprint)
+                            && peers.iter().any(|peer| {
+                                peer.before
+                                    .as_ref()
+                                    .is_some_and(|before| !before.contains(&input.id))
+                            })
+                            && ids.insert(input.id.as_str())
+                    })
+                    .collect();
+                if echoes.len() != peers.len() {
+                    return None;
+                }
+                let candidates: Vec<Vec<usize>> = peers
+                    .iter()
+                    .map(|peer| {
+                        echoes
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, input)| {
+                                peer.before
+                                    .as_ref()
+                                    .is_some_and(|before| !before.contains(&input.id))
+                            })
+                            .map(|(index, _)| index)
+                            .collect()
+                    })
+                    .collect();
+                let mut owners = vec![None; echoes.len()];
+                (0..peers.len())
+                    .all(|peer| {
+                        assign_native_input(
+                            peer,
+                            &candidates,
+                            &mut owners,
+                            &mut vec![false; echoes.len()],
+                        )
+                    })
+                    .then_some(index)
+            })
+            .collect();
+        let mut index = 0;
+        submissions.retain(|_| {
+            let keep = !accepted.contains(&index);
+            index += 1;
+            keep
+        });
+    }
+}
+
+// Each receipt must own a different eligible native message. Reassign an earlier
+// match if a later receipt has a narrower baseline (for example, an incomplete echo).
+fn assign_native_input(
+    receipt: usize,
+    candidates: &[Vec<usize>],
+    owners: &mut [Option<usize>],
+    seen: &mut [bool],
+) -> bool {
+    for &input in &candidates[receipt] {
+        if seen[input] {
+            continue;
+        }
+        seen[input] = true;
+        if owners[input]
+            .is_none_or(|previous| assign_native_input(previous, candidates, owners, seen))
+        {
+            owners[input] = Some(receipt);
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct PhoneInput {
     receipt: String,
@@ -90,6 +205,8 @@ impl Activity {
             .filter(|input| input.complete && !known.contains(&input.id))
             .collect();
         let mut consumed: Vec<String> = Vec::new();
+        // Inputs already matched to a phone receipt. Identical sends match one to one.
+        let mut matched: Vec<&str> = Vec::new();
         let mut local = false;
         for input in &fresh {
             let candidates: Vec<_> = self
@@ -106,18 +223,19 @@ impl Activity {
             // Held prompts run in send order, so identical held text matches the oldest submission.
             let receipt = match candidates.first() {
                 Some(first) if candidates.iter().all(|phone| phone.held) => Some(first),
-                Some(only)
-                    if candidates.len() == 1
-                        && fresh
+                // Without holds, every identical fresh input needs its own receipt, or the text is ambiguous.
+                Some(first)
+                    if candidates.len()
+                        == fresh
                             .iter()
                             .filter(|other| {
-                                other.fingerprint == only.fingerprint
-                                    && !only.before.contains(&other.id)
+                                other.fingerprint == first.fingerprint
+                                    && !first.before.contains(&other.id)
+                                    && !matched.contains(&other.id.as_str())
                             })
-                            .count()
-                            == 1 =>
+                            .count() =>
                 {
-                    Some(only)
+                    Some(first)
                 }
                 _ => None,
             }
@@ -127,6 +245,7 @@ impl Activity {
                 continue;
             };
             consumed.push(receipt);
+            matched.push(&input.id);
             if let Some(turn) = &input.turn
                 && !self.phone_turns.contains(turn)
             {
@@ -144,10 +263,9 @@ impl Activity {
             index += 1;
             !consumed.contains(&phone.receipt)
                 && last.is_none_or(|last| index > last + 1)
-                && (phone.held
-                    || !fresh
-                        .iter()
-                        .any(|input| !input.queued && !phone.before.contains(&input.id)))
+                // Unmatched local input makes an unheld submission stale. Matched echoes of
+                // other submissions do not, so staggered echoes keep the later receipt.
+                && (phone.held || !local)
         });
         observed.extend(fresh.into_iter().map(|input| input.id.clone()));
         local
@@ -186,9 +304,14 @@ impl Activity {
 
     pub fn start_phone(&mut self, receipt: &str, text: &str, inputs: &[UserInput]) {
         self.baseline(inputs);
+        self.start_phone_current(receipt, text);
+    }
+
+    pub fn start_phone_current(&mut self, receipt: &str, text: &str) {
+        let before = self.observed.get_or_insert_with(Vec::new).clone();
         self.phone.push(PhoneInput {
             receipt: receipt.into(),
-            before: inputs.iter().map(|input| input.id.clone()).collect(),
+            before,
             fingerprint: UserInput::new(String::new(), text).fingerprint,
             confirmed: false,
             held: false,

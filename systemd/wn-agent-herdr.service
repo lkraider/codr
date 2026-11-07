@@ -1,5 +1,5 @@
 [Unit]
-Description=MDK transport for HERDR White Noise remote
+Description=MDK transport for herdr White Noise remote
 After=network-online.target
 
 [Service]

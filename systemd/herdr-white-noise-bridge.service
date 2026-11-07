@@ -1,5 +1,5 @@
 [Unit]
-Description=HERDR White Noise remote plugin worker
+Description=herdr White Noise remote plugin worker
 After=network-online.target wn-agent-herdr.service
 Requires=wn-agent-herdr.service
 

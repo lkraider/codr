@@ -7,6 +7,44 @@ use std::{
 
 const SESSION: &str = "11111111-1111-4111-8111-111111111111";
 
+#[test]
+fn fresh_session_is_empty_until_the_first_transcript_is_written() {
+    // Adapted from Juraj Bednar's PR #18, with the first-write transition covered.
+    let home = tempfile::tempdir().unwrap();
+    assert!(claude::read(home.path(), SESSION).unwrap().is_empty());
+    fs::create_dir_all(home.path().join("projects/project")).unwrap();
+    assert!(claude::read(home.path(), SESSION).unwrap().is_empty());
+    assert!(claude::read(home.path(), "../../credentials").is_err());
+    write_transcript(
+        home.path(),
+        "project",
+        &[
+            user("u", None, json!("First prompt")),
+            assistant(
+                "a",
+                "u",
+                "api",
+                json!("end_turn"),
+                json!([{"type":"text","text":"First answer"}]),
+            ),
+        ],
+    );
+    let replies = claude::read(home.path(), SESSION).unwrap();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].text, "First answer");
+}
+
+#[test]
+fn missing_transcript_does_not_hide_scan_errors_or_ambiguity() {
+    let home = tempfile::tempdir().unwrap();
+    fs::write(home.path().join("projects"), "Not a directory").unwrap();
+    assert!(claude::read(home.path(), SESSION).is_err());
+    fs::remove_file(home.path().join("projects")).unwrap();
+    write_transcript(home.path(), "one", &[]);
+    write_transcript(home.path(), "two", &[]);
+    assert!(claude::read(home.path(), SESSION).is_err());
+}
+
 fn user(id: &str, parent: Option<&str>, content: Value) -> Value {
     json!({"type":"user","uuid":id,"parentUuid":parent,"sessionId":SESSION,"message":{"role":"user","content":content}})
 }

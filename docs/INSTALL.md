@@ -1,6 +1,13 @@
 # Install **codr**
 
-**codr** is a **herdr** plugin backed by two per-user services: the Rust bridge and its MDK transport. Linux uses systemd; macOS uses launchd LaunchAgents.
+**0.11.1 targets existing accounts.** Fresh-account examples use
+the supported 0.9.0 setup. For an existing account, use the explicit
+[combined-service handover](COMBINED.md), not the legacy two-service setup flow.
+Fresh identity creation still uses local 0.9 setup before that handover.
+
+The 0.9 **codr** plugin uses two per-user services: the Rust bridge and MDK transport.
+The 0.10 and 0.11 combined runtimes use one executable and one service after an
+explicit handover. Linux uses systemd. macOS uses launchd LaunchAgents.
 
 ## One-prompt installation
 
@@ -32,11 +39,16 @@ The phone account must publish a compatible Marmot KeyPackage before the bridge 
 Run these commands as your normal user, not root:
 
 ```bash
-herdr plugin install tidley/codr --ref v0.6.0
+herdr plugin install tidley/codr --ref v0.9.0
 herdr plugin action invoke local.white-noise.setup
 ```
 
 **herdr** previews and runs the manifest's installation hook, then registers the plugin. The hook downloads the bridge and dedicated connector for the host architecture and checks their SHA-256 checksums. Users do not need Rust or Cargo.
+
+These are the **0.9 fresh-account instructions**, not a 0.10 setup command.
+After setup, use the [combined handover guide](COMBINED.md) for an explicitly
+approved move to a reviewed 0.10 build. The 0.10 installer alone does not convert
+services, and its Setup action refuses the legacy identity-creation path.
 
 The Setup action opens a **herdr** tab. Enter your own White Noise public `npub` there. Setup:
 
@@ -48,6 +60,28 @@ The Setup action opens a **herdr** tab. Enter your own White Noise public `npub`
 6. Starts the transport and bridge, then prints the bridge's public `npub` and local result.
 
 The dedicated connector uses a pinned MDK revision with **codr**'s founding-admin and media-recovery patch. See [connector source and provenance](../patches/README.md). Setup does not replace a shared `wn-agent` executable.
+
+### Your bridge identity
+
+The current setup code names a newly created bridge account **👾** in White Noise. This publishes only the public profile name and display name, not your project names or other private details. The supported 0.9.0 fresh-account bootstrap keeps its original default. A later handover does not rename that existing profile. Use `/help` in a session chat to see the available commands.
+
+The display name is not proof of identity. Continue to verify invitations against the full bridge `npub` printed by setup. Existing and reused accounts keep their profile names and keys. Existing chats are not greeted again.
+
+Setup records profile publication before sending it. If confirmation is lost, setup reports `default_profile_status: unconfirmed` and does not automatically publish again. The same bridge identity can still deliver messages; inspect its profile before retrying a profile change.
+
+### Optional portr desktop/SSH access
+
+The normal phone-only installation does not enable the desktop endpoint or require SSH. In builds with portr support, fresh interactive setup asks **Enable optional portr desktop/SSH access? [y/N]**; press Enter to leave it off.
+
+For non-interactive setup, opt in explicitly:
+
+```sh
+python3 scripts/setup.py --npub "$OWNER_NPUB" --portr
+```
+
+Omit `--portr`, or use `--no-portr`, for phone-only setup. The optional setting is `portr_enabled = true`; an absent setting means disabled. The separate **portr** desktop application handles the SSH connection. Codr does not install the app, an SSH server, a VPN, or SSH keys. See the [desktop endpoint guide](PORTER.md).
+
+Re-running setup without either option preserves the stored preference. On an existing installation, an explicit change is validated and saved without an extra worker restart for this setting; setup reports that a restart is required. Apply it only after active work is idle. Other explicitly requested setup operations, such as a connector upgrade, retain the service behavior described below. `--check` cannot be combined with a desktop change option.
 
 The binary installer selects the **codr** version from the installed plugin checkout. A pinned installation uses that exact version's assets and checksums. A missing release asset or checksum stops installation rather than falling back to unverified code.
 
@@ -70,6 +104,13 @@ Version 0.6.0 enables automatic handoff by default: a new local native prompt mu
 
 For an existing installation, setup validates the configuration and selects the release-matched connector. A managed transport upgrade pauses the bridge and transport, replaces only the transport executable in its unit, then restarts both services. Configuration, identities, and mappings are preserved. Custom transport overrides require inspection before an upgrade. `--check` validates without changing services.
 
+MDK 0.13 to 0.14 requires a manual storage migration, not this executable-only upgrade.
+Setup refuses the older cohort before stopping services. Stop both services and keep a
+private, device-local backup of the complete connector home and credentials before the
+first 0.14 start. The migration rekeys databases and changes their schema; an old executable
+cannot reopen them. See [migration precautions](../patches/README.md). Do not restore
+old MLS state automatically after the new connector has received traffic.
+
 Setup stores the OpenCode executable's PATH entry, such as `/opt/homebrew/bin/opencode`, instead of Homebrew's versioned Cellar path. If an upgrade removes an absolute configured path and a replacement is installed, rerun setup: it validates session readers with the replacement before saving it, then restarts the worker. A failed restart restores the original configuration so setup can retry. `--check` reports an available repair without writing or restarting.
 
 Bare command names such as `opencode` keep their normal PATH lookup. Claude-only and Codex-only installations do not require OpenCode, including on repeat setup and `--check`. If OpenCode is unavailable, validation still fails when a live session needs its reader; without such a session, validation can be deferred.
@@ -88,7 +129,7 @@ launchctl kickstart -k "gui/$(id -u)/io.github.tidley.codr.herdr-white-noise-bri
 ```bash
 herdr plugin list
 herdr plugin unlink local.white-noise
-herdr plugin install tidley/codr --ref v0.6.0
+herdr plugin install tidley/codr --ref v0.9.0
 ```
 
 Unlinking leaves the local checkout and account state in place. Do not delete the MDK home or reset the bridge to perform an upgrade.
@@ -212,12 +253,14 @@ Before changing the host:
 Set `OWNER_NPUB` to the public key supplied by the user. Export the selected `HERDR_SOCKET_PATH` before running **herdr** commands.
 
 ```bash
-herdr plugin install tidley/codr --ref v0.6.0 --yes
+herdr plugin install tidley/codr --ref v0.9.0 --yes
 PLUGIN_ROOT="$(herdr plugin list --plugin local.white-noise --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["plugins"][0]["plugin_root"])')"
 python3 "$PLUGIN_ROOT/scripts/setup.py" --npub "$OWNER_NPUB" --herdr-socket "$HERDR_SOCKET_PATH"
 ```
 
-Use [Existing installations and upgrades](#existing-installations-and-upgrades) instead of overwriting a local plugin registration. For a local source checkout, the same setup script works after the binary has been installed.
+Use [Existing installations and upgrades](#existing-installations-and-upgrades) instead of overwriting a local plugin registration.
+The commands above require the 0.9 checkout. A 0.10 checkout must use the explicit
+[combined handover](COMBINED.md), not `setup.py --npub`.
 
 For a passive check of an existing configuration:
 
@@ -237,12 +280,17 @@ If a prerequisite or release asset is unavailable, report that blocker precisely
 
 ## Build from source
 
+This fresh-account procedure pins 0.9.0 because 0.10 does not create identities.
+For a reviewed 0.10 source build with an existing account, follow the explicit
+[combined-service handover](COMBINED.md) instead. Do not run legacy setup from a
+0.10 checkout or switch a dirty checkout to follow these examples.
+
 This path requires Rust and Cargo. Use the target host's build/storage policy. Audio setup needs FFmpeg and downloads the CPU or MLX runtime plus the approximately 164 MB model. On Linux its service is capped at 1 GiB RAM; launchd on macOS has no equivalent cap.
 
 ```bash
 git clone https://github.com/tidley/codr.git
 cd codr
-git checkout master
+git checkout v0.9.0
 cargo test --locked --tests
 cargo install --locked --path . --root "$HOME/.local"
 herdr plugin link "$PWD"

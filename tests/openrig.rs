@@ -221,7 +221,7 @@ async fn discovery_maps_listed_running_seats_to_agents() {
     assert_eq!(agent.state_change_seq, 7);
     assert_eq!(agent.cwd, "/work/project");
     assert_eq!(agent.agent_session.as_ref().unwrap().value, FIRST);
-    assert_eq!(agent.group_name(), format!("[cd] {SEAT}"));
+    assert_eq!(agent.group_name(), SEAT);
     assert!(
         agent
             .group_description()
@@ -285,7 +285,7 @@ async fn a_phone_prompt_goes_through_rig_send_and_a_state_change_forwards_the_fi
         .await
         .unwrap();
     bridge.flush().await.unwrap();
-    assert_eq!(sent(&calls, "> idle OpenRig session: connected."), 1);
+    assert_eq!(sent(&calls, "> Idle. OpenRig session: connected. 0 waiting prompt(s)."), 1);
     peer.abort();
 }
 
@@ -434,13 +434,14 @@ async fn an_image_is_queued_while_the_stored_status_is_blocked() {
     let mut event = inbound("photo", "");
     event["message"]["media"] = json!([{"media_type":"image/jpeg","file_name":"photo.jpg"}]);
     bridge.inbound(&event).await.unwrap();
-    assert_eq!(bridge.state.media_pending.len(), 1);
+    // An image waits in the chat's prompt queue until the seat accepts input.
+    assert_eq!(bridge.state.mappings[&json!(["openrig", SEAT]).to_string()].prompt_queue.len(), 1);
     assert!(rig_calls(dir.path(), "send").is_empty());
     peer.abort();
 }
 
 #[tokio::test]
-async fn a_second_image_while_the_stored_status_is_blocked_is_refused_as_busy() {
+async fn a_second_image_while_the_stored_status_is_blocked_waits_in_the_same_queue() {
     let (dir, _config, calls, mut bridge, peer) = connected_seat().await;
     seats(dir.path(), &[node(SEAT, FIRST, "needs_input", 2)]);
     tick(&mut bridge).await;
@@ -450,15 +451,9 @@ async fn a_second_image_while_the_stored_status_is_blocked_is_refused_as_busy() 
         bridge.inbound(&event).await.unwrap();
     }
     bridge.flush().await.unwrap();
-    assert_eq!(bridge.state.media_pending.len(), 1);
+    let key = json!(["openrig", SEAT]).to_string();
+    assert_eq!(bridge.state.mappings[&key].prompt_queue.len(), 2);
     assert_eq!(sent(&calls, BLOCKED), 0);
-    assert_eq!(
-        sent(
-            &calls,
-            "Media could not be queued. Another media message may still be in preparation, or the session has ended. Resend it later."
-        ),
-        1
-    );
     peer.abort();
 }
 
@@ -593,7 +588,8 @@ async fn a_stop_hook_on_the_event_stream_forwards_the_reply_without_waiting_for_
     bridge.flush().await.unwrap();
     assert_eq!(sent(&calls, "Fixed"), 1);
     assert_eq!(rig_calls(dir.path(), "ps").len(), listed + 1);
-    assert!(!bridge.stop_rereads_pending());
+    // A Claude reply that is already in the transcript is forwarded at the `working` event, before
+    // the Stop. The Stop then finds nothing new and rereads for a bounded time, so it can stay pending.
     assert_eq!(bridge.state.openrig_event_seq, Some(104));
     peer.abort();
 }
@@ -859,7 +855,7 @@ fn the_herdr_backend_stays_the_default_and_openrig_needs_seats() {
     assert!(
         agent
             .group_description()
-            .ends_with("Managed by codr via HERDR.")
+            .ends_with("Managed by codr via herdr.")
     );
 }
 
@@ -948,7 +944,7 @@ async fn a_phone_prompt_deferred_by_a_stale_idle_snapshot_reaches_the_seat_withi
     };
     let elapsed = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         tokio::select! {
-            result = bridge.run() => panic!("run stopped: {result:?}"),
+            result = bridge.run(false) => panic!("run stopped: {result:?}"),
             elapsed = delivered => elapsed,
         }
     })
@@ -999,7 +995,7 @@ async fn deferred_prepared_media_reaches_the_seat_within_seconds() {
     };
     let elapsed = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         tokio::select! {
-            result = bridge.run() => panic!("run stopped: {result:?}"),
+            result = bridge.run(false) => panic!("run stopped: {result:?}"),
             elapsed = delivered => elapsed,
         }
     })
@@ -1338,7 +1334,7 @@ async fn the_run_loop_sends_a_held_text_when_copy_mode_ends_and_then_stops_check
     let (held_notices, sends_in_mode, send_after, extra) =
         tokio::time::timeout(std::time::Duration::from_secs(70), async {
             tokio::select! {
-                result = bridge.run() => panic!("run stopped: {result:?}"),
+                result = bridge.run(false) => panic!("run stopped: {result:?}"),
                 result = watch => result,
             }
         })

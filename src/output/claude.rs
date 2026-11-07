@@ -13,6 +13,7 @@ use std::{
 
 struct Row {
     id: String,
+    timestamp: Option<i64>,
     parent: Option<String>,
     kind: String,
     same_session: bool,
@@ -62,6 +63,7 @@ fn truthy(value: &Value) -> bool {
 #[derive(Default)]
 struct Response {
     message: Option<String>,
+    timestamp: Option<i64>,
     last_row: String,
     text: Vec<String>,
     complete: bool,
@@ -69,10 +71,21 @@ struct Response {
 }
 
 impl Response {
-    fn finish(&mut self, replies: &mut Vec<FinalMessage>) {
+    fn finish(
+        &mut self,
+        replies: &mut Vec<FinalMessage>,
+        recent: &mut Vec<super::ConversationMessage>,
+    ) {
         if self.complete {
             let text = self.text.join("\n");
             if !text.trim().is_empty() {
+                super::record_message(
+                    recent,
+                    "Agent",
+                    &format!("claude:{}", self.last_row),
+                    &text,
+                    self.timestamp,
+                );
                 replies.push(FinalMessage {
                     id: format!("claude:{}", self.last_row),
                     text,
@@ -117,14 +130,24 @@ pub(super) fn snapshot(
     let session = native::session_id(session)?;
     let name = format!("{session}.jsonl");
     // Only project roots, never nested session/subagent directories. This also handles custom project keys.
-    let path = native::find(&[(home.join("projects"), 1)], |candidate| candidate == name)?;
+    // Claude writes the first transcript only after receiving its first prompt.
+    // Adapted from Juraj Bednar's PR #18; scan and ambiguity errors still fail.
+    let path = match native::find(&[(home.join("projects"), 1)], |candidate| candidate == name) {
+        Err(error) if error.is::<native::NotWritten>() => {
+            return Ok((super::SessionHistory::default(), None));
+        }
+        found => found?,
+    };
     let mut transcript = TRANSCRIPTS
         .lock()
         .unwrap()
         .remove(&path)
         .unwrap_or_default();
     transcript.update(&path, &session)?;
-    let snapshot = transcript.snapshot();
+    let snapshot = transcript.snapshot().map(|(mut history, tasks)| {
+        history.activity_at = native::modified_at(&path);
+        (history, tasks)
+    });
     transcript.used = Some(Instant::now());
     let mut cached = TRANSCRIPTS.lock().unwrap();
     if cached.len() >= CACHED_TRANSCRIPTS
@@ -176,8 +199,14 @@ impl Transcript {
                 || truthy(&value["teamName"]);
             let content = &value["message"]["content"];
             let blocks = content.as_array();
+            // Claude Code records background-task notifications as system-sourced user rows.
+            let system_prompt = value["promptSource"] == "system"
+                || value["origin"]["kind"]
+                    .as_str()
+                    .is_some_and(|origin| origin != "human");
             let user_prompt = kind == "user"
                 && !private
+                && !system_prompt
                 && !truthy(&value["isCompactSummary"])
                 && (content.is_string()
                     || blocks.is_some_and(|parts| {
@@ -201,6 +230,7 @@ impl Transcript {
             };
             let mut row = Row {
                 id: id.into(),
+                timestamp: super::source_timestamp(&value["timestamp"]),
                 parent: value["parentUuid"].as_str().map(str::to_owned),
                 kind: kind.into(),
                 same_session,
@@ -321,6 +351,7 @@ impl Transcript {
         let mut latest_turn = None;
         let mut turns = std::collections::BTreeSet::new();
         let mut user_inputs = Vec::new();
+        let mut recent_messages = Vec::new();
         for position in chain.into_iter().rev() {
             let row = &rows[position];
             if row.private || !row.same_session {
@@ -331,7 +362,14 @@ impl Transcript {
                     crate::activity::UserInput::new(format!("claude:{}", row.id), &row.input_text)
                         .in_turn(Some(format!("claude:{}", row.id))),
                 );
-                response.finish(&mut replies);
+                response.finish(&mut replies, &mut recent_messages);
+                super::record_message(
+                    &mut recent_messages,
+                    "You",
+                    &format!("claude:{}", row.id),
+                    &row.input_text,
+                    row.timestamp,
+                );
                 latest_turn = Some(format!("claude:{}", row.id));
                 turns.insert(latest_turn.clone().unwrap());
                 tasks.new_turn();
@@ -360,7 +398,9 @@ impl Transcript {
             }
             let message = row.message.as_deref().unwrap_or(&row.id);
             if response.message.as_deref() != Some(message) {
-                // A continuation for the same user turn supersedes the earlier model response.
+                // A continuation for the same user turn supersedes an incomplete model response.
+                // A completed one stays final, e.g. a reply before a background task reports back.
+                response.finish(&mut replies, &mut recent_messages);
                 response = Response {
                     message: Some(message.into()),
                     turn: latest_turn.clone(),
@@ -368,17 +408,22 @@ impl Transcript {
                 };
             }
             response.last_row = row.id.clone();
+            response.timestamp = response.timestamp.or(row.timestamp);
             response.text.extend(row.text.iter().cloned());
             // Duration/system markers and null stop reasons do not prove a successful final answer.
             response.complete = row.stop.as_deref() == Some("end_turn");
         }
-        response.finish(&mut replies);
+        response.finish(&mut replies, &mut recent_messages);
         Ok((
             super::SessionHistory {
+                activity_at: None,
                 finals: replies,
                 latest_turn,
                 turns: turns.into_iter().collect(),
                 user_inputs,
+                recent_messages: recent_messages[recent_messages.len().saturating_sub(3)..]
+                    .to_vec(),
+                last_messages: recent_messages,
             },
             tasks.latest,
         ))

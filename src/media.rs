@@ -2,7 +2,7 @@ use crate::{BridgeConfig, wire::Socket};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     process::Stdio,
     time::Duration,
 };
@@ -46,6 +46,25 @@ pub fn audio(message: &Value) -> bool {
     })
 }
 
+pub fn images(message: &Value) -> bool {
+    message["media"].as_array().is_some_and(|items| {
+        !items.is_empty()
+            && items.len() <= 4
+            && items.iter().all(|item| {
+                matches!(
+                    item["media_type"]
+                        .as_str()
+                        .unwrap_or("")
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim(),
+                    "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+                )
+            })
+    })
+}
+
 #[derive(Debug)]
 pub struct Prepared {
     pub prompt: String,
@@ -58,7 +77,7 @@ pub fn transcript_notice(text: &str) -> String {
         .map(|line| format!("> {line}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let mut notice = format!("> transcribed\n\n{quote}");
+    let mut notice = format!("> Transcribed.\n\n{quote}");
     const SUFFIX: &str = "\n\n> … Transcript shortened for display.";
     if notice.len() > 30000 {
         let mut end = 30000 - SUFFIX.len();
@@ -91,13 +110,7 @@ pub async fn prepare(
     if !caption.is_empty() {
         parts.push(caption.to_owned());
     }
-    if !complete_refs(message)
-        && attachments.iter().all(|m| {
-            m["media_type"]
-                .as_str()
-                .is_some_and(|t| t.starts_with("image/") || t.starts_with("audio/"))
-        })
-    {
+    if !complete_refs(message) {
         let recovered = socket.marmot(json!({"type":"timeline_message_get", "account_id_hex":config.account_id_hex,
             "group_id_hex":group, "message_id_hex":message["message_id_hex"], "include_media":true}))
             .await.map_err(|_| MediaUnavailable)?;
@@ -136,11 +149,8 @@ pub async fn prepare(
             "image/gif" => Some("gif"),
             _ => None,
         };
-        ensure!(
-            extension.is_some() || kind.starts_with("audio/"),
-            "Only images and audio are supported"
-        );
-        if extension.is_none() {
+        let audio = kind.starts_with("audio/");
+        if audio {
             ensure!(
                 !config.transcribe_command.is_empty(),
                 "Audio transcription is not configured"
@@ -176,7 +186,21 @@ pub async fn prepare(
                 == kind),
             "Media type changed"
         );
-        if let Some(extension) = extension {
+        if !audio {
+            // Never use a remote filename as a destination path. Files are kept
+            // inert and private; archives are not extracted or executed here.
+            let name = attachment["file_name"].as_str().unwrap_or("attachment");
+            let suffix = extension.unwrap_or_else(|| {
+                std::path::Path::new(name)
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .filter(|value| {
+                        !value.is_empty()
+                            && value.len() <= 16
+                            && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                    })
+                    .unwrap_or("bin")
+            });
             let directory = config.state_path.parent().unwrap().join("media");
             std::fs::DirBuilder::new()
                 .recursive(true)
@@ -187,8 +211,21 @@ pub async fn prepare(
                 "Invalid media directory"
             );
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-            let target = directory.join(format!("{}.{extension}", uuid::Uuid::new_v4()));
-            let mut source = tokio::fs::File::open(path).await?.take(MAX_BYTES + 1);
+            let target = directory.join(format!("{}.{suffix}", uuid::Uuid::new_v4()));
+            let source = tokio::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+                .open(path)
+                .await?;
+            let opened = source.metadata().await?;
+            ensure!(
+                opened.is_file()
+                    && opened.dev() == metadata.dev()
+                    && opened.ino() == metadata.ino()
+                    && opened.len() == metadata.len(),
+                "Media file changed before read"
+            );
+            let mut source = source.take(MAX_BYTES + 1);
             let mut bytes = Vec::new();
             source.read_to_end(&mut bytes).await?;
             ensure!(
@@ -203,10 +240,15 @@ pub async fn prepare(
                 .await?;
             output.write_all(&bytes).await?;
             output.flush().await?;
-            parts.push(format!(
-                "Attached image: {}",
-                serde_json::to_string(&target)?
-            ));
+            parts.push(if extension.is_some() {
+                format!("Attached image: {}", serde_json::to_string(&target)?)
+            } else {
+                format!(
+                    "Attached file: {}\nOriginal file name: {}",
+                    serde_json::to_string(&target)?,
+                    serde_json::to_string(name)?
+                )
+            });
         } else {
             let command = &config.transcribe_command;
             let mut child = tokio::process::Command::new(&command[0])

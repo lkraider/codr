@@ -34,8 +34,20 @@ pub struct BridgeConfig {
     pub wn_agent_socket: PathBuf,
     pub account_id_hex: String,
     pub state_path: PathBuf,
+    /// Owner-confirmed workspace launches are restricted to this directory.
+    #[serde(default = "default_launch_root")]
+    pub launch_root: PathBuf,
+    /// Optional same-user desktop endpoint for portr; does not configure SSH.
+    #[serde(default)]
+    pub portr_enabled: bool,
+    /// Create a standalone owner-only control group for /new and general commands.
+    #[serde(default)]
+    pub control_chat: bool,
     #[serde(default = "default_opencode")]
     pub opencode_bin: PathBuf,
+    /// Read-only V2 HTTP connection; never starts or recovers the shared service.
+    #[serde(default)]
+    pub opencode_service_file: Option<PathBuf>,
     /// Explicit database/profile selection. None keeps the CLI export reader.
     #[serde(default)]
     pub opencode_db: Option<PathBuf>,
@@ -100,6 +112,10 @@ fn default_opencode() -> PathBuf {
     "opencode".into()
 }
 
+fn default_launch_root() -> PathBuf {
+    native_home("HOME", ".").join("code")
+}
+
 fn native_home(variable: &str, directory: &str) -> PathBuf {
     std::env::var_os(variable)
         .map(PathBuf::from)
@@ -159,6 +175,7 @@ impl BridgeConfig {
             &config.state_path,
             &config.codex_home,
             &config.claude_home,
+            &config.launch_root,
         ] {
             ensure!(path.is_absolute(), "Configuration paths must be absolute");
         }
@@ -178,6 +195,10 @@ impl BridgeConfig {
                 "speak_adapt_prompt_file must be absolute"
             );
         }
+        ensure!(
+            config.launch_root.parent().is_some(),
+            "Launch root must not be the filesystem root"
+        );
         if let Some(path) = &config.opencode_db {
             ensure!(
                 path.is_absolute(),

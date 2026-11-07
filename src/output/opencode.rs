@@ -78,6 +78,7 @@ impl Reader {
         db.set_limit(Limit::SQLITE_LIMIT_LENGTH, 16 * 1024 * 1024)?;
         db.execute_batch("PRAGMA query_only=ON")?;
         let tx = db.transaction()?;
+        let mut update_columns = (false, false);
         for (table, required) in [
             ("session", &["id"][..]),
             ("event", &["id", "aggregate_id", "seq", "type", "data"][..]),
@@ -90,6 +91,11 @@ impl Reader {
                 .collect::<rusqlite::Result<HashSet<_>>>()?;
             if required.iter().any(|column| !columns.contains(*column)) {
                 return Err(IncompatibleDatabase.into());
+            }
+            match table {
+                "message" => update_columns.0 = columns.contains("time_updated"),
+                "part" => update_columns.1 = columns.contains("time_updated"),
+                _ => {}
             }
         }
         ensure!(
@@ -193,7 +199,7 @@ impl Reader {
             cached.map_or(0, |cache| cache.bytes)
         };
         for id in &changed {
-            let update = read_message(&tx, session, id, &mut parts_read)?;
+            let update = read_message(&tx, session, id, &mut parts_read, update_columns)?;
             if !rebuilt {
                 bytes -= cached
                     .and_then(|cache| cache.messages.get(id))
@@ -235,6 +241,7 @@ impl Reader {
                 history: super::history_from_data(&export),
                 tasks: super::tasks::from_data(&export),
                 decision: super::decision::from_data(&export).ok().flatten(),
+                permission: None,
             };
         }
         cache.cursor = latest;
@@ -253,20 +260,45 @@ fn read_message(
     session: &str,
     id: &str,
     parts_read: &mut usize,
+    update_columns: (bool, bool),
 ) -> Result<Option<CachedMessage>> {
-    let row: Option<(i64, String)> = tx
+    // Optional clock columns preserve compatibility with older projections. Read
+    // aggregate part clocks without loading tool output or attachment bodies.
+    let updated = if update_columns.0 {
+        "time_updated"
+    } else {
+        "NULL"
+    };
+    let part_updated = if update_columns.1 {
+        "(SELECT MAX(p.time_updated) FROM part p WHERE p.session_id=?1 AND p.message_id=?2)"
+    } else {
+        "NULL"
+    };
+    let row: Option<(i64, String, Option<i64>, Option<i64>)> = tx
         .query_row(
-            "SELECT time_created,data FROM message WHERE session_id=?1 AND id=?2",
+            &format!("SELECT time_created,data,{updated},{part_updated} FROM message WHERE session_id=?1 AND id=?2"),
             (session, id),
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let Some((created, data)) = row else {
+    let Some((created, data, updated, part_updated)) = row else {
         return Ok(None);
     };
     let mut bytes = data.len();
     let mut info: Info = serde_json::from_str(&data)?;
     info.id = id.into();
+    info.time.created = info.time.created.or_else(|| u64::try_from(created).ok());
+    info.time.updated = info
+        .time
+        .updated
+        .into_iter()
+        .chain(
+            updated
+                .into_iter()
+                .chain(part_updated)
+                .filter_map(|time| u64::try_from(time).ok()),
+        )
+        .max();
     let mut parts = Vec::new();
     if info.role == "assistant" || info.role == "user" {
         let mut statement = tx.prepare(

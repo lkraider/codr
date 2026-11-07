@@ -99,18 +99,21 @@ def download(url, destination):
         raise InstallError(f"Could not download release asset: {url}") from error
 
 
-def install_bundle(url, member, destination):
+def install_bundle(url, member, destination, *, checksum_url=None, expected_sha256=None, downloader=None):
     """Verify the archive, then install only its expected regular executable."""
     with tempfile.TemporaryDirectory(prefix="codr-download-") as temporary:
         archive = Path(temporary) / "binary.tar.gz"
         checksum = Path(temporary) / "checksum"
-        download(url, archive)
-        download(url + ".sha256", checksum)
+        fetch = downloader or download
+        fetch(url, archive)
+        fetch(checksum_url or url + ".sha256", checksum)
         fields = checksum.read_text().split()
         if not fields or not re.fullmatch(r"[a-fA-F0-9]{64}", fields[0]):
             raise InstallError("Invalid release checksum")
         if sha256(archive) != fields[0].lower():
             raise InstallError("Release checksum mismatch; nothing was installed")
+        if expected_sha256 is not None and sha256(archive) != expected_sha256:
+            raise InstallError("Release differs from the confirmed asset; nothing was installed")
         with tarfile.open(archive, "r:gz") as bundle:
             entries = [entry for entry in bundle.getmembers() if entry.name == member]
             if len(entries) != 1 or not entries[0].isfile() or not 0 < entries[0].size <= MAX_DOWNLOAD:
@@ -147,12 +150,19 @@ def main():
         asset = f"codr-v{release}-{platform_name()}.tar.gz"
         url = f"https://github.com/tidley/codr/releases/download/v{release}/{asset}"
         destination = Path.home() / ".local/bin/herdr-white-noise-bridge"
-        connector = install_connector(release)
+        combined = tuple(map(int, release.split("."))) >= (0, 10, 0)
+        connector = None if combined else install_connector(release)
         install_bundle(url, "herdr-white-noise-bridge", destination)
         print(f"Installed codr {release}: {destination}")
-        print(f"Dedicated connector: {connector}")
-        print("Next: run the plugin's Setup action, or follow docs/INSTALL.md for non-interactive setup.")
-        print("For an existing installation, run Setup to select the matching connector and preserve account state.")
+        if connector:
+            print(f"Dedicated connector: {connector}")
+            print("Next: run the plugin's Setup action, or follow docs/INSTALL.md for non-interactive setup.")
+            print("For an existing installation, run Setup to select the matching connector and preserve account state.")
+        else:
+            print("One executable contains the bridge and MDK messaging runtime.")
+            print("Existing accounts require the explicit stopped-backup combined-service handover; installation does not migrate services.")
+            print("Next: follow docs/COMBINED.md for the approved local handover, not the legacy Setup action.")
+            print("Fresh accounts require 0.9 setup before handover. Do not start the combined runtime on unapproved storage.")
     except (InstallError, OSError, tarfile.TarError) as error:
         print(f"codr install: {error}", file=sys.stderr)
         return 1

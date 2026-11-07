@@ -44,6 +44,16 @@ def detect_backend():
     return LAUNCHD if sys.platform == "darwin" else SYSTEMD
 
 
+def combined_service(binary, config, messaging_home):
+    """Describe one process; installation/start and account handover stay explicit."""
+    paths = [Path(value) for value in (binary, config, messaging_home)]
+    if not all(path.is_absolute() for path in paths):
+        raise ServiceError("Combined service paths must be absolute")
+    return Service("codr", "codr bridge and MDK messaging runtime",
+                   [paths[0], "--config", paths[1], "run", "--messaging-home", paths[2]],
+                   environment={"PATH": worker_path()})
+
+
 def for_host(runner, private_write, config_root, error=ServiceError):
     if detect_backend() == LAUNCHD:
         return LaunchdServices(runner, private_write, config_root, error)
@@ -158,8 +168,9 @@ class SystemdServices:
         self.runner(["systemctl", "--version"])
         self.runner(["systemctl", "--user", "show-environment"])
 
-    def install(self, service):
-        template = (ROOT / "systemd" / f"{service.name}.service").read_text()
+    def install(self, service, template=None):
+        if template is None:
+            template = (ROOT / "systemd" / f"{service.name}.service").read_text()
         try:
             # A variable the template sets keeps the template value, so existing units stay byte-identical.
             missing = [f"Environment={systemd_argument(f'{key}={value}')}" for key, value in service.environment.items()
@@ -251,7 +262,16 @@ class LaunchdServices:
 
     def ensure_loaded(self, name):
         if not self.loaded(name):
+            self.bootstrap(name)
+
+    def bootstrap(self, name):
+        try:
             self.runner(["launchctl", "bootstrap", self.domain(), str(self.path(name))])
+        except Exception:
+            # Preserve PR #16: launchd can refuse bootstrap just after bootout.
+            time.sleep(2)
+            if not self.loaded(name):
+                self.runner(["launchctl", "bootstrap", self.domain(), str(self.path(name))])
 
     def start(self, names):
         for name in _names(names):
@@ -260,7 +280,7 @@ class LaunchdServices:
             if self.loaded(name):
                 self.runner(["launchctl", "kickstart", f"{self.domain()}/{_label(name)}"])
             else:
-                self.runner(["launchctl", "bootstrap", self.domain(), str(self.path(name))])
+                self.bootstrap(name)
 
     def restart(self, name):
         self.ensure_loaded(name)
@@ -268,15 +288,19 @@ class LaunchdServices:
 
     def is_active(self, names):
         pending = {_label(name) for name in _names(names)}
-        deadline = time.monotonic() + 15
+        started = time.monotonic()
         while pending:
+            spawning = False
             for label in list(pending):
                 output = _capture(["launchctl", "print", f"{self.domain()}/{label}"])
                 if output and re.search(r"(?m)^\s*state = running\s*$", output):
                     pending.remove(label)
+                elif output and re.search(r"(?m)^\s*state = xpcproxy\s*$", output):
+                    spawning = True
             if not pending:
                 return
-            if time.monotonic() >= deadline:
+            # A first launch can wait in xpcproxy while macOS registers the job.
+            if time.monotonic() >= started + (90 if spawning else 15):
                 raise self.error(f"Service did not stay running: {', '.join(sorted(pending))}")
             time.sleep(0.25)
 

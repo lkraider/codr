@@ -9,6 +9,17 @@ use std::{
 const MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 
+/// A session log's modification time counts tool and assistant activity as well as input.
+pub fn modified_at(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|time| time.as_secs())
+}
+
 pub fn session_id(value: &str) -> Result<String> {
     Ok(uuid::Uuid::parse_str(value)
         .map_err(|_| anyhow::anyhow!("Invalid native session UUID"))?
@@ -16,10 +27,18 @@ pub fn session_id(value: &str) -> Result<String> {
         .to_string())
 }
 
+/// A valid session has not written a transcript yet.
+#[derive(Debug, thiserror::Error)]
+#[error("Native transcript has not been written yet")]
+pub struct NotWritten;
+
 pub fn find(roots: &[(PathBuf, usize)], matches: impl Fn(&str) -> bool) -> Result<PathBuf> {
     let mut found = Vec::new();
     for (root, depth) in roots {
         scan(root, *depth, &matches, &mut found)?;
+    }
+    if found.is_empty() {
+        return Err(NotWritten.into());
     }
     ensure!(
         found.len() == 1,

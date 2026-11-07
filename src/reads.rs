@@ -37,6 +37,7 @@ pub(crate) struct Reads {
     ready: BTreeMap<String, (Context, Arc<output::SessionSnapshot>)>,
     ended: HashSet<String>,
     pub database: Arc<Mutex<output::opencode::Reader>>,
+    service: Arc<output::service::Reader>,
 }
 
 impl Default for Reads {
@@ -50,6 +51,7 @@ impl Default for Reads {
             ready: BTreeMap::new(),
             ended: HashSet::new(),
             database: Arc::new(Mutex::new(output::opencode::Reader::default())),
+            service: Arc::new(output::service::Reader::default()),
         }
     }
 }
@@ -69,6 +71,13 @@ impl Reads {
         self.jobs
             .retain(|key, job| keys.contains(key) || !job.task.is_finished());
         self.ended.retain(|key| keys.contains(key));
+        let sessions = keys
+            .iter()
+            .filter_map(|key| serde_json::from_str::<Vec<String>>(key).ok())
+            .filter(|parts| parts.len() == 4 && parts[1] == "opencode")
+            .map(|parts| parts[3].clone())
+            .collect();
+        self.service.retain(&sessions);
         if let Ok(mut reader) = self.database.try_lock() {
             let sessions = keys
                 .iter()
@@ -97,6 +106,13 @@ impl Reads {
         config: &BridgeConfig,
         session: &crate::herdr::Session,
     ) -> Result<output::SessionSnapshot> {
+        if session.agent == "opencode" && config.opencode_service_file.is_some() {
+            anyhow::ensure!(
+                session.kind == "id",
+                "Unsupported native session reference kind"
+            );
+            return self.service.read(config, &session.value).await;
+        }
         snapshot(config, session, self.database.clone()).await
     }
 
@@ -164,12 +180,21 @@ impl Reads {
             let limit = self.limit.clone();
             let notify = self.notify.clone();
             let database = self.database.clone();
+            let service = self.service.clone();
             Job {
                 context,
                 task: tokio::spawn(async move {
                     let result = async {
                         let _permit = limit.acquire_owned().await?;
-                        snapshot(&config, &session, database).await
+                        if session.agent == "opencode" && config.opencode_service_file.is_some() {
+                            anyhow::ensure!(
+                                session.kind == "id",
+                                "Unsupported native session reference kind"
+                            );
+                            service.read(&config, &session.value).await
+                        } else {
+                            snapshot(&config, &session, database).await
+                        }
                     }
                     .await;
                     notify.notify_one();
