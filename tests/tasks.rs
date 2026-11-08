@@ -26,6 +26,7 @@ async fn codex_tasks_require_success_and_do_not_reuse_the_previous_turn() {
         kind: "id".into(),
         source: "herdr:codex".into(),
         value: id.into(),
+        home: None,
     };
     let mut rows = vec![
         json!({"type":"session_meta","payload":{"id":id}}),
@@ -83,6 +84,7 @@ async fn claude_tasks_follow_main_conversation_and_apply_successful_updates() {
         kind: "id".into(),
         source: "herdr:claude".into(),
         value: id.into(),
+        home: None,
     };
     let rows = [
         json!({"uuid":"u","type":"user","sessionId":id,"message":{"role":"user","content":"Work"}}),
@@ -123,6 +125,7 @@ async fn codex_turn_identity_is_available_before_the_final_record() {
         kind: "id".into(),
         source: "herdr:codex".into(),
         value: id.into(),
+        home: None,
     };
     let prefix = format!(
         "{}\n{}\n{}\n",
@@ -165,6 +168,7 @@ async fn claude_turn_identity_uses_the_main_user_prompt_before_the_final() {
         kind: "id".into(),
         source: "herdr:claude".into(),
         value: id.into(),
+        home: None,
     };
     let prefix = format!(
         "{}\n",
@@ -206,6 +210,7 @@ async fn claude_background_task_notifications_stay_in_the_phone_turn() {
         kind: "id".into(),
         source: "herdr:claude".into(),
         value: id.into(),
+        home: None,
     };
     let rows = [
         json!({"uuid":"u1","type":"user","sessionId":id,"origin":{"kind":"human"},"promptSource":"typed","message":{"role":"user","content":"Phone request"}}),

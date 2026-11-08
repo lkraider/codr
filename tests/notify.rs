@@ -11,6 +11,7 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, net::UnixListener};
 
+const SEAT: &str = "operator-agent@kernel";
 const GROUP: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const OTHER: &str = "cccccccccccccccccccccccccccccccc";
 const MESSAGE: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
@@ -40,9 +41,15 @@ fn write_state(dir: &Path, forwarding_enabled: bool) {
         forwarding_enabled,
         ..Default::default()
     };
-    for (key, group) in [("first", GROUP), ("second", OTHER)] {
+    for (key, group) in [
+        (serde_json::to_string(&("openrig", SEAT)).unwrap(), GROUP),
+        (
+            serde_json::to_string(&("openrig", "dev-build@workshop")).unwrap(),
+            OTHER,
+        ),
+    ] {
         state.mappings.insert(
-            key.to_string(),
+            key,
             Mapping {
                 group_id_hex: Some(group.into()),
                 active: true,
@@ -82,7 +89,7 @@ async fn notify(config: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[tokio::test]
-async fn notify_reaches_one_group_while_the_worker_holds_the_state_lock() {
+async fn notify_reaches_a_seat_group_while_the_worker_holds_the_state_lock() {
     let dir = tempfile::tempdir().unwrap();
     let config = write_config(dir.path());
     write_state(dir.path(), true);
@@ -91,7 +98,7 @@ async fn notify_reaches_one_group_while_the_worker_holds_the_state_lock() {
     let calls = Arc::new(Mutex::new(vec![]));
     let server = mdk(&dir.path().join("wn.sock"), calls.clone()).await;
 
-    let output = notify(&config, &["--group", GROUP, "Merge the branch?"]).await;
+    let output = notify(&config, &["--seat", SEAT, "Merge the branch?"]).await;
 
     assert!(
         output.status.success(),
@@ -117,7 +124,7 @@ async fn notify_reaches_one_group_while_the_worker_holds_the_state_lock() {
 }
 
 #[tokio::test]
-async fn notify_refuses_an_unknown_group_and_at_desk_while_the_worker_runs() {
+async fn notify_refuses_an_unknown_seat_and_at_desk_while_the_worker_runs() {
     let dir = tempfile::tempdir().unwrap();
     let config = write_config(dir.path());
     write_state(dir.path(), true);
@@ -125,15 +132,17 @@ async fn notify_refuses_an_unknown_group_and_at_desk_while_the_worker_runs() {
     let calls = Arc::new(Mutex::new(vec![]));
     let server = mdk(&dir.path().join("wn.sock"), calls.clone()).await;
 
-    let unknown = notify(&config, &["--group", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "Question"]).await;
+    let unknown = notify(&config, &["--seat", "nobody@kernel", "Question"]).await;
     assert!(!unknown.status.success());
-    assert!(String::from_utf8_lossy(&unknown.stderr).contains("No mapped groups exist yet"));
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("Unknown seat: nobody@kernel"));
 
     write_state(dir.path(), false);
-    let desk = notify(&config, &["--group", GROUP, "Question"]).await;
+    let desk = notify(&config, &["--seat", SEAT, "Question"]).await;
     assert!(!desk.status.success());
     assert!(String::from_utf8_lossy(&desk.stderr).contains("Forwarding is At desk"));
 
+    let both = notify(&config, &["--seat", SEAT, "--group", GROUP, "Question"]).await;
+    assert!(!both.status.success());
     assert!(calls.lock().unwrap().is_empty());
     server.abort();
 }
@@ -148,12 +157,12 @@ async fn notify_follows_the_forwarding_control_before_the_worker_copies_it() {
     let server = mdk(&dir.path().join("wn.sock"), calls.clone()).await;
 
     forwarding::set(&dir.path().join("state.json"), false).unwrap();
-    let desk = notify(&config, &["--group", GROUP, "Question"]).await;
+    let desk = notify(&config, &["--seat", SEAT, "Question"]).await;
     assert!(!desk.status.success());
     assert!(String::from_utf8_lossy(&desk.stderr).contains("Forwarding is At desk"));
 
     forwarding::set(&dir.path().join("state.json"), true).unwrap();
-    let resuming = notify(&config, &["--group", GROUP, "Question"]).await;
+    let resuming = notify(&config, &["--seat", SEAT, "Question"]).await;
     assert!(!resuming.status.success());
     assert!(String::from_utf8_lossy(&resuming.stderr).contains("Away is set; wait for the bridge"));
 

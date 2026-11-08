@@ -224,7 +224,10 @@ pub async fn read_session(config: &BridgeConfig, session: &Session) -> Result<Op
             let home = if provider == "codex" {
                 config.codex_home.clone()
             } else {
-                config.claude_home.clone()
+                session
+                    .home
+                    .clone()
+                    .unwrap_or_else(|| config.claude_home.clone())
             };
             tokio::task::spawn_blocking(move || {
                 if provider == "codex" {

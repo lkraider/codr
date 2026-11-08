@@ -42,6 +42,7 @@ async fn installed_session_yields_structured_tasks_without_model_calls() {
         agent,
         kind: "id".into(),
         value: std::env::var("CODR_TEST_TASK_SESSION").expect("set CODR_TEST_TASK_SESSION"),
+        home: None,
     };
     let tasks = herdr_white_noise_bridge::output::tasks::read_session(&config, &session)
         .await

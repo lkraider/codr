@@ -1,16 +1,16 @@
 use crate::{
     BridgeConfig, BridgeState,
-    config::phone_hex,
+    config::{Backend, phone_hex},
     forwarding,
     herdr::{self, Agent},
-    output,
-    state::Mapping,
+    openrig, output,
+    state::{HeldPrompt, Mapping},
     wire::{PROTOCOL, Socket, read_line},
 };
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -34,7 +34,14 @@ pub struct Bridge {
     reads: crate::reads::Reads,
     pub(crate) last_snapshot: Vec<Agent>,
     pub(crate) porter_updates: tokio::sync::watch::Sender<Value>,
+    stop_rereads: BTreeMap<String, StopReread>,
+    /// Seats whose copy-mode check failed since its last success. The failure is logged once.
+    copy_mode_unchecked: BTreeSet<String>,
+    held_due: bool,
+    releasing: Option<String>,
 }
+
+const HELD: &str = "This message is held. The seat's terminal is in copy mode. React 👍 to this notice to send it now.";
 
 struct SpeechJob {
     message_id: String,
@@ -42,6 +49,14 @@ struct SpeechJob {
 }
 
 const SPOKEN_LIMIT: usize = 500;
+
+/// A `Stop` hook can arrive before the transcript holds the final reply.
+struct StopReread {
+    finals: usize,
+    started: tokio::time::Instant,
+    next: tokio::time::Instant,
+    wait: Duration,
+}
 
 impl Drop for Bridge {
     fn drop(&mut self) {
@@ -72,6 +87,7 @@ impl Bridge {
         state.account = Some(config.account_id_hex.clone());
         state.phone = Some(phone.clone());
         state.save(&config.state_path)?;
+        let held_due = !state.held_prompts.is_empty();
         let mut bridge = Self {
             herdr: Socket {
                 path: config.herdr_socket.clone(),
@@ -92,6 +108,10 @@ impl Bridge {
             speak_prompt_unreadable: Default::default(),
             reads: crate::reads::Reads::default(),
             last_snapshot: vec![],
+            stop_rereads: BTreeMap::new(),
+            copy_mode_unchecked: BTreeSet::new(),
+            held_due,
+            releasing: None,
             porter_updates: tokio::sync::watch::channel(Value::Null).0,
         };
         bridge.refresh_forwarding()?;
@@ -111,6 +131,37 @@ impl Bridge {
         self.state.save(&self.config.state_path)?;
         crate::porter::publish(self);
         Ok(())
+    }
+
+    fn backend_name(&self) -> &'static str {
+        match self.config.backend {
+            Backend::Herdr => "herdr",
+            Backend::OpenRig => "OpenRig",
+        }
+    }
+
+    pub async fn snapshot(&self) -> Result<Vec<Agent>> {
+        match self.config.backend {
+            Backend::Herdr => herdr::snapshot(&self.herdr).await,
+            Backend::OpenRig => openrig::snapshot(&self.config).await,
+        }
+    }
+
+    async fn current_agent(&self, agent: &Agent) -> Result<Agent> {
+        match self.config.backend {
+            Backend::Herdr => herdr::get(&self.herdr, agent).await,
+            Backend::OpenRig => openrig::get(&self.config, agent).await,
+        }
+    }
+
+    /// Returns herdr's `agent.prompt` reply. OpenRig confirms the send itself, so it gets the same shape.
+    async fn prompt_agent(&self, agent: &Agent, text: &str) -> Result<Value> {
+        match self.config.backend {
+            Backend::Herdr => herdr::prompt(&self.herdr, agent, text).await,
+            Backend::OpenRig => openrig::prompt(&self.config, agent, text)
+                .await
+                .map(|()| json!({"result":{"type":"agent_prompted"}})),
+        }
     }
 
     fn refresh_forwarding(&mut self) -> Result<()> {
@@ -901,7 +952,7 @@ impl Bridge {
             .agent_record
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Pending session has no terminal identity"))?;
-        let agents = herdr::snapshot(&self.herdr).await?;
+        let agents = self.snapshot().await?;
         ensure!(
             agents.iter().filter(|a| a.key() == key).count() == 1
                 && agents.iter().any(|a| a.key() == key
@@ -927,9 +978,18 @@ impl Bridge {
             let history = self.read_history(agent).await?;
             let mapping = self.state.mappings.get_mut(key).unwrap();
             mapping.activity.baseline(&history.user_inputs);
-            mapping
-                .final_ids
-                .extend(history.finals.into_iter().map(|reply| reply.id));
+            // A new session's transcript can already hold the reply to a phone prompt sent before the change.
+            let phone_turn = |turn: &Option<String>| {
+                turn.as_ref()
+                    .is_some_and(|turn| mapping.activity.phone_turn(turn))
+            };
+            let seen: Vec<_> = history
+                .finals
+                .into_iter()
+                .filter(|reply| !phone_turn(&reply.turn))
+                .map(|reply| reply.id)
+                .collect();
+            mapping.final_ids.extend(seen);
             mapping.output_initialised = true;
             mapping.last_export_at = now();
             self.save()?;
@@ -1078,7 +1138,8 @@ impl Bridge {
                         && (mapping.last_state_change_seq != agent.state_change_seq
                             || mapping.last_agent_status != agent.agent_status
                             || mapping.completion_pending
-                            || now().saturating_sub(mapping.last_export_at) >= 30))
+                            || now().saturating_sub(mapping.last_export_at)
+                                >= self.config.settled_reread_secs))
             });
             if needs_read {
                 let result = self
@@ -1141,6 +1202,14 @@ impl Bridge {
             }
             self.save()?;
         }
+        if self.state.mappings[key]
+            .agent_record
+            .as_ref()
+            .is_some_and(|record| record.agent_session != agent.agent_session)
+        {
+            // A new session on the same seat brings a transcript with its own history.
+            self.state.mappings.get_mut(key).unwrap().output_initialised = false;
+        }
         self.baseline_forwarding(key, agent).await?;
         // Older bridge versions created these groups without a transcript watermark.
         // Seed their existing history once when enabling native reply support.
@@ -1179,7 +1248,12 @@ impl Bridge {
                         let group = response["group_id_hex"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| anyhow::anyhow!("Missing group ID"))?.to_owned();
                         let m = self.state.mappings.get_mut(key).unwrap(); m.group_id_hex = Some(group.clone()); m.creating = false;
                         m.group_name = Some(name.clone()); m.group_description = Some(description.clone());
-                        self.state.enqueue(&group, &format!("Hi! This is your chat with {name}.\n\nSend /help in any Codr chat to see available commands."));
+                        let hello = if self.config.backend == Backend::Herdr {
+                            format!("Hi! This is your chat with {name}.\n\nSend /help in any Codr chat to see available commands.")
+                        } else {
+                            format!("Connected to {}: {}. Send a message here to prompt this session. Use /status for its state.", self.backend_name(), agent.title())
+                        };
+                        self.state.enqueue(&group, &hello);
                         self.save()?;
                     }
                     Err(error) => {
@@ -1335,7 +1409,7 @@ impl Bridge {
                     .unwrap()
                     .blocked_context_seq = Some(agent.state_change_seq);
             }
-        } else if self.state.forwarding_enabled
+        } else if self.config.backend == Backend::Herdr && self.state.forwarding_enabled
             && agent.agent_status == "blocked"
             && self.state.mappings[key].blocked_context_seq != Some(agent.state_change_seq)
         {
@@ -1346,7 +1420,7 @@ impl Bridge {
                     json!({"target":agent.pane_id,"source":"visible","format":"text","lines":40}),
                 )
                 .await?;
-            herdr::get(&self.herdr, agent).await?;
+            self.current_agent(agent).await?;
             if let Some(text) = response["result"]["read"]["text"].as_str() {
                 let text = format!("> Blocked... Agent needs input (terminal context):\n{text}");
                 if self.config.edit_responses {
@@ -1371,7 +1445,8 @@ impl Bridge {
         if (agent.settled() || background_claude)
             && (self.state.mappings[key].completion_pending
                 || background_claude
-                || now().saturating_sub(self.state.mappings[key].last_export_at) >= 30)
+                || now().saturating_sub(self.state.mappings[key].last_export_at)
+                    >= self.config.settled_reread_secs)
         {
             self.collect_finals(key, agent, &group).await?;
             if self.config.edit_responses && agent.settled() {
@@ -1511,7 +1586,8 @@ impl Bridge {
         Ok(self
             .reads
             .read(&self.config, agent, self.state.forwarding_revision.clone())
-            .await?
+            .await
+            .map_err(read_failed)?
             .history
             .clone())
     }
@@ -1520,7 +1596,8 @@ impl Bridge {
         Ok(self
             .reads
             .read(&self.config, agent, self.state.forwarding_revision.clone())
-            .await?
+            .await
+            .map_err(read_failed)?
             .tasks
             .clone())
     }
@@ -1529,6 +1606,118 @@ impl Bridge {
     pub async fn poll_sessions(&mut self, agents: Vec<Agent>) -> Result<()> {
         self.reads.background = true;
         self.reconcile(agents).await
+    }
+
+    /// Applies a batch of OpenRig events. Hook states patch the last snapshot, and anything else reads `rig ps` again.
+    pub async fn apply_events(&mut self, events: Vec<openrig::Event>) -> Result<()> {
+        let mut resync = false;
+        let mut statuses = BTreeMap::new();
+        let mut stopped = HashSet::new();
+        for event in events {
+            if event.seq.is_some() {
+                self.state.openrig_event_seq = event.seq;
+            }
+            match event.action {
+                openrig::Action::Ignore => {}
+                openrig::Action::Resync => resync = true,
+                openrig::Action::Status { seat, status, stop } => {
+                    if stop {
+                        stopped.insert(seat.clone());
+                    }
+                    statuses.insert(seat, (status, event.seq.unwrap_or_default()));
+                }
+            }
+        }
+        let mut agents = self.last_snapshot.clone();
+        resync |= statuses
+            .keys()
+            .any(|seat| !agents.iter().any(|agent| agent.seat.as_ref() == Some(seat)));
+        if resync {
+            agents = self.snapshot().await?;
+        } else if statuses.is_empty() {
+            return Ok(());
+        } else {
+            for agent in &mut agents {
+                if let Some((status, seq)) = agent.seat.as_ref().and_then(|seat| statuses.get(seat))
+                {
+                    agent.agent_status.clone_from(status);
+                    agent.state_change_seq = *seq;
+                }
+            }
+        }
+        let keys: Vec<_> = agents
+            .iter()
+            .filter(|agent| {
+                agent
+                    .seat
+                    .as_ref()
+                    .is_some_and(|seat| stopped.contains(seat))
+            })
+            .map(Agent::key)
+            .collect();
+        let finals = |bridge: &Self, key: &String| {
+            bridge
+                .state
+                .mappings
+                .get(key)
+                .map_or(0, |mapping| mapping.final_ids.len())
+        };
+        let before: Vec<_> = keys.iter().map(|key| finals(self, key)).collect();
+        let result = self.reconcile(agents).await;
+        let start = tokio::time::Instant::now();
+        for (key, before) in keys.into_iter().zip(before) {
+            if finals(self, &key) == before {
+                self.stop_rereads.insert(
+                    key,
+                    StopReread {
+                        finals: before,
+                        started: start,
+                        next: start + Duration::from_secs(1),
+                        wait: Duration::from_secs(1),
+                    },
+                );
+            }
+        }
+        result
+    }
+
+    pub fn stop_rereads_pending(&self) -> bool {
+        !self.stop_rereads.is_empty()
+    }
+
+    /// Rereads a stopped seat's transcript after 1, 2, 4… seconds until a final appears or `settled_reread_secs` pass.
+    pub async fn reread_stopped(&mut self) -> Result<()> {
+        let now = tokio::time::Instant::now();
+        let limit = Duration::from_secs(self.config.settled_reread_secs);
+        let state = &self.state;
+        self.stop_rereads.retain(|key, reread| {
+            state
+                .mappings
+                .get(key)
+                .is_some_and(|mapping| mapping.final_ids.len() == reread.finals)
+                && now.duration_since(reread.started) < limit
+        });
+        let mut due = false;
+        for (key, reread) in &mut self.stop_rereads {
+            if reread.next <= now {
+                due = true;
+                reread.wait *= 2;
+                reread.next = now + reread.wait;
+                self.state.mappings.get_mut(key).unwrap().completion_pending = true;
+            }
+        }
+        if !due {
+            return Ok(());
+        }
+        let result = self.reconcile(self.last_snapshot.clone()).await;
+        let state = &self.state;
+        self.stop_rereads.retain(|key, reread| {
+            state
+                .mappings
+                .get(key)
+                .is_some_and(|mapping| mapping.final_ids.len() == reread.finals)
+        });
+        result
     }
 
     pub async fn poll_ready_sessions(&mut self) -> Result<()> {
@@ -1939,7 +2128,7 @@ impl Bridge {
                 "Pending questions and menus cleared. This session has ended; no interrupt was sent. History and accepted deliveries were kept.",
             );
         };
-        let current = herdr::get(&self.herdr, &record).await?;
+        let current = self.current_agent(&record).await?;
         ensure!(
             current.key() == key,
             "The mapped session changed; no interrupt was sent"
@@ -1996,6 +2185,9 @@ impl Bridge {
             "MDK event protocol mismatch"
         );
         if event["type"] == "reaction_added" {
+            if self.force_held(event) {
+                return self.save();
+            }
             self.reaction(event);
             return Ok(());
         }
@@ -2427,6 +2619,41 @@ impl Bridge {
             self.agents.contains_key(&key) || !self.state.mappings[&key].active,
             "Session identity is uncertain; phone input deferred"
         );
+        // Enter in copy mode goes to tmux, so the prompt would sit unsent in the seat's input.
+        if self.config.backend == Backend::OpenRig
+            && !status_command
+            && !text.trim().is_empty()
+            && msg["text_truncated"] != true
+            && msg["attachments_truncated"] != true
+            && msg["media"].as_array().is_none_or(|media| media.is_empty())
+            && !queued
+            && self.releasing.as_deref() != Some(id)
+            && let Some(agent) = self.agents.get(&key).cloned()
+            && (self
+                .state
+                .held_prompts
+                .iter()
+                .any(|held| held.group == group)
+                || self.in_copy_mode(&agent).await)
+        {
+            if !self
+                .state
+                .held_prompts
+                .iter()
+                .any(|held| held.message_id == id)
+            {
+                self.state.held_prompts.push(HeldPrompt {
+                    group: group.into(),
+                    message_id: id.into(),
+                    event: event.clone(),
+                    prepared,
+                    notice_id: None,
+                    force: false,
+                });
+                self.held_due = true;
+            }
+            return self.save();
+        }
         if let Some(agent) = self.agents.get(&key).cloned()
             && (self.state.forwarding_enabled || !immediate_prompt)
         {
@@ -2520,7 +2747,7 @@ impl Bridge {
             && !self.state.mappings[&key].pending_prompt
         {
             let agent = self.agents[&key].clone();
-            match herdr::get(&self.herdr, &agent).await {
+            match self.current_agent(&agent).await {
                 Ok(current) if current.key() == key && (current.settled() || immediate_prompt) => {}
                 Err(error) if error.downcast_ref::<crate::wire::NotSubmitted>().is_some() => {
                     self.herdr_available = false;
@@ -2537,14 +2764,22 @@ impl Bridge {
             pending["group_id_hex"] == group
                 && !(prepared && pending["message"]["message_id_hex"] == id)
         });
+        let media_full = media_busy || self.state.media_pending.len() >= 16;
+        let image_blocked = self.config.backend == Backend::Herdr
+            && !crate::media::audio(msg)
+            && self
+                .agents
+                .get(&key)
+                .is_some_and(|agent| agent.agent_status == "blocked");
         if !status_command
             && msg["text_truncated"] != true
             && msg["attachments_truncated"] != true
             && msg["media"]
                 .as_array()
                 .is_some_and(|items| !items.is_empty())
-            && self.state.media_pending.len() < 16
+            && !media_full
             && self.agents.contains_key(&key)
+            && !image_blocked
         {
             let mut pending = event.clone();
             if crate::media::audio(msg) && self.config.edit_responses {
@@ -2558,11 +2793,7 @@ impl Bridge {
             self.state.media_pending.push(pending);
             return self.save();
         }
-        // Phone-only replies need the checkpoint while the agent works, because the
-        // agent holds the typed prompt and answers it in a later or the running turn.
-        let phone_history = if (self.config.phone_replies_only
-            || self.config.auto_forwarding
-            || queued)
+        let phone_history = if (self.config.phone_replies_only || self.config.auto_forwarding || queued)
             && (!immediate_prompt || self.state.forwarding_enabled)
             && !status_command
             && !text.trim().is_empty()
@@ -2570,13 +2801,11 @@ impl Bridge {
             && msg["attachments_truncated"] != true
             && msg["media"].as_array().is_none_or(|media| media.is_empty())
             && !media_busy
-            && (self.config.phone_replies_only || !self.state.mappings[&key].pending_prompt)
             && self.agents.get(&key).is_some_and(|agent| {
-                (self.config.phone_replies_only || agent.settled())
-                    && agent
-                        .agent_session
-                        .as_ref()
-                        .is_some_and(|session| output::supported(&session.agent))
+                agent
+                    .agent_session
+                    .as_ref()
+                    .is_some_and(|session| output::supported(&session.agent))
             }) {
             let revision = self.state.forwarding_revision.clone();
             let session = self.agents[&key].agent_session.as_ref().unwrap().clone();
@@ -2584,7 +2813,11 @@ impl Bridge {
                 let agent = self.agents[&key].clone();
                 self.read_history(&agent).await?
             } else {
-                self.reads.fresh(&self.config, &session).await?.history
+                self.reads
+                    .fresh(&self.config, &session)
+                    .await
+                    .map_err(read_failed)?
+                    .history
             };
             self.refresh_forwarding()?;
             ensure!(
@@ -2623,12 +2856,14 @@ impl Bridge {
             && !text.trim().is_empty()
             && let Some(agent) = self.agents.get(&key)
         {
-            let current = herdr::get(&self.herdr, agent).await?;
+            let current = self.current_agent(agent).await?;
             ensure!(
                 current.key() == key,
                 "The mapped session changed; phone input was not submitted"
             );
-            if current.agent_status == "blocked" {
+            // OpenRig can keep needs_input after a prompt is answered at the desk. rig send
+            // refuses with target_needs_input while a prompt is really open.
+            if current.agent_status == "blocked" && self.config.backend == Backend::Herdr {
                 if prepared {
                     anyhow::bail!("Prepared media awaits resolution of the native blocking dialog");
                 }
@@ -2688,8 +2923,12 @@ impl Bridge {
         }
         let response = if status_command {
             Some(format!(
-                "> {} Herdr session: {}. {} waiting prompt(s).",
+                "> {} {} session: {}. {} waiting prompt(s).",
                 herdr::status_label(&self.state.mappings[&key].last_agent_status),
+                match self.config.backend {
+                    Backend::Herdr => "Herdr",
+                    Backend::OpenRig => "OpenRig",
+                },
                 if self.agents.contains_key(&key) {
                     "connected"
                 } else {
@@ -2700,11 +2939,21 @@ impl Bridge {
         } else if msg["text_truncated"] == true || msg["attachments_truncated"] == true {
             Some("This offline message was truncated by MDK. No prompt was sent. Send a shorter text message.".into())
         } else if !msg["media"].as_array().is_none_or(|a| a.is_empty()) {
-            Some("Media preparation is unavailable or at capacity. No prompt was sent. Try again when a preparation slot is available.".into())
+            Some(
+                if image_blocked && !media_full {
+                    "The agent is waiting on a terminal prompt. Answer it at the desk, then resend."
+                } else {
+                    "Media preparation is unavailable or at capacity. No prompt was sent. Try again when a preparation slot is available."
+                }
+                .into(),
+            )
         } else if let Some(agent) = self.agents.get(&key).cloned() {
-            if !immediate_prompt
-                && (media_busy || self.state.mappings[&key].pending_prompt || !agent.settled())
-            {
+            if media_busy && !prepared {
+                Some(
+                    "Media from this group is still being prepared. Wait for it, then resend."
+                        .into(),
+                )
+            } else if !immediate_prompt && (self.state.mappings[&key].pending_prompt || !agent.settled()) {
                 Some("The agent is busy or blocked. Wait for it to become idle before sending another prompt.".into())
             } else if text.trim().is_empty() {
                 Some("Send a non-empty text message.".into())
@@ -2755,7 +3004,7 @@ impl Bridge {
                     self.state = before_consumption.unwrap_or(before_submission);
                     return Err(error);
                 }
-                match herdr::prompt(&self.herdr, &agent, text).await {
+                match self.prompt_agent(&agent, text).await {
                     Ok(response) if response["result"]["type"]=="agent_prompted" => {
                         if new_flight {
                             let mapping=self.state.mappings.get_mut(&key).unwrap();
@@ -2794,6 +3043,20 @@ impl Bridge {
                         }
                         None
                     }
+                    Err(error) if error.downcast_ref::<openrig::Refused>().is_some() => {
+                        let reason = &error.downcast_ref::<openrig::Refused>().unwrap().0;
+                        let notice = if reason == "target_needs_input" {
+                            "The agent is waiting on a terminal prompt. Answer it at the desk, then resend.".into()
+                        } else {
+                            format!(
+                                "OpenRig did not type the prompt ({reason}). Resend it when the seat accepts input."
+                            )
+                        };
+                        let m = self.state.mappings.get_mut(&key).unwrap();
+                        m.pending_prompt = false;
+                        m.activity.cancel_phone(id);
+                        Some(notice)
+                    }
                     Ok(_) => Some("The prompt could not be confirmed. It will not be retried. Inspect the agent before submitting again.".into()),
                     Err(error) => {
                         if error.downcast_ref::<crate::wire::NotSubmitted>().is_some() {
@@ -2823,6 +3086,175 @@ impl Bridge {
             self.state.enqueue(group, &text);
         }
         self.save()
+    }
+
+    async fn in_copy_mode(&mut self, agent: &Agent) -> bool {
+        let seat = agent.seat.clone().unwrap_or_default();
+        let checked = match &agent.pane {
+            Some(pane) => pane.in_copy_mode(&self.config).await,
+            None => Err(anyhow::anyhow!("OpenRig reports no tmux pane")),
+        };
+        match checked {
+            Ok(in_mode) => {
+                self.copy_mode_unchecked.remove(&seat);
+                in_mode
+            }
+            Err(error) => {
+                if self.copy_mode_unchecked.insert(seat.clone()) {
+                    eprintln!(
+                        "Copy mode of {seat} is not checked, so phone prompts are sent as before. Cause: {error:#}"
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    /// Marks the held prompts of a group for sending when the phone reacts 👍 to a held notice.
+    fn force_held(&mut self, event: &Value) -> bool {
+        let thumbs_up = event["emoji"].as_str().is_some_and(|emoji| {
+            emoji
+                .chars()
+                .filter(|c| !matches!(c, '\u{1F3FB}'..='\u{1F3FF}' | '\u{FE0F}'))
+                .eq("👍".chars())
+        });
+        if !thumbs_up
+            || event["account_id_hex"] != self.config.account_id_hex
+            || event["actor"]["account_id_hex"] != self.phone
+        {
+            return false;
+        }
+        let (group, target) = (
+            event["group_id_hex"].as_str(),
+            event["target_message_id_hex"].as_str(),
+        );
+        let mut forced = false;
+        for held in &mut self.state.held_prompts {
+            if target.is_some() && held.notice_id.as_deref() == target && group == Some(&held.group)
+            {
+                held.force = true;
+                forced = true;
+            }
+        }
+        self.held_due |= forced;
+        forced
+    }
+
+    /// Sends held prompts in order when their pane leaves copy mode or the phone reacts 👍.
+    /// While the pane stays in copy mode, each held prompt gets one notice.
+    pub async fn process_held(&mut self) -> Result<()> {
+        self.held_due = false;
+        let mut groups: Vec<String> = vec![];
+        for held in &self.state.held_prompts {
+            if !groups.contains(&held.group) {
+                groups.push(held.group.clone());
+            }
+        }
+        let mut result = Ok(());
+        for group in groups {
+            let agent = self
+                .state
+                .mappings
+                .iter()
+                .find(|(_, mapping)| mapping.group_id_hex.as_deref() == Some(&group))
+                .and_then(|(key, _)| self.agents.get(key))
+                .cloned();
+            let force = self
+                .state
+                .held_prompts
+                .iter()
+                .any(|held| held.group == group && held.force);
+            let in_mode = match &agent {
+                Some(agent) => self.in_copy_mode(agent).await,
+                None => false,
+            };
+            if in_mode && !force {
+                if let Err(error) = self.send_held_notices(&group).await {
+                    result = Err(error);
+                }
+                continue;
+            }
+            if in_mode
+                && let Some(pane) = agent.as_ref().and_then(|agent| agent.pane.as_ref())
+                && let Err(error) = pane.leave_copy_mode(&self.config).await
+            {
+                eprintln!(
+                    "Copy mode could not be left for a forced phone prompt. Cause: {error:#}"
+                );
+            }
+            while let Some(held) = self
+                .state
+                .held_prompts
+                .iter()
+                .find(|held| held.group == group)
+                .cloned()
+            {
+                self.releasing = Some(held.message_id.clone());
+                let sent = self.route_inbound(&held.event, held.prepared, false).await;
+                self.releasing = None;
+                if let Err(error) = sent {
+                    for other in &mut self.state.held_prompts {
+                        if other.group == group {
+                            other.force = false;
+                        }
+                    }
+                    self.save()?;
+                    result = Err(error);
+                    break;
+                }
+                self.state
+                    .held_prompts
+                    .retain(|other| other.message_id != held.message_id);
+                // The guard for media still in preparation would refuse the next held text.
+                if held.prepared
+                    && self.state.mappings.values().any(|mapping| {
+                        mapping.group_id_hex.as_deref() == Some(group.as_str())
+                            && mapping.seen_messages.contains(&held.message_id)
+                    })
+                {
+                    self.state.media_pending.retain(|pending| {
+                        pending["group_id_hex"] != group.as_str()
+                            || pending["message"]["message_id_hex"] != held.message_id.as_str()
+                    });
+                }
+                self.save()?;
+            }
+        }
+        result
+    }
+
+    async fn send_held_notices(&mut self, group: &str) -> Result<()> {
+        let unnoticed: Vec<String> = self
+            .state
+            .held_prompts
+            .iter()
+            .filter(|held| held.group == group && held.notice_id.is_none())
+            .map(|held| held.message_id.clone())
+            .collect();
+        for id in unnoticed {
+            let response = self
+                .marmot
+                .marmot(
+                    json!({"type":"send_final","account_id_hex":self.config.account_id_hex,
+                    "group_id_hex":group,"text":HELD,"reply_to_message_id_hex":id,
+                    "idempotency_key":uuid::Uuid::new_v4().to_string()}),
+                )
+                .await?;
+            let notice = response["message_ids_hex"][0]
+                .as_str()
+                .filter(|_| response["type"] == "final_sent")
+                .ok_or_else(|| anyhow::anyhow!("MDK did not confirm the held notice"))?;
+            if let Some(held) = self
+                .state
+                .held_prompts
+                .iter_mut()
+                .find(|held| held.message_id == id)
+            {
+                held.notice_id = Some(notice.into());
+            }
+            self.save()?;
+        }
+        Ok(())
     }
 
     fn reaction(&mut self, event: &Value) {
@@ -2983,6 +3415,11 @@ impl Bridge {
         if let Some(index) = self.state.media_pending.iter().position(|event| {
                 event["_codr_prepared_text"].is_string()
                     && event["_codr_retry_at"].as_u64().unwrap_or(0) <= now()
+                    && !self.state.held_prompts.iter().any(|held| {
+                        held.prepared
+                            && Some(held.message_id.as_str())
+                                == event["message"]["message_id_hex"].as_str()
+                    })
             })
             // An active download owns element zero. Removing a ready later
             // element cannot disturb that job or hold up prepared input.
@@ -3255,7 +3692,7 @@ impl Bridge {
         else {
             return self.permission_notice(key, group, id, "This permission needs the terminal.");
         };
-        if herdr::get(&self.herdr, &agent).await?.agent_status != "blocked" {
+        if self.current_agent(&agent).await?.agent_status != "blocked" {
             return self.permission_notice(key, group, id, "Permission is no longer waiting.");
         }
         let fresh = output::permission::read_request(
@@ -3272,7 +3709,7 @@ impl Bridge {
                 "Permission changed or could not be verified. No reply sent.",
             );
         }
-        if herdr::get(&self.herdr, &agent).await?.agent_status != "blocked" {
+        if self.current_agent(&agent).await?.agent_status != "blocked" {
             return self.permission_notice(key, group, id, "Permission is no longer waiting.");
         }
         // Durable intent precedes the only mutation. Unknown results must never auto-retry.
@@ -3374,7 +3811,7 @@ impl Bridge {
         if agent.agent_status != "blocked" && previous.is_none() && !looks_like_answer {
             return Ok(false);
         }
-        let current = herdr::get(&self.herdr, agent).await?;
+        let current = self.current_agent(agent).await?;
         if current.agent_status != "blocked" {
             if previous.is_some() && looks_like_answer {
                 return self.decision_notice(
@@ -3386,9 +3823,13 @@ impl Bridge {
             }
             return Ok(false);
         }
-        let snapshot = self.reads.fresh(&self.config, session).await?;
+        let snapshot = self
+            .reads
+            .fresh(&self.config, session)
+            .await
+            .map_err(read_failed)?;
         let Some(active) = snapshot.decision else {
-            if looks_like_answer {
+            if looks_like_answer || previous.is_some() {
                 return self.decision_notice(key, group, id, "No supported decision is available yet. Wait for its question card or use the terminal. No answer was sent.");
             }
             return Ok(false);
@@ -3423,10 +3864,10 @@ impl Bridge {
                 && visible["result"]["read"]["text"]
                     .as_str()
                     .is_some_and(|text| decision.matches_visible(text));
-            if !matches || herdr::get(&self.herdr, agent).await?.agent_status != "blocked" {
+            if !matches || self.current_agent(agent).await?.agent_status != "blocked" {
                 return self.decision_notice(key, group, id, "The terminal is no longer showing that decision's choice list. No answer was sent. Check the terminal or wait for its current question.");
             }
-        } else if herdr::get(&self.herdr, agent).await?.agent_status != "blocked" {
+        } else if self.current_agent(agent).await?.agent_status != "blocked" {
             return self.decision_notice(
                 key,
                 group,
@@ -3582,7 +4023,8 @@ impl Bridge {
     }
 
     pub async fn rename_groups(&mut self) -> Result<()> {
-        let live: BTreeMap<_, _> = herdr::snapshot(&self.herdr)
+        let live: BTreeMap<_, _> = self
+            .snapshot()
             .await?
             .into_iter()
             .map(|a| (a.key(), a))
@@ -3620,7 +4062,10 @@ impl Bridge {
                 .as_ref()
                 .map(Agent::group_description)
                 .unwrap_or_else(|| {
-                    "Workspace: unknown\nAgent: unknown\nManaged by codr via herdr.".into()
+                    format!(
+                        "Workspace: unknown\nAgent: unknown\nManaged by codr via {}.",
+                        self.backend_name()
+                    )
                 });
             // MDK 0.13 exposes the subject but not the description. Remember only
             // confirmed metadata writes, so matching titles can still gain details.
@@ -3795,6 +4240,26 @@ impl Bridge {
         Ok(info)
     }
 
+    /// Returns false when the backend did not list its agents.
+    async fn resync(&mut self) -> bool {
+        match self.snapshot().await {
+            Ok(agents) => {
+                if self.reconcile(agents).await.is_err() {
+                    eprintln!("Session reconciliation failed; will retry.");
+                }
+                true
+            }
+            Err(_) => {
+                self.herdr_available = false;
+                eprintln!(
+                    "{} is unavailable; waiting for reconnection.",
+                    self.backend_name()
+                );
+                false
+            }
+        }
+    }
+
     pub async fn run(&mut self, porter_enabled: bool) -> Result<()> {
         let porter_listener = if porter_enabled {
             Some(crate::porter::listen(&self.config.state_path)?)
@@ -3820,15 +4285,35 @@ impl Bridge {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
+        let (event_tx, mut events) = tokio::sync::mpsc::channel::<openrig::Event>(256);
+        let follower = (self.config.backend == Backend::OpenRig).then(|| {
+            let config = self.config.clone();
+            let since = self.state.openrig_event_seq;
+            tokio::spawn(async move { openrig::follow(&config, since, event_tx).await })
+        });
+        // Authoritative snapshots avoid relying on HERDR's non-durable, differently shaped event payloads.
         // Authoritative snapshots avoid relying on herdr's non-durable, differently shaped event payloads.
         // State-change sequence and stored assistant message IDs also catch work completed between snapshots.
-        let mut tick = tokio::time::interval(Duration::from_secs(3));
+        // OpenRig events drive its seats, so its snapshot only resyncs.
+        let mut tick = tokio::time::interval(Duration::from_secs(match self.config.backend {
+            Backend::Herdr => 3,
+            Backend::OpenRig => 60,
+        }));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut recovery_due = true;
         let mut recovery_tick = tokio::time::interval(Duration::from_secs(60));
+        let mut reread_tick = tokio::time::interval(Duration::from_secs(1));
         recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut speech_tick = tokio::time::interval(Duration::from_secs(1));
+        let mut held_tick = tokio::time::interval(Duration::from_secs(2));
+        // A deferred phone message retries after a fresh snapshot within seconds, because the
+        // OpenRig snapshot and the recovery ticks are 60 s apart.
+        let mut retry = tokio::time::interval(Duration::from_secs(2));
+        let mut retries = 0u8;
+        let mut media_retried = false;
         loop {
+            let mut inbound_deferred = false;
+            let mut media_deferred = false;
             tokio::select! {
                 Ok(stream) = crate::porter::accept(&porter_listener) => {
                     if crate::porter::serve(self, stream).await.is_err() {
@@ -3837,14 +4322,30 @@ impl Bridge {
                 },
                 _ = tokio::signal::ctrl_c() => {
                     subscriber.abort();
+                    if let Some(follower) = &follower { follower.abort(); }
                     if let Some(job) = self.media_job.take() { job.abort(); }
                     for speech in &self.speech_jobs { speech.job.abort(); }
                     return Ok(());
                 },
                 _ = tick.tick() => {
-                    match herdr::snapshot(&self.herdr).await {
-                        Ok(agents) => if self.reconcile(agents).await.is_err() { eprintln_throttled!("Session reconciliation failed; will retry."); },
-                        Err(_) => { self.herdr_available = false; recovery_due = true; eprintln_throttled!("herdr is unavailable; waiting for reconnection."); }
+                    if !self.resync().await { recovery_due = true; }
+                },
+                _ = retry.tick(), if retries > 0 => {
+                    retries -= 1;
+                    self.resync().await;
+                    recovery_due = true;
+                },
+                Some(event) = events.recv() => {
+                    let mut batch = vec![event];
+                    while let Ok(event) = events.try_recv() { batch.push(event); }
+                    if self.apply_events(batch).await.is_err() {
+                        recovery_due = true;
+                        eprintln!("OpenRig event handling failed; the next resync retries it.");
+                    }
+                },
+                _ = reread_tick.tick(), if self.stop_rereads_pending() => {
+                    if self.reread_stopped().await.is_err() {
+                        eprintln!("A stopped seat's transcript reread failed; it retries.");
                     }
                 },
                 _ = reads_ready.notified() => {
@@ -3856,13 +4357,23 @@ impl Bridge {
                     if event["type"] == "reconcile_inbound" || event["type"] == "resync_required" {
                         // Refresh current agent identities before recovering any queued phone prompts.
                         recovery_due = true;
-                    } else if self.inbound(&event).await.is_err() { recovery_due = true; eprintln_throttled!("Inbound message deferred; will reconcile history."); }
+                    } else if let Err(error) = self.inbound(&event).await {
+                        recovery_due = true;
+                        inbound_deferred = true;
+                        eprintln!("Inbound message deferred; will reconcile history. Cause: {error:#}");
+                    }
                 },
                 _ = recovery_tick.tick() => { recovery_due = true; }
                 _ = speech_tick.tick(), if !self.speech_jobs.is_empty() => {}
+                _ = held_tick.tick(), if !self.state.held_prompts.is_empty() => { self.held_due = true; }
             }
             if recovery_due && self.herdr_available {
                 recovery_due = self.recover_inbound().await.is_err();
+            }
+            if self.held_due
+                && let Err(error) = self.process_held().await
+            {
+                eprintln!("Held phone message deferred; it retries. Cause: {error:#}");
             }
             if self.update_messaging_home.is_some() && self.state.update_job.is_some() {
                 // Failed messaging startup leaves desktop reads available, but
@@ -3874,9 +4385,28 @@ impl Bridge {
                     "Update result remains pending; no automatic installation retry."
                 );
             }
-            if self.process_media().await.is_err() {
+            if let Err(error) = self.process_media().await {
                 recovery_due = true;
-                eprintln_throttled!("Prepared media input deferred; will reconcile history.");
+                media_deferred = true;
+                eprintln!(
+                    "Prepared media input deferred; will reconcile history. Cause: {error:#}"
+                );
+            }
+            // Deferred media fails again on every pass while the agent works, so it arms the
+            // retries once while it waits. A recovery that succeeds leaves the media waiting.
+            if inbound_deferred || (media_deferred && !media_retried) {
+                retries = 3;
+                retry.reset();
+                media_retried |= media_deferred;
+            }
+            let media_waiting = self
+                .state
+                .media_pending
+                .iter()
+                .any(|event| event["_codr_prepared_text"].is_string());
+            if !recovery_due && !media_waiting {
+                retries = 0;
+                media_retried = false;
             }
             if self.check_submission_acceptances().is_err() {
                 eprintln_throttled!(
@@ -3892,6 +4422,18 @@ impl Bridge {
             crate::porter::publish(self);
         }
     }
+}
+
+/// Transcript errors can quote transcript text or CLI stderr, and deferral logs print the chain.
+/// `Pending` passes through, because callers downcast it to stay silent.
+fn read_failed(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<crate::reads::Pending>() {
+        return error;
+    }
+    anyhow::anyhow!(
+        "Session history read failed: {}",
+        output::read_error_message(&error)
+    )
 }
 
 pub fn now() -> u64 {

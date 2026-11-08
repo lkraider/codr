@@ -12,6 +12,7 @@ async fn installed_pending_question_is_available_without_answering_it() {
         agent: "opencode".into(),
         kind: "id".into(),
         value: std::env::var("CODR_TEST_DECISION_SESSION").unwrap(),
+        home: None,
     };
     let decision = output::decision::read(&config, &session)
         .await

@@ -93,6 +93,7 @@ async fn recent_excerpt_labels_each_sender_with_the_original_source_date_in_utc(
         let history = output::read_history(
             &config,
             &Session {
+                home: None,
                 source: "test".into(),
                 agent: if provider.starts_with("opencode") {
                     "opencode"
@@ -125,6 +126,7 @@ async fn recent_excerpt_does_not_invent_dates_for_missing_or_invalid_source_cloc
         let history = output::read_history(
             &config,
             &Session {
+                home: None,
                 source: "test".into(),
                 agent: if provider.starts_with("opencode") {
                     "opencode"
@@ -174,6 +176,7 @@ async fn native_excerpts_mark_absent_timestamps_unknown_instead_of_using_file_mt
         let history = output::read_history(
             &config,
             &Session {
+                home: None,
                 source: "test".into(),
                 agent: provider.into(),
                 kind: "id".into(),
@@ -215,6 +218,7 @@ async fn claude_chunked_answer_keeps_its_first_source_timestamp() {
     let history = output::read_history(
         &config,
         &Session {
+            home: None,
             source: "test".into(),
             agent: "claude".into(),
             kind: "id".into(),

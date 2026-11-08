@@ -111,6 +111,7 @@ async fn missing_service_is_retryable_without_cli_fallback() {
         agent: "opencode".into(),
         kind: "id".into(),
         value: "ses_fixture".into(),
+        home: None,
     };
     assert!(
         output::read_history(&config, &session)

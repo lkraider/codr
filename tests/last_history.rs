@@ -62,6 +62,7 @@ async fn all_providers_keep_a_bounded_replay_window_without_expanding_recent() {
         let history = output::read_history(
             &config,
             &Session {
+                home: None,
                 source: "test".into(),
                 agent: if provider.starts_with("opencode") {
                     "opencode"

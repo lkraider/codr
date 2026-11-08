@@ -12,6 +12,7 @@ pub mod herdr;
 pub mod launch;
 pub mod launch_flow;
 pub mod media;
+pub mod openrig;
 pub mod outbound_images;
 pub mod output;
 mod reads;

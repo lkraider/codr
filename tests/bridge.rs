@@ -25,7 +25,12 @@ fn config(dir: &std::path::Path) -> BridgeConfig {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     BridgeConfig {
         phone_npub: phone_npub(),
+        backend: Default::default(),
         herdr_socket: dir.join("herdr.sock"),
+        openrig_seats: vec![],
+        rig_bin: "rig".into(),
+        tmux_bin: "tmux".into(),
+        openrig_url: "http://127.0.0.1:7433".into(),
         wn_agent_socket: dir.join("wn.sock"),
         account_id_hex: "aa".repeat(32),
         state_path: dir.join("state.json"),
@@ -40,6 +45,7 @@ fn config(dir: &std::path::Path) -> BridgeConfig {
         edit_responses: false,
         auto_forwarding: false,
         phone_replies_only: false,
+        settled_reread_secs: 30,
         transcribe_command: vec![],
         speak_command: vec![],
         speak_reaction: None,
@@ -6963,6 +6969,7 @@ async fn a_deferred_phone_wake_does_not_undo_a_later_desk_selection() {
     );
 }
 
+
 #[tokio::test]
 async fn selecting_desk_during_a_transcript_read_still_allows_an_invitation() {
     let dir = tempfile::tempdir().unwrap();
@@ -8766,6 +8773,7 @@ async fn native_round_trip(provider: &str, legacy_mapping: bool) {
         agent: provider.into(),
         kind: "id".into(),
         value: ID.into(),
+        home: None,
     });
     let path = if provider == "codex" {
         config
@@ -8883,6 +8891,7 @@ async fn legacy_native_session_that_exited_before_upgrade_does_not_replay_histor
             agent: provider.into(),
             kind: "id".into(),
             value: ID.into(),
+            home: None,
         });
         let (path, rows) = if provider == "codex" {
             (
@@ -9930,6 +9939,46 @@ async fn renaming_uses_the_existing_title_when_an_ended_group_has_no_stored_tab_
 }
 
 #[tokio::test]
+async fn an_image_waits_in_the_chat_queue_while_a_prompt_is_pending_or_the_agent_works() {
+    for status in ["idle", "working", "blocked"] {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        export_script(&config.opencode_bin, "Historical answer", "old");
+        let calls = Arc::new(Mutex::new(vec![]));
+        let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+        let herdr = peer(&config.herdr_socket, false, calls.clone()).await;
+        let mut bridge = Bridge::open(config).unwrap();
+        let mut observed = agent();
+        observed.agent_status = status.into();
+        bridge.reconcile(vec![observed]).await.unwrap();
+        bridge.state.outbox.clear();
+        bridge
+            .state
+            .mappings
+            .get_mut(&agent().key())
+            .unwrap()
+            .pending_prompt = true;
+        let image = root.path().join("photo.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\nexample").unwrap();
+        let mut event = inbound(HEX, "photo");
+        event["message"]["text"] = json!("");
+        event["message"]["media"] = json!([{"media_type":"image/png","test_path":image,"file_name":"photo.png",
+            "ciphertext_sha256":"aa".repeat(32),"plaintext_sha256":"bb".repeat(32),"nonce_hex":"00".repeat(12),
+            "version":"encrypted-media-v1","source_epoch":1,"locators":[{"kind":"blossom-v1","value":"https://example.com/fixture"}]}]);
+        bridge.inbound(&event).await.unwrap();
+        // The chat's persistent queue holds the image until the agent can take it.
+        assert!(bridge.state.media_pending.is_empty(), "{status}");
+        assert_eq!(
+            bridge.state.mappings[&agent().key()].prompt_queue.len(),
+            1,
+            "{status}"
+        );
+        mdk.abort();
+        herdr.abort();
+    }
+}
+
+#[tokio::test]
 async fn deferred_prepared_media_does_not_block_another_session() {
     let root = tempfile::tempdir().unwrap();
     let config = config(root.path());
@@ -10872,389 +10921,6 @@ async fn an_unconfirmed_profile_update_is_not_retried() {
     mdk.abort();
 }
 
-#[tokio::test]
-async fn control_chat_is_created_once_and_answers_without_an_agent() {
-    let root = tempfile::tempdir().unwrap();
-    let mut config = config(root.path());
-    config.control_chat = true;
-    let calls = Arc::new(Mutex::new(vec![]));
-    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
-    let mut bridge = Bridge::open(config).unwrap();
-    assert!(bridge.state.mappings.contains_key("control"));
-
-    bridge.reconcile(vec![]).await.unwrap();
-    let control = &bridge.state.mappings["control"];
-    assert_eq!(
-        control.group_id_hex.as_deref(),
-        Some("bb".repeat(16).as_str())
-    );
-    assert!(control.active && !control.creating);
-    assert_eq!(
-        calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|call| call["type"] == "group_create_with_admins")
-            .count(),
-        1
-    );
-
-    let mut plain = inbound(HEX, "control-1");
-    plain["message"]["text"] = json!("hello");
-    bridge.inbound(&plain).await.unwrap();
-    assert!(
-        bridge
-            .state
-            .outbox
-            .iter()
-            .any(|item| item.text.contains("control chat") && item.text.contains("/new"))
-    );
-
-    let mut status = inbound(HEX, "control-2");
-    status["message"]["text"] = json!("status");
-    bridge.inbound(&status).await.unwrap();
-    assert!(
-        bridge
-            .state
-            .outbox
-            .iter()
-            .any(|item| item.text.contains("mapped session"))
-    );
-
-    let mut ambiguous = inbound(HEX, "control-3");
-    ambiguous["message"]["text"] = json!("/s");
-    bridge.inbound(&ambiguous).await.unwrap();
-    assert!(
-        bridge
-            .state
-            .outbox
-            .last()
-            .is_some_and(|item| item.text.contains("Ambiguous command"))
-    );
-
-    let mut agent = inbound(HEX, "control-4");
-    agent["message"]["text"] = json!("/agent");
-    bridge.inbound(&agent).await.unwrap();
-    assert!(
-        bridge
-            .state
-            .outbox
-            .last()
-            .is_some_and(|item| item.text.contains("not mapped to a project"))
-    );
-
-    let mut new = inbound(HEX, "control-5");
-    new["message"]["text"] = json!("new");
-    bridge.inbound(&new).await.unwrap();
-    assert!(
-        bridge
-            .state
-            .outbox
-            .last()
-            .is_some_and(|item| item.text.contains("workspace"))
-    );
-
-    let mut menu = inbound(HEX, "control-6");
-    menu["message"]["text"] = json!("n");
-    bridge.inbound(&menu).await.unwrap();
-    assert!(
-        bridge
-            .state
-            .outbox
-            .last()
-            .is_some_and(|item| item.text.contains("setup menu is open"))
-    );
-
-    bridge
-        .state
-        .mappings
-        .get_mut("control")
-        .unwrap()
-        .launch_draft
-        .as_mut()
-        .unwrap()
-        .expires_at = 0;
-    let mut fresh = inbound(HEX, "control-7");
-    fresh["message"]["text"] = json!("new");
-    bridge.inbound(&fresh).await.unwrap();
-    assert!(
-        bridge
-            .state
-            .outbox
-            .last()
-            .is_some_and(|item| item.text.contains("workspace"))
-    );
-
-    bridge.reconcile(vec![]).await.unwrap();
-    assert!(bridge.state.mappings["control"].active);
-    assert_eq!(
-        calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|call| call["type"] == "group_create_with_admins")
-            .count(),
-        1
-    );
-    mdk.abort();
-}
-
-#[tokio::test]
-async fn control_chat_does_not_block_forwarding_resume() {
-    let root = tempfile::tempdir().unwrap();
-    let mut config = config(root.path());
-    config.control_chat = true;
-    let calls = Arc::new(Mutex::new(vec![]));
-    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
-    let mut bridge = Bridge::open(config.clone()).unwrap();
-    bridge.reconcile(vec![]).await.unwrap();
-
-    herdr_white_noise_bridge::forwarding::set(&config.state_path, false).unwrap();
-    bridge.reconcile(vec![]).await.unwrap();
-    assert!(!bridge.state.forwarding_enabled);
-
-    // A phone message wakes forwarding; the synthetic control chat has no
-    // transcript, so it must not be treated as a blocking checkpoint.
-    herdr_white_noise_bridge::forwarding::set(&config.state_path, true).unwrap();
-    bridge.reconcile(vec![]).await.unwrap();
-    assert!(bridge.state.forwarding_enabled);
-    assert!(!bridge.state.forwarding_resume_pending);
-    mdk.abort();
-}
-
-#[tokio::test]
-async fn forwarding_reset_does_not_reannounce_an_unchanged_blocked_context() {
-    for editable in [false, true] {
-        for delivered in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let mut config = config(root.path());
-            config.edit_responses = editable;
-            input_history(
-                &config,
-                "ses_1",
-                &[("prior-input", "Prior task")],
-                Some(("prior-reply", "Prior answer")),
-            );
-            // Keep the fixture slower than the former 20 x 10 ms observation
-            // window, as can happen when full-binary CI runs contend for I/O.
-            let script = std::fs::read_to_string(&config.opencode_bin).unwrap();
-            std::fs::write(
-                &config.opencode_bin,
-                script.replacen("#!/bin/sh\n", "#!/bin/sh\nsleep 0.3\n", 1),
-            )
-            .unwrap();
-            let mut bridge = Bridge::open(config.clone()).unwrap();
-            let mut blocked = agent();
-            blocked.agent_status = "blocked".into();
-            blocked.state_change_seq = 2;
-            let observed = Arc::new(Mutex::new(blocked.clone()));
-            let calls = Arc::new(Mutex::new(vec![]));
-            let herdr = decision_herdr(
-                &config.herdr_socket,
-                observed.clone(),
-                Arc::new(Mutex::new("Input required".into())),
-                calls.clone(),
-            )
-            .await;
-            bridge.state.mappings.insert(
-                blocked.key(),
-                Mapping {
-                    group_id_hex: Some("bb".repeat(16)),
-                    output_initialised: true,
-                    active: true,
-                    agent_record: Some(blocked.clone()),
-                    last_agent_status: "idle".into(),
-                    last_state_change_seq: 1,
-                    ..Mapping::default()
-                },
-            );
-            let announced = |bridge: &Bridge| {
-                bridge.state.outbox.iter().any(|item| {
-                    item.text.contains("Agent needs input")
-                        && item.response.as_ref().is_none_or(|response| {
-                            response.sent_text.as_deref() != Some(item.text.as_str())
-                        })
-                })
-            };
-            for _ in 0..1000 {
-                let _ = bridge.poll_sessions(vec![blocked.clone()]).await;
-                if announced(&bridge) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            assert!(announced(&bridge));
-            if delivered {
-                bridge.state.outbox.retain_mut(|item| {
-                    if let Some(response) = item.response.as_mut() {
-                        response.target = Some("delivered-blocked-notice".into());
-                        response.sent_text = Some(item.text.clone());
-                        true
-                    } else {
-                        false
-                    }
-                });
-            }
-
-            herdr_white_noise_bridge::forwarding::set(&config.state_path, false).unwrap();
-            for _ in 0..20 {
-                let _ = bridge.poll_sessions(vec![blocked.clone()]).await;
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            assert!(
-                calls
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .all(|call| call["method"] != "agent.read"),
-                "muted blocks must not consume an announcement"
-            );
-            herdr_white_noise_bridge::forwarding::set(&config.state_path, true).unwrap();
-            for _ in 0..1000 {
-                let _ = bridge.poll_sessions(vec![blocked.clone()]).await;
-                // Wait for the asynchronous checkpoint and blocked-context read,
-                // not an assumed CLI completion time under CI contention.
-                if bridge.state.forwarding_enabled
-                    && !bridge.state.forwarding_resume_pending
-                    && bridge.state.mappings[&blocked.key()].blocked_context_seq
-                        == Some(blocked.state_change_seq)
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            assert!(
-                bridge.state.forwarding_enabled && !bridge.state.forwarding_resume_pending,
-                "forwarding checkpoint must complete before checking delivery"
-            );
-            assert_eq!(
-                bridge.state.mappings[&blocked.key()].blocked_context_seq,
-                Some(blocked.state_change_seq),
-                "blocked context must finish refreshing"
-            );
-            assert!(
-                announced(&bridge) != delivered,
-                "mute/wake must retry only an undelivered blocked notice"
-            );
-
-            bridge.state.outbox.clear();
-            blocked.state_change_seq = 3;
-            *observed.lock().unwrap() = blocked.clone();
-            for _ in 0..1000 {
-                let _ = bridge.poll_sessions(vec![blocked.clone()]).await;
-                if announced(&bridge) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            assert!(announced(&bridge), "a new blocked context is announced");
-            herdr.abort();
-        }
-    }
-}
-
-#[tokio::test]
-async fn claude_replies_reach_the_phone_while_background_tasks_keep_it_working() {
-    const ID: &str = "11111111-1111-4111-8111-111111111111";
-    let root = tempfile::tempdir().unwrap();
-    let mut config = config(root.path());
-    config.auto_forwarding = true;
-    config.edit_responses = true;
-    let mut observed = agent();
-    observed.agent = "claude".into();
-    observed.agent_session = Some(herdr_white_noise_bridge::herdr::Session {
-        source: "herdr:claude".into(),
-        agent: "claude".into(),
-        kind: "id".into(),
-        value: ID.into(),
-    });
-    let path = config
-        .claude_home
-        .join("projects/project")
-        .join(format!("{ID}.jsonl"));
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let mut rows = vec![
-        json!({"type":"user","uuid":"u0","sessionId":ID,"origin":{"kind":"human"},"promptSource":"typed","message":{"role":"user","content":"Old prompt"}}),
-        json!({"type":"assistant","uuid":"a0","parentUuid":"u0","sessionId":ID,"message":{"role":"assistant","id":"api-0","stop_reason":"end_turn","content":[{"type":"text","text":"Old reply"}]}}),
-    ];
-    let write = |rows: &[Value]| {
-        std::fs::write(
-            &path,
-            rows.iter()
-                .map(|row| format!("{row}\n"))
-                .collect::<String>(),
-        )
-        .unwrap();
-    };
-    write(&rows);
-    let calls = Arc::new(Mutex::new(vec![]));
-    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
-    let herdr = peer_for_agent(&config.herdr_socket, false, calls.clone(), observed.clone()).await;
-    let mut bridge = Bridge::open(config.clone()).unwrap();
-    bridge.state.mappings.insert(
-        observed.key(),
-        activity_mapping(observed.clone(), &"bb".repeat(16)),
-    );
-    bridge.reconcile(vec![observed.clone()]).await.unwrap();
-    bridge.inbound(&inbound(HEX, "phone")).await.unwrap();
-    assert!(bridge.state.forwarding_enabled);
-    let replied = |bridge: &Bridge, text: &str| {
-        bridge.state.outbox.iter().any(|item| item.text == text)
-            || calls
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|call| call["text"] == text)
-    };
-    // Claude ends its turn, but a background task keeps herdr reporting "working".
-    rows.extend([
-        json!({"type":"user","uuid":"u1","parentUuid":"a0","sessionId":ID,"origin":{"kind":"human"},"promptSource":"typed","message":{"role":"user","content":"test prompt"}}),
-        json!({"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":ID,"message":{"role":"assistant","id":"api-1","stop_reason":"end_turn","content":[{"type":"text","text":"First reply"}]}}),
-    ]);
-    write(&rows);
-    observed.agent_status = "working".into();
-    observed.state_change_seq += 1;
-    bridge.reconcile(vec![observed.clone()]).await.unwrap();
-    assert!(replied(&bridge, "First reply"));
-    // A completed reply must not create a replacement working bubble on the next poll.
-    let progress = bridge.state.mappings[&observed.key()].response_id.clone();
-    assert!(progress.is_some());
-    bridge.reconcile(vec![observed.clone()]).await.unwrap();
-    assert_eq!(bridge.state.mappings[&observed.key()].response_id, progress);
-    observed.agent_status = "idle".into();
-    observed.state_change_seq += 1;
-    bridge.reconcile(vec![observed.clone()]).await.unwrap();
-    assert!(bridge.state.mappings[&observed.key()].response_id.is_none());
-    assert!(!bridge.state.outbox.iter().any(|item| {
-        item.response
-            .as_ref()
-            .is_some_and(|response| !response.finished)
-    }));
-    // The task's notification is not local typing and does not mute forwarding.
-    rows.extend([
-        json!({"type":"user","uuid":"n1","parentUuid":"a1","sessionId":ID,"origin":{"kind":"task-notification"},"promptSource":"system","message":{"role":"user","content":"<task-notification>done</task-notification>"}}),
-        json!({"type":"assistant","uuid":"a2","parentUuid":"n1","sessionId":ID,"message":{"role":"assistant","id":"api-2","stop_reason":"end_turn","content":[{"type":"text","text":"Background result"}]}}),
-    ]);
-    write(&rows);
-    observed.agent_status = "idle".into();
-    observed.state_change_seq += 1;
-    bridge.reconcile(vec![observed.clone()]).await.unwrap();
-    assert!(bridge.state.forwarding_enabled);
-    assert!(replied(&bridge, "Background result"));
-    bridge.flush().await.unwrap();
-    assert_eq!(
-        calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|call| call["text"] == "First reply")
-            .count(),
-        1
-    );
-    mdk.abort();
-    herdr.abort();
-}
-
 fn claude_agent(status: &str) -> Agent {
     let mut observed = agent();
     observed.agent = "claude".into();
@@ -11264,6 +10930,7 @@ fn claude_agent(status: &str) -> Agent {
         agent: "claude".into(),
         kind: "id".into(),
         value: "11111111-1111-4111-8111-111111111111".into(),
+        home: None,
     });
     observed
 }
@@ -11573,59 +11240,6 @@ async fn phone_replies_only_sends_no_idle_when_a_phone_turn_ends_from_blocked() 
     }
 }
 
-/// Whether the phone prompt took a transcript checkpoint. The checkpoint read records the input
-/// rows that already exist, so the phone submission does not claim them as its own.
-async fn takes_checkpoint(phone_replies_only: bool, status: &str, pending_prompt: bool) -> bool {
-    let dir = tempfile::tempdir().unwrap();
-    let mut config = config(dir.path());
-    config.auto_forwarding = true;
-    config.phone_replies_only = phone_replies_only;
-    let observed = claude_agent(status);
-    let before = [("u0", "user", "Old prompt"), ("a0", "final", "Old final")];
-    claude_transcript(&config, &before);
-    let calls = Arc::new(Mutex::new(vec![]));
-    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
-    let herdr = peer_for_agent(&config.herdr_socket, false, calls.clone(), observed.clone()).await;
-    let mut bridge = Bridge::open(config.clone()).unwrap();
-    bridge.reconcile(vec![observed.clone()]).await.unwrap();
-    bridge.flush().await.unwrap();
-    // A row the bridge has not read yet: only a checkpoint read sees it.
-    claude_transcript(
-        &config,
-        &[before[0], before[1], ("u1", "user", "Typed at the desk")],
-    );
-    bridge
-        .state
-        .mappings
-        .get_mut(&observed.key())
-        .unwrap()
-        .pending_prompt = pending_prompt;
-    bridge.inbound(&inbound(HEX, "phone-gate")).await.unwrap();
-    let prompted = calls
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|call| call["method"] == "agent.prompt");
-    assert!(prompted, "the prompt must reach the agent");
-    let activity = serde_json::to_value(&bridge.state.mappings[&observed.key()].activity).unwrap();
-    mdk.abort();
-    herdr.abort();
-    activity["phone"][0]["before"]
-        .as_array()
-        .is_some_and(|ids| ids.iter().any(|id| id == "claude:u1"))
-}
-
-#[tokio::test]
-async fn the_phone_checkpoint_waits_for_a_settled_agent_unless_phone_replies_only() {
-    // Without phone_replies_only the checkpoint keeps its earlier rule: an idle agent with
-    // no prompt pending. With it, the checkpoint is taken while the agent works.
-    assert!(!takes_checkpoint(false, "working", false).await);
-    assert!(!takes_checkpoint(false, "idle", true).await);
-    assert!(takes_checkpoint(false, "idle", false).await);
-    assert!(takes_checkpoint(true, "working", false).await);
-    assert!(takes_checkpoint(true, "idle", true).await);
-}
-
 #[tokio::test]
 async fn phone_replies_only_answers_a_phone_prompt_queued_behind_a_peer_prompt() {
     let (_dir, config, mut observed, calls, mut bridge, peers) = phone_only_bridge("working").await;
@@ -11788,4 +11402,422 @@ async fn phone_replies_only_stops_waiting_for_a_held_prompt_after_30_minutes_and
             handle.abort();
         }
     }
+}
+
+#[tokio::test]
+async fn a_phone_prompt_behind_media_from_the_same_group_gets_the_media_notice() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    export_script(&config.opencode_bin, "Historical answer", "old");
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+    let herdr = peer(&config.herdr_socket, false, calls.clone()).await;
+    let mut bridge = Bridge::open(config).unwrap();
+    bridge.reconcile(vec![agent()]).await.unwrap();
+    bridge.state.outbox.clear();
+    bridge.state.media_pending = vec![inbound(HEX, "media")];
+    bridge.inbound(&inbound(HEX, "prompt")).await.unwrap();
+    let notices: Vec<_> = bridge
+        .state
+        .outbox
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect();
+    assert_eq!(
+        notices,
+        ["Media from this group is still being prepared. Wait for it, then resend."]
+    );
+    assert!(
+        !calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call["method"] == "agent.prompt")
+    );
+    mdk.abort();
+    herdr.abort();
+}
+
+#[tokio::test]
+async fn control_chat_is_created_once_and_answers_without_an_agent() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = config(root.path());
+    config.control_chat = true;
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+    let mut bridge = Bridge::open(config).unwrap();
+    assert!(bridge.state.mappings.contains_key("control"));
+
+    bridge.reconcile(vec![]).await.unwrap();
+    let control = &bridge.state.mappings["control"];
+    assert_eq!(
+        control.group_id_hex.as_deref(),
+        Some("bb".repeat(16).as_str())
+    );
+    assert!(control.active && !control.creating);
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["type"] == "group_create_with_admins")
+            .count(),
+        1
+    );
+
+    let mut plain = inbound(HEX, "control-1");
+    plain["message"]["text"] = json!("hello");
+    bridge.inbound(&plain).await.unwrap();
+    assert!(
+        bridge
+            .state
+            .outbox
+            .iter()
+            .any(|item| item.text.contains("control chat") && item.text.contains("/new"))
+    );
+
+    let mut status = inbound(HEX, "control-2");
+    status["message"]["text"] = json!("status");
+    bridge.inbound(&status).await.unwrap();
+    assert!(
+        bridge
+            .state
+            .outbox
+            .iter()
+            .any(|item| item.text.contains("mapped session"))
+    );
+
+    let mut ambiguous = inbound(HEX, "control-3");
+    ambiguous["message"]["text"] = json!("/s");
+    bridge.inbound(&ambiguous).await.unwrap();
+    assert!(
+        bridge
+            .state
+            .outbox
+            .last()
+            .is_some_and(|item| item.text.contains("Ambiguous command"))
+    );
+
+    let mut agent = inbound(HEX, "control-4");
+    agent["message"]["text"] = json!("/agent");
+    bridge.inbound(&agent).await.unwrap();
+    assert!(
+        bridge
+            .state
+            .outbox
+            .last()
+            .is_some_and(|item| item.text.contains("not mapped to a project"))
+    );
+
+    let mut new = inbound(HEX, "control-5");
+    new["message"]["text"] = json!("new");
+    bridge.inbound(&new).await.unwrap();
+    assert!(
+        bridge
+            .state
+            .outbox
+            .last()
+            .is_some_and(|item| item.text.contains("workspace"))
+    );
+
+    let mut menu = inbound(HEX, "control-6");
+    menu["message"]["text"] = json!("n");
+    bridge.inbound(&menu).await.unwrap();
+    assert!(
+        bridge
+            .state
+            .outbox
+            .last()
+            .is_some_and(|item| item.text.contains("setup menu is open"))
+    );
+
+    bridge
+        .state
+        .mappings
+        .get_mut("control")
+        .unwrap()
+        .launch_draft
+        .as_mut()
+        .unwrap()
+        .expires_at = 0;
+    let mut fresh = inbound(HEX, "control-7");
+    fresh["message"]["text"] = json!("new");
+    bridge.inbound(&fresh).await.unwrap();
+    assert!(
+        bridge
+            .state
+            .outbox
+            .last()
+            .is_some_and(|item| item.text.contains("workspace"))
+    );
+
+    bridge.reconcile(vec![]).await.unwrap();
+    assert!(bridge.state.mappings["control"].active);
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["type"] == "group_create_with_admins")
+            .count(),
+        1
+    );
+    mdk.abort();
+}
+
+#[tokio::test]
+async fn control_chat_does_not_block_forwarding_resume() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = config(root.path());
+    config.control_chat = true;
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    bridge.reconcile(vec![]).await.unwrap();
+
+    herdr_white_noise_bridge::forwarding::set(&config.state_path, false).unwrap();
+    bridge.reconcile(vec![]).await.unwrap();
+    assert!(!bridge.state.forwarding_enabled);
+
+    // A phone message wakes forwarding; the synthetic control chat has no
+    // transcript, so it must not be treated as a blocking checkpoint.
+    herdr_white_noise_bridge::forwarding::set(&config.state_path, true).unwrap();
+    bridge.reconcile(vec![]).await.unwrap();
+    assert!(bridge.state.forwarding_enabled);
+    assert!(!bridge.state.forwarding_resume_pending);
+    mdk.abort();
+}
+
+#[tokio::test]
+async fn forwarding_reset_does_not_reannounce_an_unchanged_blocked_context() {
+    for editable in [false, true] {
+        for delivered in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = config(root.path());
+            config.edit_responses = editable;
+            input_history(
+                &config,
+                "ses_1",
+                &[("prior-input", "Prior task")],
+                Some(("prior-reply", "Prior answer")),
+            );
+            // Keep the fixture slower than the former 20 x 10 ms observation
+            // window, as can happen when full-binary CI runs contend for I/O.
+            let script = std::fs::read_to_string(&config.opencode_bin).unwrap();
+            std::fs::write(
+                &config.opencode_bin,
+                script.replacen("#!/bin/sh\n", "#!/bin/sh\nsleep 0.3\n", 1),
+            )
+            .unwrap();
+            let mut bridge = Bridge::open(config.clone()).unwrap();
+            let mut blocked = agent();
+            blocked.agent_status = "blocked".into();
+            blocked.state_change_seq = 2;
+            let observed = Arc::new(Mutex::new(blocked.clone()));
+            let calls = Arc::new(Mutex::new(vec![]));
+            let herdr = decision_herdr(
+                &config.herdr_socket,
+                observed.clone(),
+                Arc::new(Mutex::new("Input required".into())),
+                calls.clone(),
+            )
+            .await;
+            bridge.state.mappings.insert(
+                blocked.key(),
+                Mapping {
+                    group_id_hex: Some("bb".repeat(16)),
+                    output_initialised: true,
+                    active: true,
+                    agent_record: Some(blocked.clone()),
+                    last_agent_status: "idle".into(),
+                    last_state_change_seq: 1,
+                    ..Mapping::default()
+                },
+            );
+            let announced = |bridge: &Bridge| {
+                bridge.state.outbox.iter().any(|item| {
+                    item.text.contains("Agent needs input")
+                        && item.response.as_ref().is_none_or(|response| {
+                            response.sent_text.as_deref() != Some(item.text.as_str())
+                        })
+                })
+            };
+            for _ in 0..1000 {
+                let _ = bridge.poll_sessions(vec![blocked.clone()]).await;
+                if announced(&bridge) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(announced(&bridge));
+            if delivered {
+                bridge.state.outbox.retain_mut(|item| {
+                    if let Some(response) = item.response.as_mut() {
+                        response.target = Some("delivered-blocked-notice".into());
+                        response.sent_text = Some(item.text.clone());
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+
+            herdr_white_noise_bridge::forwarding::set(&config.state_path, false).unwrap();
+            for _ in 0..20 {
+                let _ = bridge.poll_sessions(vec![blocked.clone()]).await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|call| call["method"] != "agent.read"),
+                "muted blocks must not consume an announcement"
+            );
+            herdr_white_noise_bridge::forwarding::set(&config.state_path, true).unwrap();
+            for _ in 0..1000 {
+                let _ = bridge.poll_sessions(vec![blocked.clone()]).await;
+                // Wait for the asynchronous checkpoint and blocked-context read,
+                // not an assumed CLI completion time under CI contention.
+                if bridge.state.forwarding_enabled
+                    && !bridge.state.forwarding_resume_pending
+                    && bridge.state.mappings[&blocked.key()].blocked_context_seq
+                        == Some(blocked.state_change_seq)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                bridge.state.forwarding_enabled && !bridge.state.forwarding_resume_pending,
+                "forwarding checkpoint must complete before checking delivery"
+            );
+            assert_eq!(
+                bridge.state.mappings[&blocked.key()].blocked_context_seq,
+                Some(blocked.state_change_seq),
+                "blocked context must finish refreshing"
+            );
+            assert!(
+                announced(&bridge) != delivered,
+                "mute/wake must retry only an undelivered blocked notice"
+            );
+
+            bridge.state.outbox.clear();
+            blocked.state_change_seq = 3;
+            *observed.lock().unwrap() = blocked.clone();
+            for _ in 0..1000 {
+                let _ = bridge.poll_sessions(vec![blocked.clone()]).await;
+                if announced(&bridge) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(announced(&bridge), "a new blocked context is announced");
+            herdr.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn claude_replies_reach_the_phone_while_background_tasks_keep_it_working() {
+    const ID: &str = "11111111-1111-4111-8111-111111111111";
+    let root = tempfile::tempdir().unwrap();
+    let mut config = config(root.path());
+    config.auto_forwarding = true;
+    config.edit_responses = true;
+    let mut observed = agent();
+    observed.agent = "claude".into();
+    observed.agent_session = Some(herdr_white_noise_bridge::herdr::Session {
+        source: "herdr:claude".into(),
+        agent: "claude".into(),
+        kind: "id".into(),
+        value: ID.into(),
+        home: None,
+    });
+    let path = config
+        .claude_home
+        .join("projects/project")
+        .join(format!("{ID}.jsonl"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut rows = vec![
+        json!({"type":"user","uuid":"u0","sessionId":ID,"origin":{"kind":"human"},"promptSource":"typed","message":{"role":"user","content":"Old prompt"}}),
+        json!({"type":"assistant","uuid":"a0","parentUuid":"u0","sessionId":ID,"message":{"role":"assistant","id":"api-0","stop_reason":"end_turn","content":[{"type":"text","text":"Old reply"}]}}),
+    ];
+    let write = |rows: &[Value]| {
+        std::fs::write(
+            &path,
+            rows.iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    };
+    write(&rows);
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+    let herdr = peer_for_agent(&config.herdr_socket, false, calls.clone(), observed.clone()).await;
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    bridge.state.mappings.insert(
+        observed.key(),
+        activity_mapping(observed.clone(), &"bb".repeat(16)),
+    );
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.inbound(&inbound(HEX, "phone")).await.unwrap();
+    assert!(bridge.state.forwarding_enabled);
+    let replied = |bridge: &Bridge, text: &str| {
+        bridge.state.outbox.iter().any(|item| item.text == text)
+            || calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call["text"] == text)
+    };
+    // Claude ends its turn, but a background task keeps herdr reporting "working".
+    rows.extend([
+        json!({"type":"user","uuid":"u1","parentUuid":"a0","sessionId":ID,"origin":{"kind":"human"},"promptSource":"typed","message":{"role":"user","content":"test prompt"}}),
+        json!({"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":ID,"message":{"role":"assistant","id":"api-1","stop_reason":"end_turn","content":[{"type":"text","text":"First reply"}]}}),
+    ]);
+    write(&rows);
+    observed.agent_status = "working".into();
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    assert!(replied(&bridge, "First reply"));
+    // A completed reply must not create a replacement working bubble on the next poll.
+    let progress = bridge.state.mappings[&observed.key()].response_id.clone();
+    assert!(progress.is_some());
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    assert_eq!(bridge.state.mappings[&observed.key()].response_id, progress);
+    observed.agent_status = "idle".into();
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    assert!(bridge.state.mappings[&observed.key()].response_id.is_none());
+    assert!(!bridge.state.outbox.iter().any(|item| {
+        item.response
+            .as_ref()
+            .is_some_and(|response| !response.finished)
+    }));
+    // The task's notification is not local typing and does not mute forwarding.
+    rows.extend([
+        json!({"type":"user","uuid":"n1","parentUuid":"a1","sessionId":ID,"origin":{"kind":"task-notification"},"promptSource":"system","message":{"role":"user","content":"<task-notification>done</task-notification>"}}),
+        json!({"type":"assistant","uuid":"a2","parentUuid":"n1","sessionId":ID,"message":{"role":"assistant","id":"api-2","stop_reason":"end_turn","content":[{"type":"text","text":"Background result"}]}}),
+    ]);
+    write(&rows);
+    observed.agent_status = "idle".into();
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    assert!(bridge.state.forwarding_enabled);
+    assert!(replied(&bridge, "Background result"));
+    bridge.flush().await.unwrap();
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["text"] == "First reply")
+            .count(),
+        1
+    );
+    mdk.abort();
+    herdr.abort();
 }

@@ -188,11 +188,32 @@ pub struct BridgeState {
     /// Authorised inbound media awaiting download/transcription. No terminal input yet.
     #[serde(default)]
     pub media_pending: Vec<serde_json::Value>,
+    /// Sequence number of the last OpenRig event read, sent back as `Last-Event-ID`.
+    #[serde(default)]
+    pub openrig_event_seq: Option<u64>,
     /// Bridge messages already sent as audio, oldest first.
     #[serde(default)]
     pub spoken_messages: Vec<String>,
+    /// Phone prompts held while the seat pane is in tmux copy mode, oldest first.
+    #[serde(default)]
+    pub held_prompts: Vec<HeldPrompt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_job: Option<crate::update::Job>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeldPrompt {
+    pub group: String,
+    pub message_id: String,
+    pub event: serde_json::Value,
+    /// A transcribed voice note or image, released through the prepared-media path.
+    #[serde(default)]
+    pub prepared: bool,
+    #[serde(default)]
+    pub notice_id: Option<String>,
+    /// The phone reacted 👍 to the notice, so copy mode is left and the prompt is sent.
+    #[serde(default)]
+    pub force: bool,
 }
 
 fn forwarding_default() -> bool {
@@ -213,8 +234,10 @@ impl Default for BridgeState {
             forwarding_enabled: true,
             forwarding_revision: None,
             forwarding_resume_pending: false,
+            openrig_event_seq: None,
             media_pending: vec![],
             spoken_messages: vec![],
+            held_prompts: vec![],
             update_job: None,
         }
     }
@@ -379,20 +402,28 @@ impl BridgeState {
 
     fn enqueue_text(&mut self, group: &str, text: &str, request: Option<&str>) {
         // Keep each encrypted message below MDK's message-size ceiling.
-        for (part, chunk) in chunks(text).into_iter().enumerate() {
+        let mut rest = text;
+        let mut part = 0;
+        while !rest.is_empty() {
+            let mut end = rest.len().min(30000);
+            while !rest.is_char_boundary(end) {
+                end -= 1;
+            }
             self.outbox.push(Outgoing {
                 id: request.map_or_else(
                     || uuid::Uuid::new_v4().to_string(),
                     |request| format!("{request}:{part}"),
                 ),
                 group: group.into(),
-                text: chunk.into(),
+                text: rest[..end].into(),
                 working_notice: false,
                 attachments: vec![],
                 response: None,
                 manual: request.is_some(),
                 source: None,
             });
+            rest = &rest[end..];
+            part += 1;
         }
     }
 

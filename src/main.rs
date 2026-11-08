@@ -63,8 +63,11 @@ enum Action {
     /// Send a text notice to all mapped groups. Works while the worker runs.
     Notify {
         text: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "seat")]
         group: Option<String>,
+        /// OpenRig seat whose group gets the notice.
+        #[arg(long)]
+        seat: Option<String>,
     },
     /// Clear an uncertain prompt after inspecting the live agent. Does not resubmit it.
     ClearPrompt { key: String },
@@ -149,14 +152,14 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    if let Some(Action::Notify { text, group }) = &args.command {
+    if let Some(Action::Notify { text, group, seat }) = &args.command {
         // A running worker owns state.json, so notify only reads it.
         let state = BridgeState::load(&config.state_path)?;
         let marmot = wire::Socket {
             path: config.wn_agent_socket.clone(),
         };
         let control = forwarding::load(&config.state_path)?;
-        for group in notify_groups(&state, &control, group.as_deref())? {
+        for group in notify_groups(&state, &control, group.as_deref(), seat.as_deref())? {
             for part in state::chunks(text) {
                 let response = marmot.marmot(serde_json::json!({"type":"send_final","account_id_hex":config.account_id_hex,"group_id_hex":group,"text":part,"reply_to_message_id_hex":null,"idempotency_key":uuid::Uuid::new_v4().to_string()})).await?;
                 let message_id = response["message_ids_hex"][0]
@@ -287,6 +290,7 @@ fn notify_groups(
     state: &BridgeState,
     control: &forwarding::Forwarding,
     group: Option<&str>,
+    seat: Option<&str>,
 ) -> Result<Vec<String>> {
     anyhow::ensure!(
         !resume_pending(state, control),
@@ -296,6 +300,18 @@ fn notify_groups(
         control.enabled && state.forwarding_enabled,
         "Forwarding is At desk; switch to Away before sending a notice"
     );
+    if let Some(seat) = seat {
+        let key = serde_json::to_string(&("openrig", seat))?;
+        let mapping = state
+            .mappings
+            .get(&key)
+            .ok_or_else(|| anyhow::anyhow!("Unknown seat: {seat}"))?;
+        let group = mapping
+            .group_id_hex
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Seat {seat} has no group yet"))?;
+        return Ok(vec![group]);
+    }
     let groups: Vec<_> = state
         .mappings
         .values()
@@ -314,13 +330,21 @@ async fn terminate_signal() -> Result<()> {
 }
 
 async fn check_readers(config: BridgeConfig) -> Result<usize> {
-    use herdr_white_noise_bridge::{herdr, output, wire::Socket};
-    let agents = herdr::snapshot(&Socket {
-        path: config.herdr_socket.clone(),
-    })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!("Session history check failed: herdr snapshot is unavailable or invalid")
+    use herdr_white_noise_bridge::{config::Backend, herdr, openrig, output, wire::Socket};
+    let (agents, backend) = match config.backend {
+        Backend::Herdr => (
+            herdr::snapshot(&Socket {
+                path: config.herdr_socket.clone(),
+            })
+            .await,
+            "HERDR",
+        ),
+        Backend::OpenRig => (openrig::snapshot(&config).await, "OpenRig"),
+    };
+    let agents = agents.map_err(|_| {
+        anyhow::anyhow!(
+            "Session history check failed: {backend} snapshot is unavailable or invalid"
+        )
     })?;
     let sessions: std::collections::BTreeMap<_, _> = agents
         .into_iter()

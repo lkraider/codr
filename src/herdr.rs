@@ -81,12 +81,25 @@ pub async fn workspace(socket: &Socket, id: &str) -> Result<Workspace> {
     Ok(workspace)
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Session {
     pub source: String,
     pub agent: String,
     pub kind: String,
     pub value: String,
+    /// The Claude config directory that holds this session's transcript. `claude_home` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<std::path::PathBuf>,
+}
+
+/// Two sessions are the same session when source, agent, kind and value match.
+/// `home` says where to read it and is not part of that identity, so a stored mapping
+/// from before `home` existed still matches the live session.
+impl PartialEq for Session {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.source, &self.agent, &self.kind, &self.value)
+            == (&other.source, &other.agent, &other.kind, &other.value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -112,10 +125,18 @@ pub struct Agent {
     #[serde(default)]
     pub foreground_cwd: Option<String>,
     pub terminal_title_stripped: Option<String>,
+    /// OpenRig session name. The seat keeps its group across Claude session changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<crate::openrig::Pane>,
 }
 
 impl Agent {
     pub fn key(&self) -> String {
+        if let Some(seat) = &self.seat {
+            return serde_json::to_string(&("openrig", seat)).expect("strings serialize");
+        }
         match &self.agent_session {
             Some(s) => serde_json::to_string(&(&s.source, &s.agent, &s.kind, &s.value))
                 .expect("strings serialize"),
@@ -185,10 +206,15 @@ impl Agent {
                 .collect::<String>()
         };
         format!(
-            "Hi! This is your chat with {}.\n\nSend /help in any Codr chat to see available commands.\n\nWorkspace: {}\nAgent: {}\nManaged by codr via herdr.",
+            "Hi! This is your chat with {}.\n\nSend /help in any Codr chat to see available commands.\n\nWorkspace: {}\nAgent: {}\nManaged by codr via {}.",
             clean(&self.group_name()),
             clean(workspace),
-            clean(agent)
+            clean(agent),
+            if self.seat.is_some() {
+                "OpenRig"
+            } else {
+                "herdr"
+            }
         )
     }
 }
@@ -318,4 +344,25 @@ pub async fn choose(socket: &Socket, agent: &Agent, choice: usize) -> Result<()>
         "Decision shortcut was not confirmed"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::Session;
+
+    #[test]
+    fn a_session_is_the_same_with_or_without_its_home() {
+        let mut session = Session {
+            source: "openrig".into(),
+            agent: "claude".into(),
+            kind: "id".into(),
+            value: "x".into(),
+            home: None,
+        };
+        let stored: Session = serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        session.home = Some("/h".into());
+        assert_eq!(stored, session);
+        session.value = "y".into();
+        assert_ne!(stored, session);
+    }
 }

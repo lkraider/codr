@@ -153,6 +153,7 @@ async fn sync_excerpt_keeps_three_messages_in_order_across_all_transcript_reader
                     agent: if opencode { "opencode" } else { provider }.into(),
                     kind: "id".into(),
                     value: session.into(),
+                    home: None,
                 },
             )
             .await
@@ -305,6 +306,7 @@ async fn sync_history_uses_opencode_v1_and_v2_source_activity() {
                 agent: "opencode".into(),
                 kind: "id".into(),
                 value: "ses_test".into(),
+                home: None,
             },
         )
         .await
@@ -361,6 +363,7 @@ async fn sync_history_native_activity_comes_from_the_verified_session_log() {
                 agent: agent.into(),
                 kind: "id".into(),
                 value: session.into(),
+                home: None,
             },
         )
         .await

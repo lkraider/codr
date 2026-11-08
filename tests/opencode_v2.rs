@@ -41,6 +41,7 @@ esac
         agent: "opencode".into(),
         kind: "id".into(),
         value: "ses_fixture".into(),
+        home: None,
     };
     let snapshot = output::read_snapshot(&config, &session).await.unwrap();
     assert!(snapshot.history.finals.is_empty());

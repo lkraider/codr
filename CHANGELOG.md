@@ -8,11 +8,19 @@
 - Fresh setup creates a speech folder, passes it to the connector as `--media-allowed-root` and writes it as `speak_dir`.
 - `speak_adapt_command` and `speak_adapt_prompt_file` rewrite the text before it is spoken, for example into another language. When the command fails, the original text is spoken and the phone is told.
 - The connector patch threads media sends that carry `reply_to_message_id_hex` with the same `e` and `q` tags as a text reply.
+- On the OpenRig backend, a phone prompt to a seat pane in tmux copy mode is held. The phone gets a notice. A 👍 on it leaves copy mode and sends the prompt. Without a reaction, the prompt goes when copy mode ends.
 - Spoken replies skip emoji. A message with only emoji gets "Nothing to speak." on the phone. Marks such as ✓ and ✗ stay, and a digit keycap such as 1️⃣ is read as its digit.
 
 ### Changed
 
-- `notify` works while the bridge runs, sends straight to MDK, and prints the MDK message ID. It refuses while forwarding is At desk or an Away switch is still pending.
+- `notify` works while the bridge runs and prints the MDK message ID. `notify --seat` sends a notice to the group of one OpenRig seat.
+
+### Fixed
+
+- Keep stable executable paths across Homebrew upgrades and report missing OpenCode executables without exposing transcript data.
+- Preserve optional OpenCode support for Claude-only and Codex-only installations, including repeat setup and check mode. Bare commands retain PATH lookup.
+- Validate replacement session readers before saving an OpenCode repair. Restore the old configuration after a failed worker restart so setup can retry the repair.
+- A phone message or prepared media prompt deferred because the agent changed state since the last snapshot reaches the agent within about 2 s. It waited up to 60 s for the next snapshot. The deferral log lines now print the cause.
 
 ## [0.11.1] - 2026-11-05
 

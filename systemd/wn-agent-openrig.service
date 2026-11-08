@@ -1,0 +1,13 @@
+[Unit]
+Description=MDK transport for the codr OpenRig bridge
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/codr/bin/wn-agent --home %h/.marmot-agents/openrig --socket %h/.marmot-agents/openrig/dev/wn-agent.sock
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

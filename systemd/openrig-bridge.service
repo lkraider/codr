@@ -1,0 +1,14 @@
+[Unit]
+Description=codr bridge for OpenRig seats
+After=network-online.target wn-agent-openrig.service
+Requires=wn-agent-openrig.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/herdr-white-noise-bridge --config %h/.config/codr-openrig/config.toml run
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target
