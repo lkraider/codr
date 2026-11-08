@@ -9,6 +9,8 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_BYTES: u64 = 25 * 1024 * 1024;
+/// A transcribe command may load a local model and decode up to five minutes of audio on a busy host.
+const TRANSCRIBE_SECS: u64 = 600;
 
 #[derive(Debug, thiserror::Error)]
 #[error("MDK has not supplied complete media download references")]
@@ -259,7 +261,7 @@ pub async fn prepare(
                 .stderr(Stdio::null())
                 .kill_on_drop(true)
                 .spawn()?;
-            let text = tokio::time::timeout(Duration::from_secs(180), async {
+            let text = tokio::time::timeout(Duration::from_secs(TRANSCRIBE_SECS), async {
                 let mut bytes = Vec::new();
                 child
                     .stdout
