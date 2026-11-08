@@ -17,7 +17,7 @@ The OpenRig bridge is a separate installation. It has its own identity, configur
 | A running OpenRig daemon and `rig` on the bridge host | Seats come from `rig ps --nodes -A --json --full`; prompts go through `rig send <seat> --raw`; `rig seat status <seat> --json` gives each seat's Claude home. |
 | `node` | The `rig` executable starts with `#!/usr/bin/env node`. |
 | `curl` | The bridge follows the daemon event stream at `<openrig_url>/api/events` with `curl`. |
-| `tmux` (optional) | Detects a seat pane in copy mode. Without it prompts are sent as usual and the cause is logged once. |
+| `tmux` (optional) | Detects a seat pane in copy mode. Without it prompts are sent as usual; the reference says the cause is logged once (**not verified** in code). |
 | FFmpeg (for voice) | Both transcription scripts convert recordings with it. |
 | Claude Code seats | The bridge reads Claude Code transcripts. |
 
@@ -96,7 +96,7 @@ Build **codr** from this fork and run setup again; it repairs services and keeps
 | A reply to a phone prompt is missing | The prompt may have waited more than 30 minutes (the phone gets a notice), or the desk typed the same text first. |
 | "answer the prompt at the desk and resend" | The seat waits on an interactive prompt; OpenRig refuses input. Answer at the desk. Other refusals, for example `typing_guard_enabled`, are quoted to the phone; the prompt is not retried. |
 | "This message is held" | The seat pane is in tmux copy mode. React 👍 to the notice to leave copy mode and send, or wait until copy mode ends. It never leaves copy mode without the reaction. |
-| Phone shows the seat as blocked after an approval at the desk | An approval at the desk sends no hook; the state corrects at the next hook, usually `Stop`. |
-| Voice note: transcription failed | Run the script by hand with an audio file: **codr** discards its stderr. Notes over five minutes are refused. On a slow host the old 180 s limit cut long notes; the limit is now 600 s. |
+| Phone shows the seat as blocked after an approval at the desk | The reference says an approval at the desk sends no hook, so the state corrects at the next hook, usually `Stop`. **Not verified** in code. |
+| Voice note: transcription failed | Run the script by hand with an audio file: **codr** discards its stderr. The Phonon script refuses recordings over five minutes; the bridge itself enforces no length limit, only the 600 s command limit, and the reference's "five minutes" for the Gemini and local scripts is not checked in their code. On a slow host the old 180 s limit cut long notes; the limit is now 600 s. |
 | "Media from this group is still being prepared" | One voice note or image is processed at a time; resend the text when the note is done. Other groups are not delayed. |
 | Seat on another Claude account shows no replies | `rig seat status <seat> --json` has no `runtime_home`, so `claude_home` is used. |
