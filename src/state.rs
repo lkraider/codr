@@ -375,28 +375,20 @@ impl BridgeState {
 
     fn enqueue_text(&mut self, group: &str, text: &str, request: Option<&str>) {
         // Keep each encrypted message below MDK's message-size ceiling.
-        let mut rest = text;
-        let mut part = 0;
-        while !rest.is_empty() {
-            let mut end = rest.len().min(30000);
-            while !rest.is_char_boundary(end) {
-                end -= 1;
-            }
+        for (part, chunk) in chunks(text).into_iter().enumerate() {
             self.outbox.push(Outgoing {
                 id: request.map_or_else(
                     || uuid::Uuid::new_v4().to_string(),
                     |request| format!("{request}:{part}"),
                 ),
                 group: group.into(),
-                text: rest[..end].into(),
+                text: chunk.into(),
                 working_notice: false,
                 attachments: vec![],
                 response: None,
                 manual: request.is_some(),
                 source: None,
             });
-            rest = &rest[end..];
-            part += 1;
         }
     }
 
@@ -563,6 +555,21 @@ pub fn lock(path: &Path) -> Result<File> {
     file.try_lock_exclusive()
         .map_err(|_| anyhow::anyhow!("Bridge already runs for this state path"))?;
     Ok(file)
+}
+
+/// Splits text below MDK's message-size ceiling.
+pub fn chunks(text: &str) -> Vec<&str> {
+    let mut parts = vec![];
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut end = rest.len().min(30000);
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        parts.push(&rest[..end]);
+        rest = &rest[end..];
+    }
+    parts
 }
 
 pub(crate) fn lock_file(path: &Path) -> Result<File> {

@@ -641,13 +641,13 @@ Live sessions automatically update their group title and description when the **
 
 ### Completion notice
 
-Stop the worker before using its state-changing CLI. To send a notice to one mapped group:
+Stop the worker before using its other state-changing CLI commands. `notify` also works while the worker runs. To send a notice to one mapped group:
 
 ```sh
 ~/.local/bin/herdr-white-noise-bridge notify --group GROUP_HEX 'The bridge is ready.'
 ```
 
-Without `--group`, the command sends the notice to every mapped group. The command returns success only after MDK confirms publication.
+Without `--group`, the command sends the notice to every mapped group. The command refuses while forwarding is At desk. It also refuses after a switch to Away until the worker applies the switch. The command reads bridge state without changing it and sends the notice to MDK directly. It returns success only after MDK confirms publication, and prints one JSON line per sent message, for example `{"group":"GROUP_HEX","message_id":"MESSAGE_HEX"}`.
 
 ## Screenshot provenance
 

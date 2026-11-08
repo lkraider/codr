@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use herdr_white_noise_bridge::{BridgeConfig, BridgeState, bridge::Bridge, forwarding, state};
+use herdr_white_noise_bridge::{
+    BridgeConfig, BridgeState, bridge::Bridge, forwarding, state, wire,
+};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -58,7 +60,7 @@ enum Action {
         #[arg(long)]
         retry: bool,
     },
-    /// Send a text notice to all mapped groups.
+    /// Send a text notice to all mapped groups. Works while the worker runs.
     Notify {
         text: String,
         #[arg(long)]
@@ -137,15 +139,35 @@ async fn main() -> Result<()> {
     if matches!(args.command, Some(Action::Status)) {
         let s = BridgeState::load(&config.state_path)?;
         let control = forwarding::load(&config.state_path)?;
-        let resume_pending = control.enabled
-            && (s.forwarding_resume_pending
-                || s.forwarding_revision.as_deref().unwrap_or("initial") != control.revision);
+        let resume_pending = resume_pending(&s, &control);
         let forwarding_enabled = control.enabled && s.forwarding_enabled && !resume_pending;
         for (key, m) in s.mappings {
             println!(
                 "{}",
                 serde_json::json!({"session":key,"group":m.group_id_hex,"control":m.control,"creating_uncertain":m.creating,"active":m.active,"state":m.last_agent_status,"session_change_from":m.session_change_from,"pending_prompt":m.pending_prompt,"queued_prompts":m.prompt_queue.len(),"queue_submission_uncertain":m.queue_flight.as_ref().is_some_and(|flight| !flight.confirmed),"native_acceptance_pending":m.submissions.len(),"native_acceptance_overdue":m.submissions.iter().filter(|submission| submission.overdue(herdr_white_noise_bridge::bridge::now())).count(),"unresolved_progress":s.outbox.iter().filter(|item| Some(&item.group)==m.group_id_hex.as_ref() && item.response.as_ref().is_some_and(|delivery| delivery.finished && delivery.target.is_none() && delivery.initial_text.is_some() && !delivery.durable)).count(),"forwarding_enabled":forwarding_enabled,"forwarding_resume_pending":resume_pending})
             );
+        }
+        return Ok(());
+    }
+    if let Some(Action::Notify { text, group }) = &args.command {
+        // A running worker owns state.json, so notify only reads it.
+        let state = BridgeState::load(&config.state_path)?;
+        let marmot = wire::Socket {
+            path: config.wn_agent_socket.clone(),
+        };
+        let control = forwarding::load(&config.state_path)?;
+        for group in notify_groups(&state, &control, group.as_deref())? {
+            for part in state::chunks(text) {
+                let response = marmot.marmot(serde_json::json!({"type":"send_final","account_id_hex":config.account_id_hex,"group_id_hex":group,"text":part,"reply_to_message_id_hex":null,"idempotency_key":uuid::Uuid::new_v4().to_string()})).await?;
+                let message_id = response["message_ids_hex"][0]
+                    .as_str()
+                    .filter(|_| response["type"] == "final_sent")
+                    .ok_or_else(|| anyhow::anyhow!("MDK did not confirm publication"))?;
+                println!(
+                    "{}",
+                    serde_json::json!({"group":group,"message_id":message_id})
+                );
+            }
         }
         return Ok(());
     }
@@ -193,26 +215,6 @@ async fn main() -> Result<()> {
             result
         }
         Action::Porter { .. } | Action::UpdateInfo { .. } => unreachable!(),
-        Action::Notify { text, group } => {
-            anyhow::ensure!(
-                bridge.state.forwarding_enabled,
-                "Forwarding is At desk; switch to Away before sending a notice"
-            );
-            let groups: Vec<_> = bridge
-                .state
-                .mappings
-                .values()
-                .filter(|m| !m.control)
-                .filter_map(|m| m.group_id_hex.clone())
-                .filter(|id| group.as_ref().is_none_or(|g| g == id))
-                .collect();
-            anyhow::ensure!(!groups.is_empty(), "No mapped groups exist yet");
-            for group in groups {
-                bridge.state.enqueue(&group, &text);
-            }
-            bridge.save()?;
-            bridge.flush().await
-        }
         Action::ResolveCreate { key, group, retry } => {
             let m = bridge
                 .state
@@ -271,7 +273,38 @@ async fn main() -> Result<()> {
         Action::Status => unreachable!(),
         Action::CheckReaders => unreachable!(),
         Action::Forwarding { .. } => unreachable!(),
+        Action::Notify { .. } => unreachable!(),
     }
+}
+
+fn resume_pending(state: &BridgeState, control: &forwarding::Forwarding) -> bool {
+    control.enabled
+        && (state.forwarding_resume_pending
+            || state.forwarding_revision.as_deref().unwrap_or("initial") != control.revision)
+}
+
+fn notify_groups(
+    state: &BridgeState,
+    control: &forwarding::Forwarding,
+    group: Option<&str>,
+) -> Result<Vec<String>> {
+    anyhow::ensure!(
+        !resume_pending(state, control),
+        "Away is set; wait for the bridge to apply it, then resend"
+    );
+    anyhow::ensure!(
+        control.enabled && state.forwarding_enabled,
+        "Forwarding is At desk; switch to Away before sending a notice"
+    );
+    let groups: Vec<_> = state
+        .mappings
+        .values()
+        .filter(|m| !m.control)
+        .filter_map(|m| m.group_id_hex.clone())
+        .filter(|id| group.is_none_or(|g| g == id))
+        .collect();
+    anyhow::ensure!(!groups.is_empty(), "No mapped groups exist yet");
+    Ok(groups)
 }
 
 async fn terminate_signal() -> Result<()> {
