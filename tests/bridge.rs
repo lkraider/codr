@@ -11567,3 +11567,56 @@ async fn phone_replies_only_sends_no_idle_when_a_phone_turn_ends_from_blocked() 
         handle.abort();
     }
 }
+
+/// Whether the phone prompt took a transcript checkpoint. The checkpoint read records the input
+/// rows that already exist, so the phone submission does not claim them as its own.
+async fn takes_checkpoint(phone_replies_only: bool, status: &str, pending_prompt: bool) -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    config.auto_forwarding = true;
+    config.phone_replies_only = phone_replies_only;
+    let observed = claude_agent(status);
+    let before = [("u0", "user", "Old prompt"), ("a0", "final", "Old final")];
+    claude_transcript(&config, &before);
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+    let herdr = peer_for_agent(&config.herdr_socket, false, calls.clone(), observed.clone()).await;
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.flush().await.unwrap();
+    // A row the bridge has not read yet: only a checkpoint read sees it.
+    claude_transcript(
+        &config,
+        &[before[0], before[1], ("u1", "user", "Typed at the desk")],
+    );
+    bridge
+        .state
+        .mappings
+        .get_mut(&observed.key())
+        .unwrap()
+        .pending_prompt = pending_prompt;
+    bridge.inbound(&inbound(HEX, "phone-gate")).await.unwrap();
+    let prompted = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call["method"] == "agent.prompt");
+    assert!(prompted, "the prompt must reach the agent");
+    let activity = serde_json::to_value(&bridge.state.mappings[&observed.key()].activity).unwrap();
+    mdk.abort();
+    herdr.abort();
+    activity["phone"][0]["before"]
+        .as_array()
+        .is_some_and(|ids| ids.iter().any(|id| id == "claude:u1"))
+}
+
+#[tokio::test]
+async fn the_phone_checkpoint_waits_for_a_settled_agent_unless_phone_replies_only() {
+    // Without phone_replies_only the checkpoint keeps its earlier rule: an idle agent with
+    // no prompt pending. With it, the checkpoint is taken while the agent works.
+    assert!(!takes_checkpoint(false, "working", false).await);
+    assert!(!takes_checkpoint(false, "idle", true).await);
+    assert!(takes_checkpoint(false, "idle", false).await);
+    assert!(takes_checkpoint(true, "working", false).await);
+    assert!(takes_checkpoint(true, "idle", true).await);
+}
