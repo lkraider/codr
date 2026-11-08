@@ -39,6 +39,8 @@ Or give your coding agent this prompt, with your own public key:
 
 [Full installation and upgrade guide →](docs/INSTALL.md)
 
+Using OpenRig seats instead of **herdr** panes: [codr with OpenRig →](docs/OPENRIG.md)
+
 ### New in 0.11.1
 
 - Clear status labels use `Request submitted...` and `Working...` for progress,
