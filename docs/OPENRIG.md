@@ -29,7 +29,7 @@ Install the **codr** binary first ([Build](REFERENCE.md#build) or [Install](INST
 python3 scripts/setup.py --npub "$OWNER_NPUB" --seat seat-a@my-rig --seat seat-b@my-rig
 ```
 
-Setup prints the bridge `npub`. Accept its invitation on the phone ([Verify on the phone](INSTALL.md#verify-on-the-phone)). `python3 scripts/setup.py --openrig --check` validates the configuration and the seat readers without changing services. Running setup again with the full seat list adds seats; each new seat gets a new group.
+Setup prints the bridge `npub`. Accept its invitation on the phone ([Verify on the phone](INSTALL.md#verify-on-the-phone)). `python3 scripts/setup.py --openrig --check` validates the configuration and the seat readers without changing services. Running setup again replaces the seat list with the seats you pass, so repeat every seat you want to keep; each new seat gets a new group.
 
 | | Linux (systemd, user units) | macOS (launchd) |
 | --- | --- | --- |
@@ -46,7 +46,7 @@ The full list of files setup writes, how to move a seat, and how to remove the b
 - Each listed seat that runs Claude Code gets one group. The group title is the seat name, for example `seat-a@my-rig`, with no `[cd]` prefix.
 - The group stays with the seat when the seat starts a new Claude session. The bridge reads the new transcript; replies already in it stay off the phone, except a reply to a phone prompt.
 - Only the configured owner can prompt a seat. Other members are ignored.
-- `/status` and `/queue` work in a seat chat ([chat commands](REFERENCE.md#white-noise-chat-commands)). `/cancel` is documented as native **herdr** control: **not verified** with OpenRig seats.
+- `/status` and `/queue` work in a seat chat ([chat commands](REFERENCE.md#white-noise-chat-commands)). `/cancel` clears pending menus, but its interrupt goes through the **herdr** socket, which this bridge does not use, so by the code it cannot stop an OpenRig seat (code read, not run). Stop a seat at the desk.
 
 Details: [OpenRig seats](REFERENCE.md#openrig-seats).
 
