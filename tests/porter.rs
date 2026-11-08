@@ -29,6 +29,11 @@ fn config(dir: &Path) -> BridgeConfig {
         edit_responses: false,
         auto_forwarding: false,
         transcribe_command: vec![],
+        speak_command: vec![],
+        speak_reaction: None,
+        speak_dir: None,
+        speak_adapt_command: vec![],
+        speak_adapt_prompt_file: None,
     }
 }
 

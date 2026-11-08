@@ -376,6 +376,14 @@ def configure(owner, herdr_socket=None, runner=run, check=False, enable_audio=No
         return _configure(owner, herdr_socket, runner, check, enable_audio, enable_portr)
 
 
+def speech_directory(state_path):
+    # The connector resolves --media-allowed-root once at startup and refuses to start when it is missing.
+    path = state_path.parent / "speech"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
+    return path
+
+
 def _configure(owner, herdr_socket, runner, check, enable_audio, enable_portr):
     if check and enable_portr is not None:
         raise SetupError("--check cannot apply --portr or --no-portr")
@@ -516,6 +524,7 @@ def _configure(owner, herdr_socket, runner, check, enable_audio, enable_portr):
     mdk_home = home / ".marmot-agents/herdr"
     mdk_socket = mdk_home / "dev/wn-agent.sock"
     state_path = Path(os.environ.get("XDG_STATE_HOME", home / ".local/state")) / "herdr-white-noise-bridge/state.json"
+    speak_dir = speech_directory(state_path)
     image_spool = state_path.with_suffix(".outbound-media")
     image_spool.mkdir(mode=0o700, parents=True, exist_ok=True)
     if image_spool.is_symlink() or not image_spool.is_dir() or image_spool.stat().st_mode & 0o077:
@@ -523,7 +532,7 @@ def _configure(owner, herdr_socket, runner, check, enable_audio, enable_portr):
     manager.install(services.Service("wn-agent-herdr", "MDK transport for herdr White Noise remote",
         [mdk, "--home", mdk_home, "--socket", mdk_socket,
          "--relay", "wss://relay.eu.whitenoise.chat", "--relay", "wss://relay.us.whitenoise.chat",
-         "--media-allowed-root", image_spool]))
+         "--media-allowed-root", image_spool, "--media-allowed-root", speak_dir]))
     manager.install(services.Service("herdr-white-noise-bridge", "herdr White Noise remote plugin worker",
         [bridge, "--config", config_path, "run"], environment={"PATH": services.worker_path()}))
     mdk_home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -544,7 +553,7 @@ def _configure(owner, herdr_socket, runner, check, enable_audio, enable_portr):
         "account_id_hex": result["account_id_hex"], "state_path": state_path, "opencode_bin": opencode,
         "codex_home": Path(os.environ.get("CODEX_HOME", home / ".codex")).resolve(),
         "claude_home": Path(os.environ.get("CLAUDE_CONFIG_DIR", home / ".claude")).resolve(),
-        "transcribe_command": transcribe_command}
+        "transcribe_command": transcribe_command, "speak_dir": speak_dir}
     # Old release binaries reject unknown fields; phone-only setup needs no desktop setting.
     if enable_portr is True:
         values["portr_enabled"] = True

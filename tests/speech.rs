@@ -1,0 +1,472 @@
+use bech32::ToBase32;
+use herdr_white_noise_bridge::{
+    BridgeConfig, BridgeState,
+    bridge::Bridge,
+    speech::{DEFAULT_ADAPT_PROMPT, adapt_prompt, spoken_text},
+    wire::read_line,
+};
+use serde_json::{Value, json};
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, atomic::AtomicBool},
+    time::Duration,
+};
+use tokio::{io::AsyncWriteExt, net::UnixListener};
+
+const BRIDGE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const PHONE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const GROUP: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const MESSAGE: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const REPLY: &str = "## Result\n\nThe **build** passed. See [the log](https://example.com/log).\n\n```sh\ncargo test\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- `fmt` is clean";
+
+#[derive(Clone, Default)]
+struct Calls {
+    requests: Arc<Mutex<Vec<Value>>>,
+    sent_audio: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+fn speaker(dir: &Path, exit: u8) -> PathBuf {
+    let path = dir.join("speak.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncat > {:?}\nprintf 'm4a audio' > \"$1\"\nexit {exit}\n",
+            dir.join("spoken.txt")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn config(dir: &Path, exit: u8) -> BridgeConfig {
+    let phone = bech32::encode("npub", [0x11u8; 32].to_base32(), bech32::Variant::Bech32).unwrap();
+    serde_json::from_value(json!({"phone_npub":phone,"account_id_hex":BRIDGE,
+        "herdr_socket":dir.join("herdr.sock"),"wn_agent_socket":dir.join("wn.sock"),"state_path":dir.join("state.json"),
+        "speak_command":[speaker(dir, exit)],"speak_reaction":"😮","speak_dir":dir.join("speech")}))
+    .unwrap()
+}
+
+async fn connector(
+    path: &Path,
+    calls: Calls,
+    refuse_media: bool,
+    text: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    let listener = UnixListener::bind(path).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let request = read_line(&mut reader).await.unwrap();
+            calls.requests.lock().unwrap().push(request.clone());
+            let mut response = match request["type"].as_str().unwrap() {
+                "timeline_message_get" => json!({"type":"timeline_message","account_id_hex":BRIDGE,
+                    "group_id_hex":GROUP,"message_id_hex":MESSAGE,"message":{"message_id_hex":MESSAGE,
+                    "availability":"available","kind":9,"sender":{"account_id_hex":BRIDGE},
+                    "text":text,"text_truncated":false}}),
+                "send_media" if refuse_media => {
+                    json!({"type":"error","error":{"code":"media_upload_disabled"}})
+                }
+                "send_media" => {
+                    let path = request["attachments"][0]["path"].as_str().unwrap();
+                    calls
+                        .sent_audio
+                        .lock()
+                        .unwrap()
+                        .push(std::fs::read(path).unwrap());
+                    json!({"type":"final_sent","message_ids_hex":["dd".repeat(32)]})
+                }
+                "send_final" => json!({"type":"final_sent","message_ids_hex":["ef".repeat(32)]}),
+                other => panic!("unexpected request {other}"),
+            };
+            response["id"] = request["id"].clone();
+            response["marmot_agent_control"] = request["marmot_agent_control"].clone();
+            let mut bytes = serde_json::to_vec(&response).unwrap();
+            bytes.push(b'\n');
+            reader.get_mut().write_all(&bytes).await.unwrap();
+        }
+    })
+}
+
+fn reaction(actor: &str, emoji: &str, target_sender: &str) -> Value {
+    json!({"marmot_agent_control":"marmot.agent-control.v2","type":"reaction_added","account_id_hex":BRIDGE,
+        "group_id_hex":GROUP,"event_id_hex":"ee".repeat(32),"target_message_id_hex":MESSAGE,
+        "actor":{"account_id_hex":actor,"is_self":false},"emoji":emoji,"recorded_at":1,
+        "target":{"message_id_hex":MESSAGE,"availability":"available","sender":{"account_id_hex":target_sender}}})
+}
+
+async fn bridge(dir: &Path, exit: u8) -> Bridge {
+    BridgeState::with_mapping("[\"herdr\",\"w1:p1\"]", GROUP.into())
+        .save(&dir.join("state.json"))
+        .unwrap();
+    Bridge::open(config(dir, exit)).unwrap()
+}
+
+fn notices(calls: &Calls) -> Vec<Value> {
+    let requests = calls.requests.lock().unwrap();
+    requests
+        .iter()
+        .filter(|r| r["type"] == "send_final")
+        .cloned()
+        .collect()
+}
+
+async fn settle(bridge: &mut Bridge, calls: &Calls) {
+    for _ in 0..200 {
+        bridge.process_speech().await.unwrap();
+        if !bridge.state.spoken_messages.is_empty() || !notices(calls).is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("speech did not finish");
+}
+
+#[tokio::test]
+async fn a_phone_reaction_sends_the_spoken_bridge_message_once_and_removes_the_audio() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Calls::default();
+    let server = connector(&dir.path().join("wn.sock"), calls.clone(), false, REPLY).await;
+    let mut bridge = bridge(dir.path(), 0).await;
+
+    bridge
+        .inbound(&reaction(PHONE, "😮", BRIDGE))
+        .await
+        .unwrap();
+    bridge
+        .inbound(&reaction(PHONE, "😮", BRIDGE))
+        .await
+        .unwrap();
+    settle(&mut bridge, &calls).await;
+
+    let requests = calls.requests.lock().unwrap().clone();
+    let types: Vec<_> = requests.iter().map(|r| r["type"].clone()).collect();
+    assert_eq!(types, ["timeline_message_get", "send_media"]);
+    let attachment = &requests[1]["attachments"][0];
+    assert_eq!(requests[1]["group_id_hex"], GROUP);
+    assert_eq!(requests[1]["reply_to_message_id_hex"], MESSAGE);
+    assert_eq!(attachment["media_type"], "audio/mp4");
+    let path = Path::new(attachment["path"].as_str().unwrap());
+    assert_eq!(path.parent().unwrap(), dir.path().join("speech"));
+    let name = path.file_name().unwrap().to_str().unwrap();
+    assert!(name.starts_with("spoken-") && name.ends_with(".m4a") && !name.contains(MESSAGE));
+    assert_eq!(calls.sent_audio.lock().unwrap()[0], b"m4a audio");
+    assert!(!path.exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("spoken.txt")).unwrap(),
+        "Result\nThe build passed. See the log.\nCode block skipped.\nTable skipped.\nfmt is clean"
+    );
+    assert_eq!(bridge.state.spoken_messages, [MESSAGE]);
+    assert!(notices(&calls).is_empty());
+
+    bridge
+        .inbound(&reaction(PHONE, "😮", BRIDGE))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    bridge.process_speech().await.unwrap();
+    assert_eq!(calls.requests.lock().unwrap().len(), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn reactions_from_another_sender_with_another_emoji_or_on_a_phone_message_are_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Calls::default();
+    let server = connector(&dir.path().join("wn.sock"), calls.clone(), false, REPLY).await;
+    let mut bridge = bridge(dir.path(), 0).await;
+
+    for event in [
+        reaction(&"22".repeat(32), "😮", BRIDGE),
+        reaction(PHONE, "👍", BRIDGE),
+        reaction(PHONE, "😮", PHONE),
+    ] {
+        bridge.inbound(&event).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    bridge.process_speech().await.unwrap();
+
+    assert!(calls.requests.lock().unwrap().is_empty());
+    assert!(bridge.state.spoken_messages.is_empty());
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_failed_speech_command_tells_the_phone_at_desk_and_removes_the_audio() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Calls::default();
+    let server = connector(&dir.path().join("wn.sock"), calls.clone(), false, REPLY).await;
+    let mut bridge = bridge(dir.path(), 1).await;
+    bridge.state.forwarding_enabled = false;
+
+    bridge
+        .inbound(&reaction(PHONE, "😮", BRIDGE))
+        .await
+        .unwrap();
+    settle(&mut bridge, &calls).await;
+
+    assert_eq!(calls.requests.lock().unwrap().len(), 2);
+    let notice = &notices(&calls)[0];
+    assert_eq!(notice["group_id_hex"], GROUP);
+    assert_eq!(
+        notice["text"],
+        "Speech failed. The bridge log has the reason."
+    );
+    assert!(bridge.state.outbox.is_empty());
+    assert!(bridge.state.spoken_messages.is_empty());
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("speech"))
+            .unwrap()
+            .count(),
+        0
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_refused_media_send_tells_the_phone_and_removes_the_audio() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Calls::default();
+    let server = connector(&dir.path().join("wn.sock"), calls.clone(), true, REPLY).await;
+    let mut bridge = bridge(dir.path(), 0).await;
+
+    bridge
+        .inbound(&reaction(PHONE, "😮", BRIDGE))
+        .await
+        .unwrap();
+    settle(&mut bridge, &calls).await;
+
+    assert_eq!(calls.requests.lock().unwrap().len(), 3);
+    assert_eq!(
+        notices(&calls)[0]["text"],
+        "Speech failed. The bridge log has the reason."
+    );
+    assert!(bridge.state.spoken_messages.is_empty());
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("speech"))
+            .unwrap()
+            .count(),
+        0
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_message_of_only_emoji_runs_no_speech_command_and_tells_the_phone() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Calls::default();
+    let server = connector(
+        &dir.path().join("wn.sock"),
+        calls.clone(),
+        false,
+        "🎉 👍🏽\n\n❤️",
+    )
+    .await;
+    let mut bridge = bridge(dir.path(), 0).await;
+
+    bridge
+        .inbound(&reaction(PHONE, "😮", BRIDGE))
+        .await
+        .unwrap();
+    settle(&mut bridge, &calls).await;
+
+    assert!(!dir.path().join("spoken.txt").exists());
+    assert_eq!(calls.requests.lock().unwrap().len(), 2);
+    assert_eq!(notices(&calls)[0]["text"], "Nothing to speak.");
+    assert!(bridge.state.spoken_messages.is_empty());
+    server.abort();
+}
+
+#[test]
+fn emoji_are_removed_and_letters_accents_and_punctuation_stay() {
+    let text = "Done 🎉 build é😮 passed 👍🏽 ok ❤️ #️⃣ 1️⃣ 👨‍👩‍👧 🇧🇷 🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F} café — naïve, «quoted»! 1 + 2\n\n✅🚀\n- ⭐ Step 3.";
+    assert_eq!(
+        spoken_text(text, false),
+        "Done build é passed ok 1 café — naïve, «quoted»! 1 + 2\nStep 3."
+    );
+}
+
+#[test]
+fn result_marks_and_circled_digits_stay_and_keycaps_keep_their_digit() {
+    assert_eq!(
+        spoken_text("✓ fmt ✗ clippy ❶ ✅ ❌ ⭐", false),
+        "✓ fmt ✗ clippy ❶"
+    );
+    assert_eq!(
+        spoken_text("1️⃣ Build 2️⃣ Test #️⃣ *️⃣", false),
+        "1 Build 2 Test"
+    );
+}
+
+#[test]
+fn the_cut_counts_only_text_left_after_emoji_removal() {
+    let text = spoken_text(&"😮 word ".repeat(1000), false);
+    let spoken = text.strip_suffix("\nThe reply is cut here.").unwrap();
+    assert!(spoken.ends_with("word") && spoken.chars().count() > 3990);
+}
+
+#[test]
+fn long_text_is_cut_at_a_word_with_a_spoken_note() {
+    let text = spoken_text(&"word ".repeat(1000), false);
+    assert!(text.ends_with("word\nThe reply is cut here."));
+    assert!(text.chars().count() <= 4000 + "\nThe reply is cut here.".len());
+    assert_eq!(spoken_text("Short.", false), "Short.");
+    assert_eq!(
+        spoken_text("Short.", true),
+        "Short.\nThe reply is cut here."
+    );
+}
+
+const CLEANED: &str =
+    "Result\nThe build passed. See the log.\nCode block skipped.\nTable skipped.\nfmt is clean";
+const FALLBACK: &str = "Translation failed. The original text is spoken.";
+
+async fn adapting_bridge(dir: &Path, adapt: &str) -> Bridge {
+    let path = dir.join("adapt.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\npwd > {:?}\ncat > {:?}\n{adapt}\n",
+            dir.join("adapt-cwd.txt"),
+            dir.join("adapt-in.txt")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join("prompt.md"), "Speak it in Portuguese.\n").unwrap();
+    BridgeState::with_mapping("[\"herdr\",\"w1:p1\"]", GROUP.into())
+        .save(&dir.join("state.json"))
+        .unwrap();
+    let mut config = config(dir, 0);
+    config.speak_adapt_command = vec![path.display().to_string()];
+    config.speak_adapt_prompt_file = Some(dir.join("prompt.md"));
+    Bridge::open(config).unwrap()
+}
+
+async fn speak_once(bridge: &mut Bridge, dir: &Path) -> String {
+    bridge.state.spoken_messages.clear();
+    bridge
+        .inbound(&reaction(PHONE, "😮", BRIDGE))
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        bridge.process_speech().await.unwrap();
+        if !bridge.state.spoken_messages.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(bridge.state.spoken_messages, [MESSAGE]);
+    std::fs::read_to_string(dir.join("adapt-in.txt")).unwrap()
+}
+
+async fn spoken_with(adapt: &str) -> (String, Vec<Value>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Calls::default();
+    let server = connector(&dir.path().join("wn.sock"), calls.clone(), false, REPLY).await;
+    let mut bridge = adapting_bridge(dir.path(), adapt).await;
+    assert_eq!(
+        speak_once(&mut bridge, dir.path()).await,
+        format!("Speak it in Portuguese.\n\n{CLEANED}")
+    );
+    assert_eq!(calls.sent_audio.lock().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("adapt-cwd.txt"))
+            .unwrap()
+            .trim_end(),
+        dir.path()
+            .join("speech")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    server.abort();
+    let spoken = std::fs::read_to_string(dir.path().join("spoken.txt")).unwrap();
+    (spoken, notices(&calls), dir)
+}
+
+#[tokio::test]
+async fn the_adapt_command_output_is_spoken() {
+    let (spoken, notices, _dir) = spoken_with("printf 'O build passou.\\n'").await;
+    assert_eq!(spoken, "O build passou.");
+    assert!(notices.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_or_empty_adapt_command_speaks_the_original_and_tells_the_phone() {
+    for adapt in ["printf 'partial'; exit 1", "printf ' \\n'"] {
+        let (spoken, notices, _dir) = spoken_with(adapt).await;
+        assert_eq!(spoken, CLEANED, "{adapt}");
+        assert_eq!(notices.len(), 1, "{adapt}");
+        assert_eq!(notices[0]["text"], FALLBACK);
+    }
+}
+
+#[tokio::test]
+async fn the_prompt_file_is_read_on_each_reaction_and_falls_back_to_the_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Calls::default();
+    let server = connector(&dir.path().join("wn.sock"), calls.clone(), false, REPLY).await;
+    let mut bridge = adapting_bridge(dir.path(), "printf 'Fala.'").await;
+    let prompt = dir.path().join("prompt.md");
+
+    std::fs::write(&prompt, "Fale em português.").unwrap();
+    assert_eq!(
+        speak_once(&mut bridge, dir.path()).await,
+        format!("Fale em português.\n\n{CLEANED}")
+    );
+    std::fs::write(&prompt, "Fale devagar.").unwrap();
+    assert_eq!(
+        speak_once(&mut bridge, dir.path()).await,
+        format!("Fale devagar.\n\n{CLEANED}")
+    );
+    std::fs::remove_file(&prompt).unwrap();
+    assert_eq!(
+        speak_once(&mut bridge, dir.path()).await,
+        format!("{DEFAULT_ADAPT_PROMPT}\n\n{CLEANED}")
+    );
+    assert!(notices(&calls).is_empty());
+    server.abort();
+}
+
+#[test]
+fn an_unreadable_prompt_file_is_logged_once_until_it_is_readable_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prompt.md");
+    let unreadable = AtomicBool::new(false);
+    let read = || adapt_prompt(Some(&path), &unreadable);
+
+    assert_eq!(read(), (DEFAULT_ADAPT_PROMPT.to_owned(), true));
+    std::fs::write(&path, " \n").unwrap();
+    assert_eq!(read(), (DEFAULT_ADAPT_PROMPT.to_owned(), false));
+    std::fs::write(&path, "Speak it.\n").unwrap();
+    assert_eq!(read(), ("Speak it.".to_owned(), false));
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(read(), (DEFAULT_ADAPT_PROMPT.to_owned(), true));
+    assert_eq!(
+        adapt_prompt(None, &AtomicBool::new(false)),
+        (DEFAULT_ADAPT_PROMPT.to_owned(), false)
+    );
+}
+
+#[test]
+fn the_prompt_file_path_must_be_absolute() {
+    let phone = bech32::encode("npub", [0x11u8; 32].to_base32(), bech32::Variant::Bech32).unwrap();
+    let toml = format!(
+        "phone_npub = {phone:?}\naccount_id_hex = {BRIDGE:?}\nherdr_socket = \"/tmp/h.sock\"\n\
+         wn_agent_socket = \"/tmp/w.sock\"\nstate_path = \"/tmp/state.json\"\n\
+         speak_adapt_command = [\"/bin/cat\"]\n"
+    );
+    assert!(BridgeConfig::from_toml(&toml).is_ok());
+    let error =
+        BridgeConfig::from_toml(&format!("{toml}speak_adapt_prompt_file = \"prompt.md\"\n"))
+            .err()
+            .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "speak_adapt_prompt_file must be absolute"
+    );
+}

@@ -188,6 +188,9 @@ pub struct BridgeState {
     /// Authorised inbound media awaiting download/transcription. No terminal input yet.
     #[serde(default)]
     pub media_pending: Vec<serde_json::Value>,
+    /// Bridge messages already sent as audio, oldest first.
+    #[serde(default)]
+    pub spoken_messages: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_job: Option<crate::update::Job>,
 }
@@ -211,6 +214,7 @@ impl Default for BridgeState {
             forwarding_revision: None,
             forwarding_resume_pending: false,
             media_pending: vec![],
+            spoken_messages: vec![],
             update_job: None,
         }
     }
