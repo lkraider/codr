@@ -502,6 +502,40 @@ The key goes in the `x-goog-api-key` request header. On failure, the script exit
 
 Normalised audio files are temporary and removed after each attempt. MDK manages its downloaded temporary files. Image copies stay in **codr**'s private media directory. Do not commit media, transcripts, or model files to Git.
 
+### Local multilingual transcription
+
+`scripts/transcribe_local.py` transcribes each recording on this machine with [faster-whisper](https://github.com/SYSTRAN/faster-whisper). **The audio never leaves the machine.** The multilingual `medium` model detects the spoken language, so Portuguese with English terms works where Phonon-2 (English only) does not. It runs on the CPU in int8.
+
+It uses the same arguments, FFmpeg conversion, five-minute limit and one-line errors as the Gemini script. It needs Python 3 with `venv`, FFmpeg from the system package manager, and about 1.5 GB of disk for the model. Measured on a six-core CPU host: a short recording took about 18 seconds including model load, and the process peaked at about 2.9 GB of memory. The model loads again for every recording, so each note takes at least 15 to 20 seconds. **codr** stops a transcribe command after 600 seconds. The default is `medium` with greedy decoding (beam size 1). On one 26-second clip it gave nearly the same text as beam size 5 (one word differed) in about 40 seconds instead of 54, on a busy six-core host. Decoding took about 1.3 times real time after the load, so a five-minute note takes roughly 7 minutes. That fits under 600 seconds, with less margin on a busier host. While a note is prepared, other media waits and a text message from the same group is refused with "Media from this group is still being prepared"; other groups' text is not delayed.
+
+`small` is a documented fallback for a host short on memory or time: about 2.5 to 3 times faster, and about 1.25 GB of memory instead of 3 GB. Select it by adding `"--model", "small"` to `transcribe_command`, and download it once like `medium`, with `"small"` in the step 3 command. It is not the default. On the one test clip it reversed the meaning of the opening phrase, which a spoken command cannot afford.
+
+1. Install FFmpeg with the system package manager, for example `sudo apt install -y ffmpeg`.
+2. Create the environment outside the repository. `av` is pinned because `av` 19 breaks faster-whisper 1.2.1:
+
+   ```sh
+   python3 -m venv ~/cache/codr-voice/venv
+   ~/cache/codr-voice/venv/bin/python -m pip install faster-whisper "av<17"
+   ```
+
+3. Download the model once. This is the only network use. Later runs work offline, and `HF_HUB_OFFLINE=1` makes that certain:
+
+   ```sh
+   ~/cache/codr-voice/venv/bin/python -c 'from faster_whisper import WhisperModel; WhisperModel("medium", device="cpu", compute_type="int8")'
+   ```
+
+4. Set the command in the bridge configuration, using the venv's Python and absolute paths:
+
+   ```toml
+   transcribe_command = ["/home/user/cache/codr-voice/venv/bin/python", "/absolute/path/to/codr/scripts/transcribe_local.py", "--ffmpeg", "/usr/bin/ffmpeg"]
+   ```
+
+5. Restart the bridge.
+
+The script sends no prompt text to the model by default, so it works the same for any speaker and any language. `--hint "text"` passes faster-whisper an optional initial prompt. Keep it at the language level, for example the language and the kind of speech. Do not list terms. Whether a hint helps mixed-language speech has not been measured here.
+
+Add `--model-dir <path>` to keep the weights somewhere other than the default Hugging Face cache. On failure the script exits non-zero with a one-line reason on stderr. **codr** discards stderr, so run the script by hand with an audio file to see the reason.
+
 ### Spoken replies
 
 React to a bridge message on the phone with the configured emoji, and **codr** sends the message back as an audio message. The audio is a reply to the spoken message in the same group. The released 0.6.0 connector ignores the reply target, so with that connector the audio arrives as a separate message. Each message is spoken once. Reactions from other members, other emoji and reactions to messages that the bridge did not send are ignored.
