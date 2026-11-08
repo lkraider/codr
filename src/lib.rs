@@ -15,6 +15,7 @@ pub mod media;
 pub mod outbound_images;
 pub mod output;
 mod reads;
+pub mod speech;
 pub mod state;
 pub mod update;
 pub mod wire;

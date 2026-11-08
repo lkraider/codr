@@ -15,7 +15,7 @@ binary = Path(sys.argv[2])
 metadata = legacy.probe(binary)
 old = {"version":"0.9.0","state_version":1,"protocol":"marmot.agent-control.v2",
        "connector":{"version":"0.14.0","revision":"3fb4b4759ac676b0c21c4c3527074866c9fa4c89",
-                    "patch_sha256":"259885539f01cc3a4fd9e49d0f99b20afd8906ea88632d824d16bab354881302"}}
+                    "patch_sha256":"1200609b8bf8c3c5f458661da00c79c7ecfda18abd83bf1c07f0c328f80306c0"}}
 installed = root/"installed"
 installed.write_bytes(b"previous 0.9 worker")
 job = root/"legacy-job"

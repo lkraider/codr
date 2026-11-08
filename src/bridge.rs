@@ -29,10 +29,19 @@ pub struct Bridge {
     pub(crate) update_check: Option<crate::update::Check>,
     phone: String,
     media_job: Option<tokio::task::JoinHandle<Result<crate::media::Prepared>>>,
+    speech_jobs: Vec<SpeechJob>,
+    speak_prompt_unreadable: std::sync::Arc<std::sync::atomic::AtomicBool>,
     reads: crate::reads::Reads,
     pub(crate) last_snapshot: Vec<Agent>,
     pub(crate) porter_updates: tokio::sync::watch::Sender<Value>,
 }
+
+struct SpeechJob {
+    message_id: String,
+    job: tokio::task::JoinHandle<Result<()>>,
+}
+
+const SPOKEN_LIMIT: usize = 500;
 
 impl Drop for Bridge {
     fn drop(&mut self) {
@@ -41,6 +50,9 @@ impl Drop for Bridge {
         }
         if let Some(job) = self.media_job.take() {
             job.abort();
+        }
+        for speech in &self.speech_jobs {
+            speech.job.abort();
         }
     }
 }
@@ -76,6 +88,8 @@ impl Bridge {
             update_check: None,
             phone,
             media_job: None,
+            speech_jobs: vec![],
+            speak_prompt_unreadable: Default::default(),
             reads: crate::reads::Reads::default(),
             last_snapshot: vec![],
             porter_updates: tokio::sync::watch::channel(Value::Null).0,
@@ -1981,6 +1995,10 @@ impl Bridge {
             event["marmot_agent_control"] == PROTOCOL,
             "MDK event protocol mismatch"
         );
+        if event["type"] == "reaction_added" {
+            self.reaction(event);
+            return Ok(());
+        }
         if event["type"] != "inbound_message"
             || event["account_id_hex"] != self.config.account_id_hex
         {
@@ -2805,6 +2823,76 @@ impl Bridge {
             self.state.enqueue(group, &text);
         }
         self.save()
+    }
+
+    fn reaction(&mut self, event: &Value) {
+        let (Some(emoji), Some(group), Some(id)) = (
+            self.config.speak_reaction.as_deref(),
+            event["group_id_hex"].as_str(),
+            event["target_message_id_hex"].as_str(),
+        ) else {
+            return;
+        };
+        if event["account_id_hex"] != self.config.account_id_hex
+            || event["actor"]["account_id_hex"] != self.phone
+            || event["emoji"] != emoji
+            || event["target"]["sender"]["account_id_hex"] != self.config.account_id_hex
+            || !self
+                .state
+                .mappings
+                .values()
+                .any(|m| m.group_id_hex.as_deref() == Some(group))
+            || self.state.spoken_messages.iter().any(|spoken| spoken == id)
+            || self
+                .speech_jobs
+                .iter()
+                .any(|speech| speech.message_id == id)
+        {
+            return;
+        }
+        let config = self.config.clone();
+        let socket = self.marmot.clone();
+        let unreadable = self.speak_prompt_unreadable.clone();
+        let (group, message_id) = (group.to_owned(), id.to_owned());
+        let job = tokio::spawn({
+            let message_id = message_id.clone();
+            async move {
+                crate::speech::speak_or_report(&config, &socket, &group, &message_id, &unreadable)
+                    .await
+            }
+        });
+        self.speech_jobs.push(SpeechJob { message_id, job });
+    }
+
+    /// Records finished speech. A failed message is spoken again on a new reaction.
+    pub async fn process_speech(&mut self) -> Result<()> {
+        let (finished, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.speech_jobs)
+            .into_iter()
+            .partition(|speech| speech.job.is_finished());
+        self.speech_jobs = running;
+        for speech in finished {
+            match speech.job.await {
+                Ok(Ok(())) => {
+                    self.state.spoken_messages.push(speech.message_id);
+                    let excess = self
+                        .state
+                        .spoken_messages
+                        .len()
+                        .saturating_sub(SPOKEN_LIMIT);
+                    self.state.spoken_messages.drain(..excess);
+                }
+                result => {
+                    let error = result.map_or_else(anyhow::Error::from, |r| r.unwrap_err());
+                    if crate::speech::nothing_to_speak(&error) {
+                        eprintln!("Speech skipped: nothing to speak.");
+                    } else {
+                        eprintln!("Speech failed: {error:#}");
+                    }
+                }
+            }
+            self.save()?;
+        }
+        Ok(())
     }
 
     /// Process one download/transcription at a time without blocking other sessions.
@@ -3739,6 +3827,7 @@ impl Bridge {
         let mut recovery_due = true;
         let mut recovery_tick = tokio::time::interval(Duration::from_secs(60));
         recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut speech_tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 Ok(stream) = crate::porter::accept(&porter_listener) => {
@@ -3749,6 +3838,7 @@ impl Bridge {
                 _ = tokio::signal::ctrl_c() => {
                     subscriber.abort();
                     if let Some(job) = self.media_job.take() { job.abort(); }
+                    for speech in &self.speech_jobs { speech.job.abort(); }
                     return Ok(());
                 },
                 _ = tick.tick() => {
@@ -3769,6 +3859,7 @@ impl Bridge {
                     } else if self.inbound(&event).await.is_err() { recovery_due = true; eprintln_throttled!("Inbound message deferred; will reconcile history."); }
                 },
                 _ = recovery_tick.tick() => { recovery_due = true; }
+                _ = speech_tick.tick(), if !self.speech_jobs.is_empty() => {}
             }
             if recovery_due && self.herdr_available {
                 recovery_due = self.recover_inbound().await.is_err();
@@ -3791,6 +3882,9 @@ impl Bridge {
                 eprintln_throttled!(
                     "Native acceptance warning remains pending; private state could not be saved."
                 );
+            }
+            if self.process_speech().await.is_err() {
+                eprintln!("Speech result could not be saved; it retries.");
             }
             if self.flush().await.is_err() {
                 eprintln_throttled!("MDK send unavailable; private outbox retained for retry.");

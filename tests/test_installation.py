@@ -529,6 +529,11 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(config["phone_npub"], "npub1fixture")
             self.assertEqual(config["herdr_socket"], str(self.socket.resolve()))
             self.assertEqual(config["account_id_hex"], "ab" * 32)
+            speech = self.home / "state/herdr-white-noise-bridge/speech"
+            self.assertEqual(config["speak_dir"], str(speech))
+            self.assertEqual(speech.stat().st_mode & 0o777, 0o700)
+            transport = (self.config.parents[1] / "systemd/user/wn-agent-herdr.service").read_text()
+            self.assertIn(f'"--media-allowed-root" "{speech}"', transport)
             unit = self.config.parents[1] / "systemd/user/herdr-white-noise-bridge.service"
             self.assertIn("%%", unit.read_text())
             self.assertIn("--config", unit.read_text())

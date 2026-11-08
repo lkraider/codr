@@ -44,6 +44,22 @@ pub struct BridgeConfig {
     /// Executable and fixed arguments. The downloaded audio path is appended.
     #[serde(default)]
     pub transcribe_command: Vec<String>,
+    /// Executable and fixed arguments. The text arrives on stdin and the audio path is appended.
+    #[serde(default)]
+    pub speak_command: Vec<String>,
+    /// Reaction from the phone that asks for a spoken copy of a bridge message.
+    #[serde(default)]
+    pub speak_reaction: Option<String>,
+    /// Temporary audio files. The connector sends media only from beneath its `--media-allowed-root`.
+    #[serde(default)]
+    pub speak_dir: Option<PathBuf>,
+    /// Executable and fixed arguments. The prompt, a blank line and the text arrive on stdin.
+    /// The speech text is read from stdout.
+    #[serde(default)]
+    pub speak_adapt_command: Vec<String>,
+    /// Read on each reaction, so an edit applies without a restart.
+    #[serde(default)]
+    pub speak_adapt_prompt_file: Option<PathBuf>,
 }
 
 fn automatic_default() -> bool {
@@ -107,6 +123,22 @@ impl BridgeConfig {
             &config.launch_root,
         ] {
             ensure!(path.is_absolute(), "Configuration paths must be absolute");
+        }
+        if config.speak_reaction.is_some() {
+            ensure!(
+                !config.speak_command.is_empty()
+                    && config
+                        .speak_dir
+                        .as_ref()
+                        .is_some_and(|dir| dir.is_absolute()),
+                "speak_reaction needs speak_command and an absolute speak_dir"
+            );
+        }
+        if let Some(path) = &config.speak_adapt_prompt_file {
+            ensure!(
+                path.is_absolute(),
+                "speak_adapt_prompt_file must be absolute"
+            );
         }
         ensure!(
             config.launch_root.parent().is_some(),
