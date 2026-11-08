@@ -1031,6 +1031,15 @@ impl Bridge {
     }
 
     async fn reconcile_agent(&mut self, key: &str, agent: &Agent) -> Result<()> {
+        if let Some(mapping) = self.state.mappings.get_mut(key) {
+            let expired = mapping.activity.expire_held(now());
+            if let Some(group) = mapping.group_id_hex.clone().filter(|_| expired > 0) {
+                for _ in 0..expired {
+                    self.state.enqueue(&group, "Stopped waiting for a phone prompt sent more than 30 minutes ago. Its reply will not be forwarded.");
+                }
+                self.save()?;
+            }
+        }
         if self.reads.background
             && agent
                 .agent_session
@@ -2718,6 +2727,9 @@ impl Bridge {
                 }
                 if let Some(history) = phone_history {
                     mapping.activity.start_phone(id, text, &history.user_inputs);
+                    if self.config.phone_replies_only {
+                        mapping.activity.hold_phone(id, now());
+                    }
                 } else if immediate_prompt && self.config.auto_forwarding {
                     mapping.activity.start_phone_current(id, text);
                 }

@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
+pub const HELD_PHONE_SECS: u64 = 30 * 60;
+
 #[derive(Clone, Debug)]
 pub struct UserInput {
     pub id: String,
@@ -169,6 +171,10 @@ struct PhoneInput {
     before: Vec<String>,
     fingerprint: Option<String>,
     confirmed: bool,
+    #[serde(default)]
+    held: bool,
+    #[serde(default)]
+    held_at: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -198,57 +204,69 @@ impl Activity {
             .iter()
             .filter(|input| input.complete && !known.contains(&input.id))
             .collect();
-        // Group fresh text by fingerprint. A resend produces two phone receipts
-        // with the same text and two echoes; matching counts keeps that
-        // attributable instead of treating the whole batch as local input.
-        // A queued input rides inside a running turn: it never counts as local input.
-        let mut by_text: std::collections::BTreeMap<String, Vec<&UserInput>> =
-            std::collections::BTreeMap::new();
-        let mut local = fresh
-            .iter()
-            .any(|input| input.fingerprint.is_none() && !input.queued);
+        let mut consumed: Vec<String> = Vec::new();
+        // Inputs already matched to a phone receipt. Identical sends match one to one.
+        let mut matched: Vec<&str> = Vec::new();
+        let mut local = false;
         for input in &fresh {
-            if let Some(fingerprint) = &input.fingerprint {
-                by_text.entry(fingerprint.clone()).or_default().push(input);
-            }
-        }
-        let mut consumed = HashSet::new();
-        for (fingerprint, group) in &by_text {
             let candidates: Vec<_> = self
                 .phone
                 .iter()
                 .filter(|phone| {
                     phone.confirmed
-                        && phone.fingerprint.as_deref() == Some(fingerprint)
-                        && group.iter().all(|input| !phone.before.contains(&input.id))
+                        && input.fingerprint.is_some()
+                        && input.fingerprint == phone.fingerprint
+                        && !phone.before.contains(&input.id)
+                        && !consumed.contains(&phone.receipt)
                 })
                 .collect();
-            if candidates.len() == group.len() {
-                consumed.insert(fingerprint.clone());
-                // The turn each matched input opens or joins holds the phone's prompt.
-                for input in group {
-                    if let Some(turn) = &input.turn
-                        && !self.phone_turns.contains(turn)
-                    {
-                        self.phone_turns.push(turn.clone());
-                    }
+            // Held prompts run in send order, so identical held text matches the oldest submission.
+            let receipt = match candidates.first() {
+                Some(first) if candidates.iter().all(|phone| phone.held) => Some(first),
+                // Without holds, every identical fresh input needs its own receipt, or the text is ambiguous.
+                Some(first)
+                    if candidates.len()
+                        == fresh
+                            .iter()
+                            .filter(|other| {
+                                other.fingerprint == first.fingerprint
+                                    && !first.before.contains(&other.id)
+                                    && !matched.contains(&other.id.as_str())
+                            })
+                            .count() =>
+                {
+                    Some(first)
                 }
-            } else if group.iter().any(|input| !input.queued) {
-                local = true;
+                _ => None,
+            }
+            .map(|phone| phone.receipt.clone());
+            let Some(receipt) = receipt else {
+                local |= !input.queued;
+                continue;
+            };
+            consumed.push(receipt);
+            matched.push(&input.id);
+            if let Some(turn) = &input.turn
+                && !self.phone_turns.contains(turn)
+            {
+                self.phone_turns.push(turn.clone());
             }
         }
-        // A genuine local/ambiguous input still invalidates outstanding attribution.
-        if local {
-            self.phone.clear();
-        } else {
-            self.phone.retain(|phone| {
-                !phone.confirmed
-                    || !phone
-                        .fingerprint
-                        .as_deref()
-                        .is_some_and(|fingerprint| consumed.contains(fingerprint))
-            });
-        }
+        // A submission can explain only the first new input batch after its checkpoint.
+        // A held submission waits behind earlier queued prompts. A later match proves it was dropped.
+        let last = self
+            .phone
+            .iter()
+            .rposition(|phone| consumed.contains(&phone.receipt));
+        let mut index = 0;
+        self.phone.retain(|phone| {
+            index += 1;
+            !consumed.contains(&phone.receipt)
+                && last.is_none_or(|last| index > last + 1)
+                // Unmatched local input makes an unheld submission stale. Matched echoes of
+                // other submissions do not, so staggered echoes keep the later receipt.
+                && (phone.held || !local)
+        });
         observed.extend(fresh.into_iter().map(|input| input.id.clone()));
         local
     }
@@ -263,7 +281,7 @@ impl Activity {
 
     /// True from a phone submission until the final reply of its turn.
     pub fn awaiting_phone(&self) -> bool {
-        !self.phone.is_empty() || self.phone_open
+        self.phone.iter().any(|phone| phone.confirmed) || self.phone_open
     }
 
     pub fn track_latest(&mut self, latest: Option<&str>, answered: bool) {
@@ -296,6 +314,8 @@ impl Activity {
             before,
             fingerprint: UserInput::new(String::new(), text).fingerprint,
             confirmed: false,
+            held: false,
+            held_at: 0,
         });
     }
 
@@ -305,6 +325,32 @@ impl Activity {
                 phone.confirmed = true;
             }
         }
+    }
+
+    /// Keeps the submission across unrelated input until its own prompt appears.
+    pub fn hold_phone(&mut self, receipt: &str, now: u64) {
+        for phone in &mut self.phone {
+            if phone.receipt == receipt {
+                phone.held = true;
+                phone.held_at = now;
+            }
+        }
+    }
+
+    /// Returns how many confirmed submissions expired.
+    /// A held entry saved without `held_at` starts its limit at the first check.
+    pub fn expire_held(&mut self, now: u64) -> usize {
+        for phone in self
+            .phone
+            .iter_mut()
+            .filter(|phone| phone.held && phone.held_at == 0)
+        {
+            phone.held_at = now;
+        }
+        let before = self.phone.iter().filter(|phone| phone.confirmed).count();
+        self.phone
+            .retain(|phone| !phone.held || now.saturating_sub(phone.held_at) < HELD_PHONE_SECS);
+        before - self.phone.iter().filter(|phone| phone.confirmed).count()
     }
 
     pub fn cancel_phone(&mut self, receipt: &str) {

@@ -330,9 +330,11 @@ The bridge saves consumption and submission intent before native input. A proven
 
 Set `phone_replies_only = true` to send a final reply only when it answers a prompt from your phone. Replies to prompts typed at the desk or sent by other agents that type into the session, stay off the phone. They are not queued for later.
 
-**codr** attributes a prompt to the phone when its transcript text matches the confirmed phone submission. A reply is sent when the turn it completes contains such a prompt. Ambiguous input, such as identical text typed at the desk at the same time, counts as local, so its reply stays off the phone.
+**codr** attributes a prompt to the phone when its transcript text matches the confirmed phone submission. A reply is sent when the turn it completes contains such a prompt. The transcript holds no source for a prompt. While a phone prompt is held, the first transcript row with the same text counts as the phone prompt, even when it came from the desk or another agent.
 
 Claude Code holds a prompt typed while it works. It either adds that prompt to the running turn or starts a new turn with it when the running turn ends. In the first case, the final reply of the running turn answers both prompts and goes to the phone.
+
+A phone prompt can wait behind other held prompts. **codr** keeps its phone submission until the prompt appears in the transcript. A later phone prompt that appears first ends the wait for earlier ones. Identical phone prompts match their transcript rows in send order. **codr** stops waiting after 30 minutes and tells the phone. If the agent starts the prompt more than 30 minutes after you sent it, its reply stays off the phone.
 
 Blocked notices always go to the phone. Working and idle notices stay off the phone, with one exception. A `> Working...` notice right after `> Blocked...` goes to the phone from a phone submission until the final reply of its turn. It tells you that the agent continued after the blocker. With `edit_responses = true`, editable progress goes to the phone from a phone submission until the final reply of its turn.
 

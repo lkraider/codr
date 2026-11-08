@@ -11620,3 +11620,167 @@ async fn the_phone_checkpoint_waits_for_a_settled_agent_unless_phone_replies_onl
     assert!(takes_checkpoint(true, "working", false).await);
     assert!(takes_checkpoint(true, "idle", true).await);
 }
+
+#[tokio::test]
+async fn phone_replies_only_answers_a_phone_prompt_queued_behind_a_peer_prompt() {
+    let (_dir, config, mut observed, calls, mut bridge, peers) = phone_only_bridge("working").await;
+    claude_transcript(
+        &config,
+        &[
+            ("u0", "user", "Old prompt"),
+            ("a0", "final", "Old final"),
+            ("u1", "user", "First peer message"),
+        ],
+    );
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.inbound(&inbound(HEX, "phone-busy")).await.unwrap();
+    claude_transcript(
+        &config,
+        &[
+            ("u0", "user", "Old prompt"),
+            ("a0", "final", "Old final"),
+            ("u1", "user", "First peer message"),
+            ("a1", "final", "Reply to the first peer"),
+            ("u2", "user", "Second peer message"),
+        ],
+    );
+    observed.agent_status = "idle".into();
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.flush().await.unwrap();
+    claude_transcript(
+        &config,
+        &[
+            ("u0", "user", "Old prompt"),
+            ("a0", "final", "Old final"),
+            ("u1", "user", "First peer message"),
+            ("a1", "final", "Reply to the first peer"),
+            ("u2", "user", "Second peer message"),
+            ("a2", "final", "Reply to the second peer"),
+            ("u3", "user", "test prompt"),
+            ("a3", "final", "Reply to the phone"),
+        ],
+    );
+    observed.agent_status = "idle".into();
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.flush().await.unwrap();
+    assert_eq!(sent(&calls, "Reply to the first peer"), 0);
+    assert_eq!(sent(&calls, "Reply to the second peer"), 0);
+    assert_eq!(sent(&calls, "Reply to the phone"), 1);
+    for handle in peers {
+        handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn phone_replies_only_answers_identical_phone_prompts_in_send_order() {
+    let (_dir, config, mut observed, calls, mut bridge, peers) = phone_only_bridge("working").await;
+    let mut rows = vec![
+        ("u0", "user", "Old prompt"),
+        ("a0", "final", "Old final"),
+        ("u1", "user", "From: a peer agent"),
+    ];
+    claude_transcript(&config, &rows);
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.inbound(&inbound(HEX, "phone-a")).await.unwrap();
+    bridge.inbound(&inbound(HEX, "phone-b")).await.unwrap();
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["method"] == "agent.prompt")
+            .count(),
+        2
+    );
+    rows.extend([
+        ("a1", "final", "Reply to the peer"),
+        ("u2", "user", "test prompt"),
+        ("a2", "final", "First phone reply"),
+    ]);
+    claude_transcript(&config, &rows);
+    observed.agent_status = "idle".into();
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.flush().await.unwrap();
+    rows.extend([
+        ("u3", "user", "test prompt"),
+        ("a3", "final", "Second phone reply"),
+    ]);
+    claude_transcript(&config, &rows);
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.flush().await.unwrap();
+    assert_eq!(sent(&calls, "Reply to the peer"), 0);
+    assert_eq!(sent(&calls, "First phone reply"), 1);
+    assert_eq!(sent(&calls, "Second phone reply"), 1);
+    for handle in peers {
+        handle.abort();
+    }
+}
+
+fn age_held(value: &mut Value, held_at: u64) -> usize {
+    match value {
+        Value::Object(map) => {
+            let mut count = 0;
+            if let Some(slot) = map.get_mut("held_at") {
+                *slot = json!(held_at);
+                count += 1;
+            }
+            count
+                + map
+                    .values_mut()
+                    .map(|v| age_held(v, held_at))
+                    .sum::<usize>()
+        }
+        Value::Array(items) => items.iter_mut().map(|v| age_held(v, held_at)).sum(),
+        _ => 0,
+    }
+}
+
+#[tokio::test]
+async fn phone_replies_only_stops_waiting_for_a_held_prompt_after_30_minutes_and_says_so() {
+    for (age, expected) in [(1700u64, 1usize), (1801, 0)] {
+        let (_dir, config, mut observed, calls, mut bridge, peers) =
+            phone_only_bridge("working").await;
+        let mut rows = vec![
+            ("u0", "user", "Old prompt"),
+            ("a0", "final", "Old final"),
+            ("u1", "user", "From: a peer agent"),
+        ];
+        claude_transcript(&config, &rows);
+        bridge.reconcile(vec![observed.clone()]).await.unwrap();
+        bridge.inbound(&inbound(HEX, "phone-a")).await.unwrap();
+        drop(bridge);
+        let mut state: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config.state_path).unwrap()).unwrap();
+        let now = herdr_white_noise_bridge::bridge::now();
+        assert_eq!(age_held(&mut state, now - age), 1, "age={age}");
+        std::fs::write(&config.state_path, state.to_string()).unwrap();
+        let mut bridge = Bridge::open(config.clone()).unwrap();
+        rows.extend([
+            ("a1", "final", "Reply to the peer"),
+            ("u2", "user", "test prompt"),
+            ("a2", "final", "Reply to the phone"),
+        ]);
+        claude_transcript(&config, &rows);
+        observed.agent_status = "idle".into();
+        observed.state_change_seq += 1;
+        bridge.reconcile(vec![observed.clone()]).await.unwrap();
+        bridge.flush().await.unwrap();
+        assert_eq!(sent(&calls, "Reply to the phone"), expected, "age={age}");
+        assert_eq!(sent(&calls, "Reply to the peer"), 0, "age={age}");
+        assert_eq!(
+            sent(
+                &calls,
+                "Stopped waiting for a phone prompt sent more than 30 minutes ago. Its reply will not be forwarded."
+            ),
+            1 - expected,
+            "age={age}"
+        );
+        for handle in peers {
+            handle.abort();
+        }
+    }
+}
