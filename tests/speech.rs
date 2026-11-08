@@ -63,7 +63,7 @@ async fn connector(
             calls.requests.lock().unwrap().push(request.clone());
             let mut response = match request["type"].as_str().unwrap() {
                 "timeline_message_get" => json!({"type":"timeline_message","account_id_hex":BRIDGE,
-                    "group_id_hex":GROUP,"message_id_hex":MESSAGE,"message":{"message_id_hex":MESSAGE,
+                    "group_id_hex":GROUP,"message_id_hex":request["message_id_hex"],"message":{"message_id_hex":request["message_id_hex"],
                     "availability":"available","kind":9,"sender":{"account_id_hex":BRIDGE},
                     "text":text,"text_truncated":false}}),
                 "send_media" if refuse_media => {
@@ -469,4 +469,59 @@ fn the_prompt_file_path_must_be_absolute() {
         error.to_string(),
         "speak_adapt_prompt_file must be absolute"
     );
+}
+
+#[tokio::test]
+async fn each_audio_is_a_new_file_and_a_stale_file_is_neither_reused_nor_overwritten() {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Calls::default();
+    let server = connector(&dir.path().join("wn.sock"), calls.clone(), false, REPLY).await;
+    let mut bridge = bridge(dir.path(), 0).await;
+    // A file a crashed run left behind, under the name an unrandomised scheme would pick.
+    let speech = dir.path().join("speech");
+    std::fs::DirBuilder::new().mode(0o700).create(&speech).unwrap();
+    let stale = speech.join("spoken-.m4a");
+    std::fs::write(&stale, "stale").unwrap();
+    // The speech command logs each output path and holds the first job open
+    // while the second one starts.
+    let log = dir.path().join("paths.log");
+    let script = dir.path().join("speak.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncat > /dev/null\necho \"$1\" >> {log:?}\nsleep 0.3\nprintf 'm4a audio' > \"$1\"\n"
+        ),
+    )
+    .unwrap();
+
+    let mut second = reaction(PHONE, "😮", BRIDGE);
+    second["target_message_id_hex"] = json!("dd".repeat(32));
+    bridge
+        .inbound(&reaction(PHONE, "😮", BRIDGE))
+        .await
+        .unwrap();
+    bridge.inbound(&second).await.unwrap();
+    for _ in 0..300 {
+        bridge.process_speech().await.unwrap();
+        if bridge.state.spoken_messages.len() == 2 || !notices(&calls).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert!(
+        notices(&calls).is_empty(),
+        "no speech may fail: {:?}",
+        notices(&calls)
+    );
+    assert_eq!(bridge.state.spoken_messages.len(), 2);
+    let log = std::fs::read_to_string(&log).unwrap();
+    let paths: Vec<_> = log.lines().collect();
+    assert_eq!(paths.len(), 2);
+    assert_ne!(paths[0], paths[1], "two jobs must not share a file");
+    assert!(paths.iter().all(|path| Path::new(path) != stale));
+    assert_eq!(std::fs::read_to_string(&stale).unwrap(), "stale");
+    assert!(paths.iter().all(|path| !Path::new(path).exists()));
+    server.abort();
 }
