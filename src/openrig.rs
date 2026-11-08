@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
     process::Stdio,
     sync::{LazyLock, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -324,12 +324,46 @@ pub fn classify(event: &Value, seats: &[String]) -> Action {
     }
 }
 
+/// How often the log repeats that the event stream is still down, or down again after a short recovery.
+const OUTAGE_LOG_EVERY: Duration = Duration::from_secs(30 * 60);
+
+/// Decides when the event stream's state is worth a log line: once when it drops, once when it is back,
+/// and at most every `OUTAGE_LOG_EVERY` for a stream that stays down or keeps dropping.
+#[derive(Default)]
+pub struct Outage {
+    announced: bool,
+    last_note: Option<Instant>,
+}
+
+impl Outage {
+    /// The stream ended or could not start.
+    pub fn dropped(&mut self, now: Instant) -> Option<&'static str> {
+        if self
+            .last_note
+            .is_some_and(|at| now.duration_since(at) < OUTAGE_LOG_EVERY)
+        {
+            return None;
+        }
+        self.last_note = Some(now);
+        self.announced = true;
+        Some("OpenRig event stream is unavailable; codr resyncs with rig ps every 60 s.")
+    }
+
+    /// The stream delivered data again.
+    pub fn connected(&mut self) -> Option<&'static str> {
+        if !std::mem::take(&mut self.announced) {
+            return None;
+        }
+        Some("OpenRig event stream recovered.")
+    }
+}
+
 /// Follows `GET <openrig_url>/api/events` until the receiver closes.
 /// Each connection starts with a resync and ignores events created before it connected.
 /// Without a stored sequence, OpenRig replays its whole history.
 pub async fn follow(config: &BridgeConfig, mut since: Option<u64>, tx: Sender<Event>) {
     let url = format!("{}/api/events", config.openrig_url.trim_end_matches('/'));
-    let mut down = false;
+    let mut outage = Outage::default();
     let mut wait = 1;
     loop {
         let skip_before = daemon_now();
@@ -356,9 +390,8 @@ pub async fn follow(config: &BridgeConfig, mut since: Option<u64>, tx: Sender<Ev
                 if !connected {
                     connected = true;
                     wait = 1;
-                    if down {
-                        eprintln!("OpenRig event stream reconnected.");
-                        down = false;
+                    if let Some(note) = outage.connected() {
+                        eprintln!("{note}");
                     }
                     if tx
                         .send(Event {
@@ -408,9 +441,8 @@ pub async fn follow(config: &BridgeConfig, mut since: Option<u64>, tx: Sender<Ev
             }
             let _ = child.wait().await;
         }
-        if !down {
-            eprintln!("OpenRig event stream is unavailable; codr resyncs with rig ps every 60 s.");
-            down = true;
+        if let Some(note) = outage.dropped(Instant::now()) {
+            eprintln!("{note}");
         }
         tokio::time::sleep(Duration::from_secs(wait)).await;
         wait = (wait * 2).min(30);

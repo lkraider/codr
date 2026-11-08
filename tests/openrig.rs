@@ -1483,3 +1483,20 @@ async fn a_phone_prompt_run_after_a_peer_turn_sends_only_its_own_answer() {
 async fn a_phone_prompt_taken_into_a_peer_turn_gets_that_turns_one_reply() {
     assert_eq!(phone_prompt_during_a_peer_turn(true).await, ["Reply to both"]);
 }
+
+#[test]
+fn a_stream_that_keeps_dropping_is_logged_once_not_on_every_drop() {
+    use std::time::{Duration, Instant};
+    let mut outage = openrig::Outage::default();
+    let start = Instant::now();
+    assert!(outage.dropped(start).is_some_and(|n| n.contains("unavailable")));
+    assert!(outage.dropped(start + Duration::from_secs(30)).is_none());
+    assert!(outage.connected().is_some_and(|n| n.contains("recovered")));
+    // Dropping again soon after a recovery stays quiet, and so does the next recovery.
+    assert!(outage.dropped(start + Duration::from_secs(60)).is_none());
+    assert!(outage.connected().is_none());
+    // Still down after 30 minutes: say so again.
+    assert!(outage.dropped(start + Duration::from_secs(60 * 31)).is_some());
+    assert!(outage.dropped(start + Duration::from_secs(60 * 32)).is_none());
+    assert!(outage.connected().is_some());
+}
