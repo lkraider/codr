@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `notify` works while the bridge runs, sends straight to MDK, and prints the MDK message ID. It refuses while forwarding is At desk or an Away switch is still pending.
+
 ## [0.11.1] - 2026-11-05
 
 See the [release notes](docs/releases/0.11.1.md) and
