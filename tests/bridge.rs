@@ -285,6 +285,43 @@ async fn equal_texts_with_one_late_echo_confirm_neither_and_both_are_delivered()
     herdr.abort();
 }
 
+#[tokio::test]
+async fn a_submission_that_never_gets_its_echo_expires_after_30_minutes() {
+    let root = tempfile::tempdir().unwrap();
+    let config = editable_config(root.path());
+    export_script(&config.opencode_bin, "old", "old");
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+    let herdr = peer(&config.herdr_socket, false, calls.clone()).await;
+    let agent = agent();
+    let key = agent.key();
+    let mut bridge = mapped_bridge(config.clone(), &agent);
+    bridge.agents.insert(key.clone(), agent.clone());
+    bridge.herdr_available = true;
+    bridge.inbound(&inbound(HEX, "lost")).await.unwrap();
+    bridge.state.mappings.get_mut(&key).unwrap().submissions[0].submitted_at = now() - 29 * 60;
+    bridge.reconcile(vec![agent.clone()]).await.unwrap();
+    assert_eq!(bridge.state.mappings[&key].submissions.len(), 1, "Still waiting at 29 minutes");
+    bridge.state.mappings.get_mut(&key).unwrap().submissions[0].submitted_at = now() - 31 * 60;
+    bridge.reconcile(vec![agent.clone()]).await.unwrap();
+    assert!(
+        bridge.state.mappings[&key].submissions.is_empty(),
+        "A submission with no echo after 30 minutes stops holding the flight"
+    );
+    assert!(
+        bridge.state.mappings[&key].queue_flight.is_some() && bridge.state.mappings[&key].pending_prompt,
+        "Expiry only drops the submission record: the flight is still held"
+    );
+    input_history(&config, "ses_1", &[("other-input", "other")], Some(("final-1", "Done")));
+    bridge.reconcile(vec![agent]).await.unwrap();
+    assert!(
+        bridge.state.mappings[&key].queue_flight.is_none() && !bridge.state.mappings[&key].pending_prompt,
+        "The flight is freed by the next new final reply, not by the 30 minutes"
+    );
+    mdk.abort();
+    herdr.abort();
+}
+
 fn accept_legacy_text(bridge: &mut Bridge, key: &str, id: &str, text: &str) {
     let mapping = bridge.state.mappings.get_mut(key).unwrap();
     if mapping.last_agent_status == "working" {

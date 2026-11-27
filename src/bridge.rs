@@ -1736,6 +1736,7 @@ impl Bridge {
     fn finish_queued_prompt(&mut self, key: &str, history: &output::SessionHistory) {
         let mapping = self.state.mappings.get_mut(key).unwrap();
         crate::activity::Submission::observe(&mut mapping.submissions, &history.user_inputs);
+        mapping.submissions.retain(|submission| !submission.expired(now()));
         if !mapping.submissions.is_empty() {
             return;
         }
