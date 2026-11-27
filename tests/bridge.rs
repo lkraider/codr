@@ -57,6 +57,12 @@ fn config(dir: &std::path::Path) -> BridgeConfig {
 fn agent() -> Agent {
     serde_json::from_value(json!({"pane_id":"w1:p1","terminal_id":"term1","tab_id":"w1:t1","agent":"opencode","agent_status":"idle","state_change_seq":1,"agent_session":{"agent":"opencode","source":"herdr:opencode","kind":"id","value":"ses_1"}})).unwrap()
 }
+fn inbound_text(sender: &str, id: &str, text: &str) -> Value {
+    let mut event = inbound(sender, id);
+    event["message"]["text"] = json!(text);
+    event
+}
+
 fn inbound(sender: &str, id: &str) -> Value {
     json!({"marmot_agent_control":"marmot.agent-control.v2","type":"inbound_message","account_id_hex":"aa".repeat(32),"group_id_hex":"bb".repeat(16),"message":{"message_id_hex":id,"sender":{"account_id_hex":sender},"text":"test prompt","recorded_at":u64::MAX}})
 }
@@ -102,7 +108,7 @@ async fn missing_transcript_cannot_hide_uncertain_delivery_or_consume_prepared_w
             .state
             .outbox
             .iter()
-            .any(|item| item.manual && item.text.contains("Native acceptance is unconfirmed"))
+            .any(|item| item.manual && item.text.contains("An earlier message is not confirmed yet"))
     );
     assert!(!bridge.state.forwarding_enabled);
     assert!(bridge.process_media().await.is_err());
@@ -162,7 +168,7 @@ async fn terminal_ack_without_native_input_warns_once_and_never_retries_after_re
         .state
         .outbox
         .iter()
-        .filter(|item| item.text.contains("Native acceptance is unconfirmed"))
+        .filter(|item| item.text.contains("An earlier message is not confirmed yet"))
         .collect();
     assert_eq!(warnings.len(), 1);
     assert!(
@@ -177,7 +183,12 @@ async fn terminal_ack_without_native_input_warns_once_and_never_retries_after_re
         bridge.state.mappings[&key].response_id.is_none(),
         "Idle native session must not show indefinite work"
     );
-    bridge.inbound(&inbound(HEX, "followup")).await.unwrap();
+    bridge
+        .inbound(&inbound_text(HEX, "followup", "followup"))
+        .await
+        .unwrap();
+    // Changed with the no-pause decision: an unconfirmed submission no longer
+    // refuses new text. The follow-up is delivered and no refusal is queued.
     assert_eq!(
         calls
             .lock()
@@ -185,14 +196,26 @@ async fn terminal_ack_without_native_input_warns_once_and_never_retries_after_re
             .iter()
             .filter(|call| call["method"] == "agent.prompt")
             .count(),
-        1
+        2
     );
     assert!(
+        !bridge
+            .state
+            .outbox
+            .iter()
+            .any(|item| item.text.contains("No new prompt was sent")
+                || item.text.contains("paused")),
+        "No refusal and no pause claim"
+    );
+    assert_eq!(
         bridge
             .state
             .outbox
             .iter()
-            .any(|item| item.text.contains("No new prompt was sent"))
+            .filter(|item| item.text.contains("An earlier message is not confirmed yet"))
+            .count(),
+        1,
+        "The notice is sent once, not for each later text"
     );
     input_history(
         &config,
@@ -201,11 +224,11 @@ async fn terminal_ack_without_native_input_warns_once_and_never_retries_after_re
         Some(("native-final", "Completed")),
     );
     bridge.reconcile(vec![agent]).await.unwrap();
-    assert!(
-        bridge.state.mappings[&key].submissions.is_empty(),
-        "Late native evidence releases the safety latch"
+    assert_eq!(
+        bridge.state.mappings[&key].submissions.len(),
+        1,
+        "Late evidence confirms the first message only; the follow-up has no echo yet"
     );
-    assert!(bridge.state.mappings[&key].queue_flight.is_none());
     bridge
         .inbound(&inbound(HEX, "after-late-acceptance"))
         .await
@@ -217,9 +240,47 @@ async fn terminal_ack_without_native_input_warns_once_and_never_retries_after_re
             .iter()
             .filter(|call| call["method"] == "agent.prompt")
             .count(),
-        2,
+        3,
         "Only explicit new input may be submitted, not a retry"
     );
+    mdk.abort();
+    herdr.abort();
+}
+
+#[tokio::test]
+async fn equal_texts_with_one_late_echo_confirm_neither_and_both_are_delivered() {
+    let root = tempfile::tempdir().unwrap();
+    let config = editable_config(root.path());
+    export_script(&config.opencode_bin, "old", "old");
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+    let herdr = peer(&config.herdr_socket, false, calls.clone()).await;
+    let agent = agent();
+    let key = agent.key();
+    let mut bridge = mapped_bridge(config.clone(), &agent);
+    bridge.agents.insert(key.clone(), agent.clone());
+    bridge.herdr_available = true;
+    bridge.inbound(&inbound(HEX, "first")).await.unwrap();
+    bridge.state.mappings.get_mut(&key).unwrap().submissions[0].submitted_at = now() - 120;
+    bridge.inbound(&inbound(HEX, "second")).await.unwrap();
+    let prompts = || {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["method"] == "agent.prompt")
+            .count()
+    };
+    assert_eq!(prompts(), 2, "The second equal text is delivered, not refused");
+    assert_eq!(bridge.state.mappings[&key].submissions.len(), 2);
+    input_history(&config, "ses_1", &[("native-input", "test prompt")], None);
+    bridge.reconcile(vec![agent]).await.unwrap();
+    assert_eq!(
+        bridge.state.mappings[&key].submissions.len(),
+        2,
+        "One echo must not confirm either of two equal submissions"
+    );
+    assert_eq!(prompts(), 2, "Nothing is sent again");
     mdk.abort();
     herdr.abort();
 }

@@ -1524,7 +1524,7 @@ impl Bridge {
             .submissions
             .iter()
             .any(|submission| submission.overdue(now()));
-        let notice = "Native acceptance is unconfirmed. Terminal input was attempted, but no matching native message was observed. No automatic retry will run. Inspect the agent before using local clear-prompt; new submissions in this chat are paused.";
+        let notice = "An earlier message is not confirmed yet: it reached the terminal, but the agent has not shown it as received. It was not sent again. New messages keep being delivered.";
         for receipt in warnings {
             self.state
                 .enqueue_manual(&group, notice, &format!("acceptance:{group}:{receipt}"));
@@ -1533,7 +1533,7 @@ impl Bridge {
             self.state.update_response(
                 key,
                 &group,
-                "> Delivery uncertain. Native acceptance is unconfirmed; no automatic retry.",
+                "> Delivery uncertain. An earlier message is not confirmed yet; it was not sent again.",
                 true,
             );
         }
@@ -2494,7 +2494,7 @@ impl Bridge {
                         .iter()
                         .any(|submission| submission.overdue(now()))
                     {
-                        "paused: native acceptance is unconfirmed; inspect the agent before local clear-prompt"
+                        "an earlier message is not confirmed yet (not sent again); new messages are still delivered"
                     } else if !mapping.submissions.is_empty() {
                         "terminal submission recorded; awaiting native acceptance"
                     } else if mapping
@@ -2502,7 +2502,7 @@ impl Bridge {
                         .as_ref()
                         .is_some_and(|flight| !flight.confirmed)
                     {
-                        "paused: submission is uncertain; inspect the terminal and use local clear-prompt"
+                        "a submission is uncertain; it will not be retried. The local clear-prompt command drops the record"
                     } else if mapping.pending_prompt || mapping.queue_flight.is_some() {
                         "a prompt is in flight"
                     } else {
@@ -2675,24 +2675,6 @@ impl Bridge {
                 .await?
         {
             return Ok(());
-        }
-        if !status_command
-            && self.state.mappings[&key]
-                .submissions
-                .iter()
-                .any(|submission| submission.overdue(now()))
-        {
-            ensure!(
-                !queued && !prepared,
-                "Accepted delivery awaits inspection of an uncertain native submission"
-            );
-            return crate::launch::reply(
-                self,
-                &key,
-                group,
-                id,
-                "An earlier submission has unconfirmed native acceptance. No new prompt was sent. Inspect the agent before using local clear-prompt. No automatic retry will run.",
-            );
         }
         // A final transcript record can lag herdr's idle state. Resolve it before
         // opening another response, so it cannot overwrite the next prompt's message.
@@ -3075,7 +3057,7 @@ impl Bridge {
                             self.save()?;
                             return Err(error);
                         }
-                        Some("The prompt could not be confirmed. It will not be retried. Inspect the agent before submitting again. The local clear-prompt command can release an uncertain prompt.".into())
+                        Some("The prompt could not be confirmed. It will not be retried. Check the agent before sending it again. The local clear-prompt command drops the uncertain record.".into())
                     }
                 }
             }
@@ -3943,7 +3925,7 @@ impl Bridge {
                 self.save()?;
                 return Err(error);
             }
-            Err(_) => self.state.enqueue(group, "The decision answer could not be confirmed. It will not be retried automatically. Inspect the terminal before using clear-prompt and sending a new answer."),
+            Err(_) => self.state.enqueue(group, "The decision answer could not be confirmed. It will not be retried automatically. Check the terminal before sending a new answer; the local clear-prompt command drops the uncertain record."),
         }
         self.save()?;
         Ok(true)
