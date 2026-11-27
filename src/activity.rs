@@ -76,6 +76,11 @@ impl Submission {
         at.saturating_sub(self.submitted_at) >= 60
     }
 
+    /// A submission that never got its native echo stops counting as in flight.
+    pub fn expired(&self, at: u64) -> bool {
+        at.saturating_sub(self.submitted_at) >= HELD_PHONE_SECS
+    }
+
     pub fn observe(submissions: &mut Vec<Self>, inputs: &[UserInput]) {
         // Match the whole group: one echo must not confirm two equal submissions,
         // nor may two equal native inputs be attributed to one phone receipt.

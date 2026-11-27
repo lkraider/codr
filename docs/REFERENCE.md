@@ -335,19 +335,20 @@ messages and ambiguous duplicates cannot confirm it. If the baseline read fails,
 acceptance remains unconfirmed.
 
 After 60 seconds without confirmed acceptance, Codr queues one durable warning
-per submission and pauses new prompts in that chat. An idle session's progress
+per submission, saying the earlier message is not confirmed yet and was not sent
+again. New prompts in that chat are still delivered; the agent keeps its own
+queue order and codr never reorders or resends. An idle session's progress
 closes as uncertain, not successful. The check survives restarts, failed history
-reads, unavailable terminals and sync-off mode. Other chats and accepted queued
+reads, unavailable terminals and sync-off mode. Accepted queued
 or prepared deliveries are preserved. No uncertain prompt is automatically resent.
-Late matching native input can resolve the check. Otherwise inspect the native
-session, stop the bridge, and use its local `clear-prompt` command before restarting
-it. Clearing a marker cannot recall terminal input or prevent delayed execution.
-Phone `/queue` shows pending or overdue acceptance. Local `status` reports
+Late matching native input can resolve the check. To drop the record by hand,
+stop the bridge and use its local `clear-prompt` command before restarting it. Clearing a marker cannot recall terminal input or prevent delayed execution.
+Phone `/queue` shows pending or not-yet-confirmed acceptance. Local `status` reports
 `native_acceptance_pending` and `native_acceptance_overdue` separately from
 terminal-write uncertainty. Pre-upgrade flights have no
 acceptance fingerprints and need separate inspection.
 
-Unless an earlier submission has overdue unconfirmed acceptance, an ordinary complete owner text prompt goes directly to the freshly verified mapped agent, including while it is working. It does not wait in codr for idle or interrupt the current task. The agent may still use its own native inbox. A blocked native dialog is reported without silently making a future task; answer its supported decision or permission request, or use `/cancel`. Duplicate inbound events do not submit again. Phone text may reach the agent before an older media item finishes preparation.
+An ordinary complete owner text prompt goes directly to the freshly verified mapped agent, including while it is working. It does not wait in codr for idle or interrupt the current task. The agent may still use its own native inbox. A blocked native dialog is reported without silently making a future task; answer its supported decision or permission request, or use `/cancel`. Duplicate inbound events do not submit again. Phone text may reach the agent before an older media item finishes preparation.
 
 Image preparation and legacy text/desktop deliveries share 16 accepted slots per chat and a 30000 UTF-8 byte caption/text limit on acceptance. A full preparation FIFO or oversized caption gets a rejection notice, not silent eviction. An image message occupies one slot, keeps its caption, and accepts up to four PNG, JPEG, WebP, or GIF attachments, with the existing 25 MiB-per-file download limit. Voice retains local transcription; it no longer waits for agent idle. New phone text has no 16-task waiting queue.
 
@@ -357,7 +358,7 @@ ZIP archives, documents and other non-audio attachments also download while the 
 
 Previously accepted legacy text and desktop deliveries run independently per chat using the existing guarded dispatch path. These non-media deliveries still require the same native session, an idle readiness check, enabled sync and a supported transcript reader. An early idle event alone is not completion. Muting pauses these retained deliveries without discarding them; ending a session never reroutes them to another session. This retained path does not hold new phone text or ready media.
 
-The bridge saves consumption and submission intent before native input. A proven pre-submission socket failure retains the message for retry without clearing a running task. A lost acknowledgement, uncertain result, or restart during submission is never automatically repeated. Inspect the terminal, then use local `clear-prompt` to release a retained-delivery hold; it does not resubmit the uncertain task. `/queue` inspects pending state while muted or disconnected. `/cancel` interrupts only a freshly verified active task, persists its receipt before submission, and never repeats an uncertain interrupt automatically.
+The bridge saves consumption and submission intent before native input. A proven pre-submission socket failure retains the message for retry without clearing a running task. A lost acknowledgement, uncertain result, or restart during submission is never automatically repeated. Check the terminal; the local `clear-prompt` command releases a retained-delivery hold; it does not resubmit the uncertain task. `/queue` inspects pending state while muted or disconnected. `/cancel` interrupts only a freshly verified active task, persists its receipt before submission, and never repeats an uncertain interrupt automatically.
 
 ### Editable progress and separate final replies
 
